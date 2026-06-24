@@ -39,6 +39,8 @@ const PREVIEW_CACHE: usize = 32;
 const THUMB_CACHE: usize = 512;
 /// Grid cell edge in points.
 const CELL: f32 = 168.0;
+/// Extra grid rows to decode above/below the viewport for smooth scrolling.
+const GRID_PREFETCH_ROWS: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Variant {
@@ -92,6 +94,7 @@ impl DecodeService {
                 for job in job_rx.iter() {
                     let image =
                         decode_rgba_capped(&job.key.path, job.key.variant.cap()).map_err(|e| format!("{e:#}"));
+                    tracing::debug!(path = %job.key.path.display(), ok = image.is_ok(), "decoded");
                     let _ = result_tx.send(DecodeResult {
                         key: job.key,
                         image,
@@ -119,6 +122,7 @@ struct GuiApp {
     status: String,
     grid_cols: usize,
     grid_rows: usize,
+    last_visible_rows: std::ops::Range<usize>,
     scroll_to_current: bool,
     fullscreen: bool,
     // Deferred from inside the input closure (which borrows ctx immutably).
@@ -141,6 +145,7 @@ impl GuiApp {
             status: String::new(),
             grid_cols: 1,
             grid_rows: 1,
+            last_visible_rows: 0..0,
             scroll_to_current: false,
             fullscreen: false,
             pending_sort: None,
@@ -203,11 +208,24 @@ impl GuiApp {
                 }
             }
             ViewMode::Grid | ViewMode::DeleteQueueGrid => {
-                for path in self.visible_grid_paths() {
-                    self.request(TexKey {
-                        path,
-                        variant: Variant::Thumb,
-                    });
+                // Only decode thumbnails for the rows on (or near) screen. This
+                // keeps the working set far below the texture cache so visible
+                // thumbnails are never evicted — no thrash, no flicker.
+                let indices = self.grid_indices();
+                let cols = self.grid_cols.max(1);
+                let total_rows = indices.len().div_ceil(cols);
+                let start = self.last_visible_rows.start.saturating_sub(GRID_PREFETCH_ROWS);
+                let end = (self.last_visible_rows.end + GRID_PREFETCH_ROWS).min(total_rows);
+                for slot in (start * cols)..(end * cols).min(indices.len()) {
+                    if let Some(&index) = indices.get(slot)
+                        && let Some(entry) = self.state.entries.get(index)
+                    {
+                        let path = entry.path.clone();
+                        self.request(TexKey {
+                            path,
+                            variant: Variant::Thumb,
+                        });
+                    }
                 }
             }
         }
@@ -218,14 +236,6 @@ impl GuiApp {
             ViewMode::DeleteQueueGrid => self.state.queued_indices(),
             _ => (0..self.state.entries.len()).collect(),
         }
-    }
-
-    fn visible_grid_paths(&self) -> Vec<PathBuf> {
-        self.grid_indices()
-            .into_iter()
-            .filter_map(|index| self.state.entries.get(index))
-            .map(|entry| entry.path.clone())
-            .collect()
     }
 
     fn drain_results(&mut self, ctx: &egui::Context) {
@@ -538,23 +548,45 @@ impl GuiApp {
         }
 
         let spacing = 8.0;
-        let cols = (((ui.available_width() + spacing) / (CELL + spacing)).floor() as usize).max(1);
-        let rows = (((ui.available_height() + spacing) / (CELL + spacing)).floor() as usize).max(1);
+        ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+        let pitch = CELL + spacing;
+        let avail_height = ui.available_height();
+        let cols = (((ui.available_width() + spacing) / pitch).floor() as usize).max(1);
+        let visible_rows = (((avail_height + spacing) / pitch).floor() as usize).max(1);
+        let total_rows = indices.len().div_ceil(cols);
         self.grid_cols = cols;
-        self.grid_rows = rows;
+        self.grid_rows = visible_rows;
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("thumb_grid")
-                .spacing([spacing, spacing])
-                .show(ui, |ui| {
-                    for (slot, &index) in indices.iter().enumerate() {
-                        self.draw_cell(ui, index);
-                        if (slot + 1) % cols == 0 {
-                            ui.end_row();
+        let mut scroll = egui::ScrollArea::vertical();
+        // On navigation, scroll only when the current cell is off-screen, so
+        // in-view moves don't jump the viewport around.
+        if self.scroll_to_current
+            && let Some(slot) = indices.iter().position(|&i| i == self.state.current_index)
+        {
+            let current_row = slot / cols;
+            if !self.last_visible_rows.contains(&current_row) {
+                let target = (current_row as f32 * pitch - (avail_height - pitch) * 0.5).max(0.0);
+                scroll = scroll.vertical_scroll_offset(target);
+            }
+        }
+
+        // Virtualized: egui only invokes the closure for visible rows, so we
+        // lay out and access only a screenful of cells regardless of folder size.
+        let mut shown = 0..0;
+        scroll.show_rows(ui, CELL, total_rows, |ui, row_range| {
+            shown = row_range.clone();
+            for row in row_range {
+                ui.horizontal(|ui| {
+                    for col in 0..cols {
+                        let slot = row * cols + col;
+                        if let Some(&index) = indices.get(slot) {
+                            self.draw_cell(ui, index);
                         }
                     }
                 });
+            }
         });
+        self.last_visible_rows = shown;
     }
 
     fn draw_cell(&mut self, ui: &mut egui::Ui, index: usize) {
@@ -611,9 +643,6 @@ impl GuiApp {
         if response.double_clicked() {
             self.state.current_index = index;
             self.state.mode = ViewMode::Preview;
-        }
-        if is_current && self.scroll_to_current {
-            response.scroll_to_me(Some(egui::Align::Center));
         }
     }
 
