@@ -1,12 +1,8 @@
-pub mod app;
 pub mod cli;
+pub mod decode;
 pub mod delete;
-pub mod image_cache;
-pub mod input;
+pub mod gui;
 pub mod metadata;
-pub mod renderer;
 pub mod scanner;
 pub mod sorter;
 pub mod state;
-pub mod thumbnail;
-pub mod ui;

@@ -8,21 +8,17 @@ anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 
-ratatui = "0.30"
-crossterm = "0.29"
-ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
-
+# GPU windowed frontend: decode once, let the GPU scale to any window size.
+eframe = "0.31"
 image = { version = "0.25", default-features = true }
-fast_image_resize = { version = "6", features = ["image", "rayon"] }
+# libjpeg-turbo bindings: SIMD + scaled (1/8..1/1) decode for fast JPEG previews.
+turbojpeg = "1"
 
-rayon = "1"
 jwalk = "0.8"
 flume = "0.11"
 lru = "0.14"
 indexmap = "2"
-parking_lot = "0.12"
 
-which = "7"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 kamadak-exif = "0.6"
 
