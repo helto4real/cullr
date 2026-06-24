@@ -119,9 +119,11 @@ struct GuiApp {
     status: String,
     grid_cols: usize,
     scroll_to_current: bool,
+    fullscreen: bool,
     // Deferred from inside the input closure (which borrows ctx immutably).
     pending_sort: Option<crate::state::SortMode>,
     pending_enrich: bool,
+    pending_rescan: bool,
 }
 
 impl GuiApp {
@@ -138,8 +140,10 @@ impl GuiApp {
             status: String::new(),
             grid_cols: 1,
             scroll_to_current: false,
+            fullscreen: false,
             pending_sort: None,
             pending_enrich: false,
+            pending_rescan: false,
         }
     }
 
@@ -248,6 +252,31 @@ impl GuiApp {
         self.scroll_to_current = true;
     }
 
+    fn rescan(&mut self) {
+        let previous = self.state.current_path();
+        let result = scan_directory(ScanOptions {
+            root: self.state.directory.clone(),
+            recursive: self.state.recursive,
+            include_hidden: self.state.include_hidden,
+            extensions: self.state.extensions.clone(),
+        });
+        match result {
+            Ok(mut entries) => {
+                sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
+                self.state.set_entries_preserving_current(entries, previous);
+                self.status = format!(
+                    "scanned {} images{}",
+                    self.state.entries.len(),
+                    if self.state.recursive { " recursively" } else { "" }
+                );
+                self.scroll_to_current = true;
+            }
+            Err(error) => {
+                self.status = format!("rescan failed: {error}");
+            }
+        }
+    }
+
     fn confirm_delete(&mut self) {
         self.state.confirm_delete = false;
         let report = delete::delete_queued(&mut self.state, self.dry_run);
@@ -348,11 +377,21 @@ impl GuiApp {
                 self.state.unqueue_current();
                 self.status = format!("queued: {}", self.state.queue_count());
             }
-            if i.modifiers.ctrl && i.key_pressed(Key::R) {
-                if self.state.queue_count() == 0 {
-                    self.status = "delete queue is empty".to_owned();
+            if i.key_pressed(Key::R) {
+                if i.modifiers.ctrl {
+                    // Ctrl+R: delete the queued files (with confirmation).
+                    if self.state.queue_count() == 0 {
+                        self.status = "delete queue is empty".to_owned();
+                    } else {
+                        self.state.confirm_delete = true;
+                    }
+                } else if i.modifiers.shift {
+                    // Shift+R: rescan the directory.
+                    self.pending_rescan = true;
                 } else {
-                    self.state.confirm_delete = true;
+                    // r: toggle recursive scanning, then rescan.
+                    self.state.recursive = !self.state.recursive;
+                    self.pending_rescan = true;
                 }
             }
 
@@ -367,11 +406,15 @@ impl GuiApp {
             if in_grid && (i.key_pressed(Key::Enter) || i.key_pressed(Key::L)) {
                 self.state.mode = ViewMode::Preview;
             }
-            if i.key_pressed(Key::F) || i.key_pressed(Key::Z) {
+            if i.key_pressed(Key::Z) {
                 self.state.zoom_mode = match self.state.zoom_mode {
                     ZoomMode::Fit => ZoomMode::OriginalPixels,
                     ZoomMode::OriginalPixels => ZoomMode::Fit,
                 };
+            }
+            if i.key_pressed(Key::F) {
+                self.fullscreen = !self.fullscreen;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
             }
             if i.key_pressed(Key::T) {
                 self.pending_sort = Some(sorter::next_time_sort(self.state.sort_mode));
@@ -395,6 +438,9 @@ impl GuiApp {
             && let Some(entry) = self.state.current_entry_mut()
         {
             metadata::enrich_entry(entry);
+        }
+        if std::mem::take(&mut self.pending_rescan) {
+            self.rescan();
         }
     }
 
@@ -588,8 +634,11 @@ space / d       toggle delete queue
 u               unqueue current
 shift+D         show delete queue
 ctrl+R          delete queued (confirm)
-f / z           toggle fit / original zoom
+z               toggle fit / original zoom
+f               toggle fullscreen window
 t / n           cycle time / name sort
+r               toggle recursive scan
+shift+R         rescan directory
 i               info overlay
 h / ?           this help
 q / esc         quit / close";
