@@ -317,16 +317,24 @@ impl GuiApp {
             ViewMode::Grid | ViewMode::DeleteQueueGrid
         );
 
+        // Viewport commands must be issued OUTSIDE the input closure — calling
+        // them while ctx.input() holds the context lock silently drops them.
+        let mut close = false;
+        let mut toggle_fullscreen = false;
+
         ctx.input(|i| {
             if i.key_pressed(Key::Q) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                close = true;
             }
             if i.key_pressed(Key::Escape) {
+                // Escape peels back one layer: overlay → grid → quit.
                 if self.state.show_help_overlay || self.state.show_info_overlay {
                     self.state.show_help_overlay = false;
                     self.state.show_info_overlay = false;
                 } else if in_grid {
                     self.state.mode = ViewMode::Preview;
+                } else {
+                    close = true;
                 }
             }
 
@@ -413,8 +421,7 @@ impl GuiApp {
                 };
             }
             if i.key_pressed(Key::F) {
-                self.fullscreen = !self.fullscreen;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                toggle_fullscreen = true;
             }
             if i.key_pressed(Key::T) {
                 self.pending_sort = Some(sorter::next_time_sort(self.state.sort_mode));
@@ -441,6 +448,13 @@ impl GuiApp {
         }
         if std::mem::take(&mut self.pending_rescan) {
             self.rescan();
+        }
+        if toggle_fullscreen {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        if close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
