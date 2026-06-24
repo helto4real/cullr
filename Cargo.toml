@@ -1,0 +1,35 @@
+[package]
+name = "cullr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+
+ratatui = "0.30"
+crossterm = "0.29"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+
+image = { version = "0.25", default-features = true }
+fast_image_resize = { version = "6", features = ["image", "rayon"] }
+
+rayon = "1"
+jwalk = "0.8"
+flume = "0.11"
+lru = "0.14"
+indexmap = "2"
+parking_lot = "0.12"
+
+which = "7"
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+kamadak-exif = "0.6"
+
+icu = { version = "2", features = ["compiled_data"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
