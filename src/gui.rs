@@ -118,6 +118,7 @@ struct GuiApp {
     dry_run: bool,
     status: String,
     grid_cols: usize,
+    grid_rows: usize,
     scroll_to_current: bool,
     fullscreen: bool,
     // Deferred from inside the input closure (which borrows ctx immutably).
@@ -139,6 +140,7 @@ impl GuiApp {
             dry_run,
             status: String::new(),
             grid_cols: 1,
+            grid_rows: 1,
             scroll_to_current: false,
             fullscreen: false,
             pending_sort: None,
@@ -165,6 +167,18 @@ impl GuiApp {
         }
         self.inflight.insert(key.clone());
         self.decoder.request(key);
+    }
+
+    /// Move the selection by `delta` entries, clamped to the list bounds.
+    fn move_by(&mut self, delta: isize) {
+        let len = self.state.entries.len();
+        if len == 0 {
+            return;
+        }
+        let current = self.state.current_index as isize;
+        let target = (current + delta).clamp(0, len as isize - 1);
+        self.state.current_index = target as usize;
+        self.scroll_to_current = true;
     }
 
     fn ensure_requested(&mut self) {
@@ -312,6 +326,7 @@ impl GuiApp {
         }
 
         let cols = self.grid_cols.max(1);
+        let rows = self.grid_rows.max(1);
         let in_grid = matches!(
             self.state.mode,
             ViewMode::Grid | ViewMode::DeleteQueueGrid
@@ -338,31 +353,46 @@ impl GuiApp {
                 }
             }
 
-            if i.key_pressed(Key::ArrowRight)
-                || i.key_pressed(Key::J)
-                || (!in_grid && i.key_pressed(Key::ArrowDown))
-            {
-                self.state.next();
-                self.scroll_to_current = true;
-            }
-            if i.key_pressed(Key::ArrowLeft)
-                || i.key_pressed(Key::K)
-                || (!in_grid && i.key_pressed(Key::ArrowUp))
-            {
-                self.state.previous();
-                self.scroll_to_current = true;
-            }
-            if in_grid && i.key_pressed(Key::ArrowDown) {
-                for _ in 0..cols {
+            if in_grid {
+                // Vim-style spatial navigation in the library grid:
+                // h/l move within a row, j/k move between rows, ctrl+d/u half-page.
+                if i.key_pressed(Key::H) || i.key_pressed(Key::ArrowLeft) {
+                    self.move_by(-1);
+                }
+                if i.key_pressed(Key::L) || i.key_pressed(Key::ArrowRight) {
+                    self.move_by(1);
+                }
+                if i.key_pressed(Key::K) || i.key_pressed(Key::ArrowUp) {
+                    self.move_by(-(cols as isize));
+                }
+                if i.key_pressed(Key::J) || i.key_pressed(Key::ArrowDown) {
+                    self.move_by(cols as isize);
+                }
+                let half_page = (rows / 2).max(1) as isize * cols as isize;
+                if i.modifiers.ctrl && i.key_pressed(Key::D) {
+                    self.move_by(half_page);
+                }
+                if i.modifiers.ctrl && i.key_pressed(Key::U) {
+                    self.move_by(-half_page);
+                }
+            } else {
+                // Preview is a one-wide list: h/k/←/↑ previous, l/j/→/↓ next.
+                if i.key_pressed(Key::L)
+                    || i.key_pressed(Key::J)
+                    || i.key_pressed(Key::ArrowRight)
+                    || i.key_pressed(Key::ArrowDown)
+                {
                     self.state.next();
+                    self.scroll_to_current = true;
                 }
-                self.scroll_to_current = true;
-            }
-            if in_grid && i.key_pressed(Key::ArrowUp) {
-                for _ in 0..cols {
+                if i.key_pressed(Key::H)
+                    || i.key_pressed(Key::K)
+                    || i.key_pressed(Key::ArrowLeft)
+                    || i.key_pressed(Key::ArrowUp)
+                {
                     self.state.previous();
+                    self.scroll_to_current = true;
                 }
-                self.scroll_to_current = true;
             }
             if i.key_pressed(Key::Home) {
                 self.state.first();
@@ -377,11 +407,11 @@ impl GuiApp {
             if i.modifiers.shift && i.key_pressed(Key::D) {
                 self.state.enter_delete_queue_grid();
                 self.scroll_to_current = true;
-            } else if i.key_pressed(Key::Space) || i.key_pressed(Key::D) {
+            } else if i.key_pressed(Key::Space) || (i.key_pressed(Key::D) && !i.modifiers.ctrl) {
                 self.state.toggle_queue_current();
                 self.status = format!("queued: {}", self.state.queue_count());
             }
-            if i.key_pressed(Key::U) {
+            if i.key_pressed(Key::U) && !i.modifiers.ctrl {
                 self.state.unqueue_current();
                 self.status = format!("queued: {}", self.state.queue_count());
             }
@@ -411,7 +441,7 @@ impl GuiApp {
                 };
                 self.scroll_to_current = true;
             }
-            if in_grid && (i.key_pressed(Key::Enter) || i.key_pressed(Key::L)) {
+            if in_grid && i.key_pressed(Key::Enter) {
                 self.state.mode = ViewMode::Preview;
             }
             if i.key_pressed(Key::Z) {
@@ -433,7 +463,7 @@ impl GuiApp {
                 self.state.show_info_overlay = !self.state.show_info_overlay;
                 self.pending_enrich = self.state.show_info_overlay;
             }
-            if i.key_pressed(Key::H) || (i.modifiers.shift && i.key_pressed(Key::Questionmark)) {
+            if i.key_pressed(Key::Questionmark) {
                 self.state.show_help_overlay = !self.state.show_help_overlay;
             }
         });
@@ -509,7 +539,9 @@ impl GuiApp {
 
         let spacing = 8.0;
         let cols = (((ui.available_width() + spacing) / (CELL + spacing)).floor() as usize).max(1);
+        let rows = (((ui.available_height() + spacing) / (CELL + spacing)).floor() as usize).max(1);
         self.grid_cols = cols;
+        self.grid_rows = rows;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("thumb_grid")
@@ -639,11 +671,16 @@ impl GuiApp {
 }
 
 const HELP_TEXT: &str = "\
-←/→ space j/k   navigate
-↑/↓             grid: move by row
-home/end        first / last
+grid (library) mode:
+  h / l           left / right one image
+  j / k           down / up one row
+  ctrl+d / ctrl+u half page down / up
+  enter           open highlighted
+preview mode:
+  h / k / ← / ↑   previous
+  l / j / → / ↓   next
+home / end      first / last
 g               toggle grid
-enter / l       open highlighted (grid)
 space / d       toggle delete queue
 u               unqueue current
 shift+D         show delete queue
@@ -654,7 +691,7 @@ t / n           cycle time / name sort
 r               toggle recursive scan
 shift+R         rescan directory
 i               info overlay
-h / ?           this help
+?               this help
 q / esc         quit / close";
 
 impl eframe::App for GuiApp {
