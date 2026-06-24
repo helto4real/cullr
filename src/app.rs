@@ -1,7 +1,7 @@
 use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -100,6 +100,10 @@ impl App {
         }
 
         let capabilities = self.renderer.preflight()?;
+        self.thumbnails.configure_renderer(
+            self.renderer.picker_clone()?,
+            self.renderer.backend_id().to_owned(),
+        );
         if !capabilities.graphics_protocol
             && !self.cli.allow_symbol_fallback
             && self.cli.backend != BackendChoice::Chafa
@@ -112,31 +116,45 @@ impl App {
     }
 
     fn run_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+        let mut needs_draw = true;
         loop {
-            self.enrich_current_entry();
-            self.thumbnails
-                .poll_finished(self.state.thumbnail_generation);
+            if self
+                .thumbnails
+                .poll_finished(self.state.thumbnail_generation)
+            {
+                needs_draw = true;
+            }
 
-            terminal.draw(|frame| {
-                ui::draw(
-                    frame,
-                    &mut self.state,
-                    &mut self.renderer,
-                    &mut self.thumbnails,
-                )
-            })?;
+            if needs_draw {
+                terminal.draw(|frame| {
+                    ui::draw(
+                        frame,
+                        &mut self.state,
+                        &mut self.renderer,
+                        &mut self.thumbnails,
+                    )
+                })?;
+                needs_draw = false;
+            }
 
-            if event::poll(Duration::from_millis(50))? {
+            if event::poll(self.event_poll_timeout())? {
                 match event::read()? {
                     Event::Key(key) => {
                         let action = action_for_key(key, self.state.confirm_delete);
-                        if !self.handle_action(action)? {
-                            break;
+                        if action != Action::Noop {
+                            if !self.handle_action(action)? {
+                                break;
+                            }
+                            needs_draw = true;
                         }
                     }
                     Event::Resize(_, _) => {
+                        self.state.bump_generation();
+                        self.state.forget_render_layout();
                         self.renderer.clear()?;
+                        self.thumbnails.clear_for_new_generation();
                         self.state.status_message = Some("terminal resized".to_owned());
+                        needs_draw = true;
                     }
                     _ => {}
                 }
@@ -146,7 +164,19 @@ impl App {
         Ok(())
     }
 
+    fn event_poll_timeout(&self) -> Duration {
+        if self.thumbnails.has_inflight() {
+            Duration::from_millis(5)
+        } else {
+            Duration::from_millis(250)
+        }
+    }
+
     fn handle_action(&mut self, action: Action) -> Result<bool> {
+        let previous_index = self.state.current_index;
+        let previous_mode = self.state.mode;
+        let previous_generation = self.state.thumbnail_generation;
+
         match action {
             Action::Quit => return Ok(false),
             Action::Next => self.state.next(),
@@ -212,7 +242,10 @@ impl App {
             }
             Action::ToggleFullscreenUi => {
                 self.state.fullscreen_ui = !self.state.fullscreen_ui;
+                self.state.bump_generation();
+                self.state.forget_render_layout();
                 self.renderer.clear()?;
+                self.thumbnails.clear_for_new_generation();
             }
             Action::ToggleRecursive => {
                 self.state.recursive = !self.state.recursive;
@@ -243,9 +276,18 @@ impl App {
                     ZoomMode::Fit => ZoomMode::OriginalPixels,
                     ZoomMode::OriginalPixels => ZoomMode::Fit,
                 };
+                self.state.bump_generation();
                 self.renderer.clear()?;
+                self.thumbnails.clear_for_new_generation();
             }
             Action::Noop => {}
+        }
+
+        if self.state.current_index != previous_index
+            || self.state.mode != previous_mode
+            || self.state.thumbnail_generation != previous_generation
+        {
+            self.prefetch_current_from_last_known_area();
         }
 
         Ok(true)
@@ -253,8 +295,54 @@ impl App {
 
     fn enrich_current_entry(&mut self) {
         if let Some(entry) = self.state.current_entry_mut() {
+            let started = Instant::now();
             metadata::enrich_entry(entry);
+            tracing::debug!(
+                path = %entry.path.display(),
+                metadata_ms = started.elapsed().as_millis(),
+                "enriched current image metadata"
+            );
         }
+    }
+
+    fn prefetch_current_from_last_known_area(&mut self) {
+        match self.state.mode {
+            ViewMode::Preview => self.prefetch_current_preview_from_last_size(),
+            ViewMode::Grid | ViewMode::DeleteQueueGrid => {
+                self.prefetch_current_thumbnail_from_last_cell();
+            }
+        }
+    }
+
+    fn prefetch_current_preview_from_last_size(&mut self) {
+        let Some((width, height)) = self.state.last_preview_size else {
+            return;
+        };
+        let Some(entry) = self.state.current_entry().cloned() else {
+            return;
+        };
+        let _ = self.thumbnails.prefetch_preview(
+            &entry,
+            width,
+            height,
+            self.state.zoom_mode,
+            self.state.thumbnail_generation,
+        );
+    }
+
+    fn prefetch_current_thumbnail_from_last_cell(&mut self) {
+        let Some((width, height)) = self.state.last_grid_cell_size else {
+            return;
+        };
+        let Some(entry) = self.state.current_entry().cloned() else {
+            return;
+        };
+        let _ = self.thumbnails.prefetch_thumbnail(
+            &entry,
+            width,
+            height,
+            self.state.thumbnail_generation,
+        );
     }
 
     fn rescan_preserving_current(&mut self) -> Result<()> {
@@ -319,6 +407,7 @@ fn scan_entries(
     sort_mode: SortMode,
     locale: Option<&str>,
 ) -> Result<Vec<crate::state::ImageEntry>> {
+    let started = Instant::now();
     let mut entries = scan_directory(ScanOptions {
         root: directory.to_path_buf(),
         recursive,
@@ -326,5 +415,66 @@ fn scan_entries(
         extensions,
     })?;
     sorter::sort_entries(&mut entries, sort_mode, locale);
+    tracing::debug!(
+        directory = %directory.display(),
+        entries = entries.len(),
+        recursive,
+        scan_ms = started.elapsed().as_millis(),
+        "scanned image entries"
+    );
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{cli::BackendChoice, input::Action};
+    use ratatui_image::picker::Picker;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn cli_for(path: &Path) -> Cli {
+        Cli {
+            directory: Some(path.to_path_buf()),
+            recursive: false,
+            file_ext: Some("jpg".to_owned()),
+            sort: None,
+            backend: BackendChoice::Auto,
+            allow_symbol_fallback: true,
+            locale: None,
+            cache_mb: 1,
+            dry_run_delete: false,
+            hidden: false,
+        }
+    }
+
+    fn app_with_files() -> App {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("a.jpg"), b"not decoded in this test").unwrap();
+        fs::write(temp.path().join("b.jpg"), b"not decoded in this test").unwrap();
+        App::new(cli_for(temp.path())).unwrap()
+    }
+
+    #[test]
+    fn ordinary_navigation_does_not_enrich_metadata() {
+        let mut app = app_with_files();
+
+        app.handle_action(Action::Next).unwrap();
+
+        let entry = app.state.current_entry().unwrap();
+        assert!(!entry.dimensions_attempted);
+        assert!(!entry.exif_attempted);
+    }
+
+    #[test]
+    fn navigation_prefetches_current_preview_when_layout_is_known() {
+        let mut app = app_with_files();
+        app.thumbnails
+            .configure_renderer(Picker::halfblocks(), "native:Halfblocks".to_owned());
+        app.state.last_preview_size = Some((40, 20));
+
+        app.handle_action(Action::Next).unwrap();
+
+        assert_eq!(app.thumbnails.preview_inflight_len(), 1);
+    }
 }

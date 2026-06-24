@@ -111,6 +111,8 @@ mod tests {
             image_type: Some(ImageKind::Jpeg),
             exif_date: None,
             exif_orientation: None,
+            dimensions_attempted: false,
+            exif_attempted: false,
         };
         let directory = path.parent().unwrap().canonicalize().unwrap();
         let mut state = AppState::new(

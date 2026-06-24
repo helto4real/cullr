@@ -134,6 +134,8 @@ fn build_entry(
         image_type: ImageKind::from_extension(extension.as_deref()),
         exif_date: None,
         exif_orientation: None,
+        dimensions_attempted: false,
+        exif_attempted: false,
     }))
 }
 

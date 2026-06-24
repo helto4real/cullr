@@ -34,7 +34,7 @@ pub fn draw(
     };
 
     match state.mode {
-        ViewMode::Preview => preview::draw(frame, main_area, state, renderer),
+        ViewMode::Preview => preview::draw(frame, main_area, state, renderer, thumbnails),
         ViewMode::Grid => grid::draw(frame, main_area, state, renderer, thumbnails, false),
         ViewMode::DeleteQueueGrid => {
             grid::draw(frame, main_area, state, renderer, thumbnails, true)

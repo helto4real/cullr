@@ -20,6 +20,8 @@ pub struct ImageEntry {
     pub image_type: Option<ImageKind>,
     pub exif_date: Option<SystemTime>,
     pub exif_orientation: Option<u16>,
+    pub dimensions_attempted: bool,
+    pub exif_attempted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +60,15 @@ pub enum ZoomMode {
     OriginalPixels,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewPrefetchMarker {
+    pub generation: u64,
+    pub width_cells: u16,
+    pub height_cells: u16,
+    pub zoom_mode: ZoomMode,
+    pub entry_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub directory: PathBuf,
@@ -78,6 +89,9 @@ pub struct AppState {
     pub confirm_delete: bool,
     pub thumbnail_generation: u64,
     pub last_grid_page_size: usize,
+    pub last_preview_size: Option<(u16, u16)>,
+    pub last_grid_cell_size: Option<(u16, u16)>,
+    pub eager_preview_prefetch: Option<PreviewPrefetchMarker>,
 }
 
 impl AppState {
@@ -108,6 +122,9 @@ impl AppState {
             confirm_delete: false,
             thumbnail_generation: 0,
             last_grid_page_size: 1,
+            last_preview_size: None,
+            last_grid_cell_size: None,
+            eager_preview_prefetch: None,
         }
     }
 
@@ -226,6 +243,13 @@ impl AppState {
 
     pub fn bump_generation(&mut self) {
         self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
+        self.eager_preview_prefetch = None;
+    }
+
+    pub fn forget_render_layout(&mut self) {
+        self.last_preview_size = None;
+        self.last_grid_cell_size = None;
+        self.eager_preview_prefetch = None;
     }
 
     pub fn queued_indices(&self) -> Vec<usize> {
@@ -354,6 +378,8 @@ mod tests {
             image_type: Some(ImageKind::Jpeg),
             exif_date: None,
             exif_orientation: None,
+            dimensions_attempted: false,
+            exif_attempted: false,
         }
     }
 

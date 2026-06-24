@@ -110,6 +110,8 @@ mod tests {
             image_type: Some(ImageKind::Jpeg),
             exif_date: None,
             exif_orientation: None,
+            dimensions_attempted: false,
+            exif_attempted: false,
         }
     }
 

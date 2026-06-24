@@ -13,13 +13,15 @@ use time::{PrimitiveDateTime, macros::format_description};
 use crate::state::ImageEntry;
 
 pub fn enrich_entry(entry: &mut ImageEntry) {
-    if entry.dimensions.is_none() {
+    if entry.dimensions.is_none() && !entry.dimensions_attempted {
+        entry.dimensions_attempted = true;
         if let Ok((width, height)) = image::image_dimensions(&entry.path) {
             entry.dimensions = Some((width, height));
         }
     }
 
-    if entry.exif_date.is_none() || entry.exif_orientation.is_none() {
+    if (entry.exif_date.is_none() || entry.exif_orientation.is_none()) && !entry.exif_attempted {
+        entry.exif_attempted = true;
         if let Ok(exif) = read_exif_metadata(&entry.path) {
             entry.exif_date = entry.exif_date.or(exif.date);
             entry.exif_orientation = entry.exif_orientation.or(exif.orientation);
@@ -29,7 +31,8 @@ pub fn enrich_entry(entry: &mut ImageEntry) {
 
 pub fn enrich_entries_for_time_sort(entries: &mut [ImageEntry]) {
     for entry in entries {
-        if entry.exif_date.is_none() {
+        if entry.exif_date.is_none() && !entry.exif_attempted {
+            entry.exif_attempted = true;
             if let Ok(exif) = read_exif_metadata(&entry.path) {
                 entry.exif_date = exif.date;
                 entry.exif_orientation = entry.exif_orientation.or(exif.orientation);
@@ -141,6 +144,8 @@ mod tests {
             image_type: Some(ImageKind::Jpeg),
             exif_date: Some(exif),
             exif_orientation: None,
+            dimensions_attempted: false,
+            exif_attempted: true,
         };
 
         assert_eq!(effective_date(&entry), Some(exif));

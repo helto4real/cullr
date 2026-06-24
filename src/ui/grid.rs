@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::{
-    renderer::{ImageRenderer, NativeRatatuiImageRenderer},
+    renderer::NativeRatatuiImageRenderer,
     state::AppState,
     thumbnail::{ThumbnailService, ThumbnailStatus},
 };
@@ -30,6 +30,10 @@ pub fn draw(
 ) {
     let layout = compute_grid_layout(area);
     state.last_grid_page_size = layout.page_size.max(1);
+    state.last_grid_cell_size = Some((
+        layout.cell_width.saturating_sub(2).max(1),
+        layout.cell_height.saturating_sub(2).max(1),
+    ));
 
     let indices: Vec<usize> = if delete_queue_only {
         state.queued_indices()
@@ -70,6 +74,10 @@ pub fn draw(
                 .min(area.height.saturating_sub(row as u16 * layout.cell_height)),
         );
         draw_cell(frame, cell, state, renderer, thumbnails, entry_index);
+    }
+
+    if !delete_queue_only {
+        prefetch_adjacent_pages(state, thumbnails, &indices, page, layout);
     }
 }
 
@@ -125,16 +133,15 @@ fn draw_cell(
         return;
     }
 
-    let status = thumbnails.get_or_request(
+    let status = thumbnails.get_or_request_thumbnail(
         entry,
         inner.width,
         inner.height,
         state.thumbnail_generation,
-        renderer.backend_id(),
     );
     match status {
-        ThumbnailStatus::Ready { key, image } => {
-            renderer.render_thumbnail(frame, inner, &key, image);
+        ThumbnailStatus::Ready { protocol, .. } => {
+            renderer.render_thumbnail_protocol(frame, inner, protocol.as_ref());
         }
         ThumbnailStatus::Loading => {
             frame.render_widget(
@@ -147,6 +154,33 @@ fn draw_cell(
                 Paragraph::new(format!("decode failed\n{}", truncate(&error, inner.width))),
                 inner,
             );
+        }
+    }
+}
+
+fn prefetch_adjacent_pages(
+    state: &AppState,
+    thumbnails: &mut ThumbnailService,
+    indices: &[usize],
+    page: usize,
+    layout: GridLayout,
+) {
+    let pages = [Some(page + 1), page.checked_sub(1)];
+    for page in pages.into_iter().flatten() {
+        let start = page.saturating_mul(layout.page_size);
+        if start >= indices.len() {
+            continue;
+        }
+        let end = (start + layout.page_size).min(indices.len());
+        for entry_index in &indices[start..end] {
+            if let Some(entry) = state.entries.get(*entry_index) {
+                thumbnails.prefetch_thumbnail(
+                    entry,
+                    layout.cell_width.saturating_sub(2).max(1),
+                    layout.cell_height.saturating_sub(2).max(1),
+                    state.thumbnail_generation,
+                );
+            }
         }
     }
 }
