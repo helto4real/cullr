@@ -738,8 +738,19 @@ impl eframe::App for GuiApp {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    let directory = resolve_directory(cli.directory.as_deref())?;
-    let extensions = cli.resolved_extensions();
+    let input = cli.path.as_deref().or(cli.directory.as_deref());
+    let (directory, initial_file) = resolve_input(input)?;
+    let mut extensions = cli.resolved_extensions();
+    // When opening a specific file, make sure its own extension is scanned even
+    // if it isn't in the default/--file_ext set, so it actually shows up.
+    if let Some(file) = &initial_file
+        && let Some(ext) = file.extension().and_then(|e| e.to_str())
+    {
+        let ext = ext.to_ascii_lowercase();
+        if !extensions.contains(&ext) {
+            extensions.push(ext);
+        }
+    }
     let sort_mode = cli.initial_sort_mode();
     let mut entries = scan_directory(ScanOptions {
         root: directory.clone(),
@@ -754,7 +765,21 @@ pub fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let state = AppState::new(directory, cli.recursive, cli.hidden, extensions, sort_mode, entries);
+    let mut state =
+        AppState::new(directory, cli.recursive, cli.hidden, extensions, sort_mode, entries);
+    // Start positioned on the requested file (after sorting).
+    if let Some(file) = &initial_file
+        && let Some(index) = state.entries.iter().position(|entry| entry.path == *file)
+    {
+        state.current_index = index;
+    }
+    tracing::debug!(
+        directory = %state.directory.display(),
+        file = ?initial_file,
+        start_index = state.current_index,
+        count = state.entries.len(),
+        "opened"
+    );
     let app = GuiApp::new(state, cli.locale.clone(), cli.dry_run_delete);
 
     let options = eframe::NativeOptions {
@@ -768,16 +793,26 @@ pub fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn resolve_directory(directory: Option<&Path>) -> Result<PathBuf> {
-    let path = match directory {
+/// Resolve the input path into a directory to scan plus, if a file was given,
+/// the specific file to open. A file implies its parent directory.
+fn resolve_input(input: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>)> {
+    let path = match input {
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir().context("failed to read current directory")?,
     };
     let canonical = path
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", path.display()))?;
-    if !canonical.is_dir() {
-        return Err(anyhow!("{} is not a directory", canonical.display()));
+
+    if canonical.is_dir() {
+        Ok((canonical, None))
+    } else if canonical.is_file() {
+        let directory = canonical
+            .parent()
+            .context("file has no parent directory")?
+            .to_path_buf();
+        Ok((directory, Some(canonical)))
+    } else {
+        Err(anyhow!("{} is not a file or directory", canonical.display()))
     }
-    Ok(canonical)
 }

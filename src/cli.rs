@@ -7,6 +7,10 @@ use crate::state::SortMode;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "cullr", version, about = "Fast GPU-windowed image viewer and culler")]
 pub struct Cli {
+    /// Image file or directory to open. A file opens its folder positioned on it.
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
+
     #[arg(short = 'd', long = "directory", value_name = "DIR")]
     pub directory: Option<PathBuf>,
 
