@@ -1,132 +1,37 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::Path,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use cullr::{
+    decode::decode_rgba_capped,
     delete::delete_queued,
     scanner::{ScanOptions, scan_directory},
-    state::{AppState, SortMode, ZoomMode},
-    thumbnail::{
-        PreviewStatus, ThumbnailService, ThumbnailStatus, generate_preview_protocol_for_test,
-        generate_thumbnail_for_test,
-    },
+    state::{AppState, SortMode},
 };
 use image::{ImageBuffer, Rgba};
-use ratatui_image::picker::Picker;
 use tempfile::tempdir;
 
 #[test]
-fn thumbnail_generation_writes_no_files_to_input_directory() {
+fn decode_writes_no_files_to_input_directory() {
     let temp = tempdir().unwrap();
     let image_path = temp.path().join("sample.png");
     write_sample_image(&image_path);
     let before = file_set(temp.path());
 
-    let thumbnail = generate_thumbnail_for_test(image_path, 12, 8).unwrap();
+    let rgba = decode_rgba_capped(&image_path, 3840).unwrap();
 
     let after = file_set(temp.path());
-    assert!(thumbnail.width() > 0);
+    assert!(rgba.width() > 0);
     assert_eq!(before, after);
 }
 
 #[test]
-fn preview_generation_writes_no_files_to_input_directory() {
+fn decode_caps_large_images_for_display() {
     let temp = tempdir().unwrap();
-    let image_path = temp.path().join("sample.png");
-    write_sample_image(&image_path);
-    let before = file_set(temp.path());
+    let image_path = temp.path().join("big.png");
+    image::RgbImage::new(1600, 900).save(&image_path).unwrap();
 
-    let protocol = generate_preview_protocol_for_test(image_path, 80, 24, ZoomMode::Fit).unwrap();
+    let rgba = decode_rgba_capped(&image_path, 512).unwrap();
 
-    let after = file_set(temp.path());
-    assert!(protocol.size().width > 0);
-    assert_eq!(before, after);
-}
-
-#[test]
-#[ignore = "synthetic prefetch timing check for manual performance runs"]
-fn synthetic_grid_prefetch_produces_cached_protocols() {
-    let temp = tempdir().unwrap();
-    for index in 0..20 {
-        write_sample_image(&temp.path().join(format!("{index:02}.png")));
-    }
-    let state = state_for(temp.path());
-    let mut thumbnails = ThumbnailService::new(64);
-    thumbnails.configure_renderer(Picker::halfblocks(), "native:Halfblocks".to_owned());
-
-    for entry in &state.entries {
-        thumbnails.prefetch_thumbnail(entry, 18, 10, state.thumbnail_generation);
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        thumbnails.poll_finished(state.thumbnail_generation);
-        let ready = state
-            .entries
-            .iter()
-            .filter(|entry| {
-                matches!(
-                    thumbnails.get_or_request_thumbnail(entry, 18, 10, state.thumbnail_generation),
-                    ThumbnailStatus::Ready { .. }
-                )
-            })
-            .count();
-
-        if ready >= 8 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "prefetch did not produce enough thumbnails"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[test]
-#[ignore = "synthetic first-preview latency check for manual performance runs"]
-fn synthetic_small_folder_preview_is_not_timer_bound() {
-    let temp = tempdir().unwrap();
-    for index in 0..5 {
-        write_sample_image(&temp.path().join(format!("{index:02}.png")));
-    }
-    let state = state_for(temp.path());
-    let mut thumbnails = ThumbnailService::new(64);
-    thumbnails.configure_renderer(Picker::halfblocks(), "native:Halfblocks".to_owned());
-
-    let started = Instant::now();
-    thumbnails.prefetch_preview(
-        &state.entries[0],
-        80,
-        24,
-        state.zoom_mode,
-        state.thumbnail_generation,
-    );
-    let deadline = started + Duration::from_millis(50);
-    loop {
-        thumbnails.poll_finished(state.thumbnail_generation);
-        if matches!(
-            thumbnails.get_or_request_preview(
-                &state.entries[0],
-                80,
-                24,
-                state.zoom_mode,
-                state.thumbnail_generation,
-            ),
-            PreviewStatus::Ready { .. }
-        ) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "first preview waited at least as long as the old 50ms loop"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
+    assert!(rgba.width() <= 512 && rgba.height() <= 512);
 }
 
 #[test]

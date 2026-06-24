@@ -5,7 +5,7 @@ use clap::{Parser, ValueEnum};
 use crate::state::SortMode;
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "cullr", version, about = "Terminal image viewer and culler")]
+#[command(name = "cullr", version, about = "Fast GPU-windowed image viewer and culler")]
 pub struct Cli {
     #[arg(short = 'd', long = "directory", value_name = "DIR")]
     pub directory: Option<PathBuf>,
@@ -19,17 +19,8 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub sort: Option<CliSortMode>,
 
-    #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
-    pub backend: BackendChoice,
-
-    #[arg(long)]
-    pub allow_symbol_fallback: bool,
-
     #[arg(long)]
     pub locale: Option<String>,
-
-    #[arg(long, default_value_t = 256)]
-    pub cache_mb: usize,
 
     #[arg(long)]
     pub dry_run_delete: bool,
@@ -44,15 +35,6 @@ pub enum CliSortMode {
     Oldest,
     Name,
     NameDesc,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum BackendChoice {
-    Auto,
-    Native,
-    Chafa,
-    Kitty,
-    Sixel,
 }
 
 impl Cli {

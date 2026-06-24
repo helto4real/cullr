@@ -1,13 +1,11 @@
 use anyhow::Context;
 use clap::Parser;
-use cullr::{app::App, cli::Cli};
+use cullr::{cli::Cli, gui};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing();
-
-    let mut app = App::new(cli).context("failed to initialize cullr")?;
-    app.run()
+    gui::run(cli).context("cullr failed")
 }
 
 fn init_tracing() {
