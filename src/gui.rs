@@ -42,6 +42,7 @@ const THUMB_CACHE: usize = 512;
 const CELL: f32 = 168.0;
 /// Extra grid rows to decode above/below the viewport for smooth scrolling.
 const GRID_PREFETCH_ROWS: usize = 3;
+const EMPTY_MEDIA_PROMPT: &str = "press `r` for recursive search or `q` to quit";
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Variant {
@@ -139,6 +140,7 @@ struct GuiApp {
     active_video: Option<ActiveVideo>,
     video_muted: bool,
     media_type_badges_visible: bool,
+    empty_media_target: PathBuf,
     // Deferred from inside the input closure (which borrows ctx immutably).
     pending_sort: Option<crate::state::SortMode>,
     pending_enrich: bool,
@@ -152,8 +154,18 @@ struct ActiveVideo {
 }
 
 impl GuiApp {
-    fn new(state: AppState, locale: Option<String>, dry_run: bool) -> Self {
+    fn new(
+        state: AppState,
+        locale: Option<String>,
+        dry_run: bool,
+        empty_media_target: PathBuf,
+    ) -> Self {
         let (video_tx, video_rx) = flume::unbounded();
+        let status = if state.entries.is_empty() {
+            empty_media_status(&empty_media_target)
+        } else {
+            String::new()
+        };
         Self {
             state,
             decoder: DecodeService::new(),
@@ -165,7 +177,7 @@ impl GuiApp {
             failed: HashMap::new(),
             locale,
             dry_run,
-            status: String::new(),
+            status,
             grid_cols: 1,
             grid_rows: 1,
             last_visible_rows: 0..0,
@@ -174,6 +186,7 @@ impl GuiApp {
             active_video: None,
             video_muted: true,
             media_type_badges_visible: true,
+            empty_media_target,
             pending_sort: None,
             pending_enrich: false,
             pending_rescan: false,
@@ -448,15 +461,19 @@ impl GuiApp {
             Ok(mut entries) => {
                 sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
                 self.state.set_entries_preserving_current(entries, previous);
-                self.status = format!(
-                    "scanned {} media files{}",
-                    self.state.entries.len(),
-                    if self.state.recursive {
-                        " recursively"
-                    } else {
-                        ""
-                    }
-                );
+                if self.state.entries.is_empty() {
+                    self.status = empty_media_status(&self.empty_media_target);
+                } else {
+                    self.status = format!(
+                        "scanned {} media files{}",
+                        self.state.entries.len(),
+                        if self.state.recursive {
+                            " recursively"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 self.scroll_to_current = true;
             }
             Err(error) => {
@@ -600,7 +617,7 @@ impl GuiApp {
                 self.scroll_to_current = true;
             } else if i.key_pressed(Key::Space) && self.current_is_video() {
                 self.toggle_current_video_playback();
-            } else if i.key_pressed(Key::Space) || (i.key_pressed(Key::D) && !i.modifiers.ctrl) {
+            } else if i.key_pressed(Key::D) && !i.modifiers.ctrl {
                 self.state.toggle_queue_current();
                 self.status = format!("queued: {}", self.state.queue_count());
             }
@@ -691,9 +708,7 @@ impl GuiApp {
     fn draw_preview(&mut self, ui: &mut egui::Ui) {
         let variant = self.preview_variant();
         let Some(entry) = self.state.current_entry() else {
-            ui.centered_and_justified(|ui| {
-                ui.label("No media found.");
-            });
+            draw_empty_media_message(ui, &self.empty_media_target);
             return;
         };
         let key = TexKey {
@@ -733,13 +748,13 @@ impl GuiApp {
     fn draw_grid(&mut self, ui: &mut egui::Ui) {
         let indices = self.grid_indices();
         if indices.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.label(if self.state.mode == ViewMode::DeleteQueueGrid {
-                    "Delete queue is empty."
-                } else {
-                    "No media found."
+            if self.state.mode == ViewMode::DeleteQueueGrid {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Delete queue is empty.");
                 });
-            });
+            } else {
+                draw_empty_media_message(ui, &self.empty_media_target);
+            }
             return;
         }
 
@@ -915,7 +930,7 @@ preview mode:
   l / j / → / ↓   next
 home / end      first / last
 g               toggle grid
-space           queue images, play/pause videos
+space           play / pause videos
 d               toggle delete queue
 u               unqueue current
 shift+D         show delete queue
@@ -1051,6 +1066,211 @@ fn draw_media_type_badge(ui: &egui::Ui, cell_rect: egui::Rect, media_kind: &Medi
     }
 }
 
+fn draw_empty_media_message(ui: &mut egui::Ui, target: &Path) {
+    let rect = ui.available_rect_before_wrap();
+    ui.allocate_rect(rect, egui::Sense::hover());
+
+    let painter = ui.painter();
+    let center_x = rect.center().x;
+    let max_width = (rect.width() * 0.82).clamp(260.0, 900.0);
+    let strong = ui.visuals().strong_text_color();
+    let weak = ui.visuals().weak_text_color();
+    let normal = ui.visuals().text_color();
+
+    let title = centered_text_galley(
+        painter,
+        "No media found".to_owned(),
+        egui::FontId::proportional(24.0),
+        strong,
+        max_width,
+    );
+    let path = centered_text_galley(
+        painter,
+        target.display().to_string(),
+        egui::FontId::monospace(13.0),
+        weak,
+        max_width,
+    );
+    let prompt = EmptyPromptRow::new(painter, normal, strong);
+
+    let title_gap = 8.0;
+    let prompt_gap = 12.0;
+    let total_height = title.size().y + title_gap + path.size().y + prompt_gap + prompt.height;
+    let mut y = rect.center().y - total_height * 0.5;
+
+    paint_centered_galley(painter, center_x, &mut y, title, title_gap, strong);
+    paint_centered_galley(painter, center_x, &mut y, path, prompt_gap, weak);
+    prompt.paint(ui, center_x, y);
+}
+
+fn empty_media_status(target: &Path) -> String {
+    format!(
+        "No media found at {}; {}",
+        target.display(),
+        EMPTY_MEDIA_PROMPT
+    )
+}
+
+fn centered_text_galley(
+    painter: &egui::Painter,
+    text: String,
+    font_id: egui::FontId,
+    color: egui::Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple(text, font_id, color, max_width);
+    job.halign = egui::Align::Center;
+    painter.layout_job(job)
+}
+
+fn paint_centered_galley(
+    painter: &egui::Painter,
+    center_x: f32,
+    y: &mut f32,
+    galley: std::sync::Arc<egui::Galley>,
+    gap_after: f32,
+    fallback_color: egui::Color32,
+) {
+    let height = galley.size().y;
+    painter.galley(egui::pos2(center_x, *y), galley, fallback_color);
+    *y += height + gap_after;
+}
+
+struct EmptyPromptRow {
+    press: std::sync::Arc<egui::Galley>,
+    recursive: std::sync::Arc<egui::Galley>,
+    quit: std::sync::Arc<egui::Galley>,
+    r: std::sync::Arc<egui::Galley>,
+    q: std::sync::Arc<egui::Galley>,
+    key_size: egui::Vec2,
+    height: f32,
+    width: f32,
+}
+
+impl EmptyPromptRow {
+    fn new(painter: &egui::Painter, text_color: egui::Color32, key_color: egui::Color32) -> Self {
+        let text_font = egui::FontId::proportional(15.0);
+        let key_font = egui::FontId::monospace(15.0);
+        let press = painter.layout_no_wrap("Press".to_owned(), text_font.clone(), text_color);
+        let recursive =
+            painter.layout_no_wrap("for recursive search or".to_owned(), text_font, text_color);
+        let quit = painter.layout_no_wrap(
+            "to quit.".to_owned(),
+            egui::FontId::proportional(15.0),
+            text_color,
+        );
+        let r = painter.layout_no_wrap("r".to_owned(), key_font.clone(), key_color);
+        let q = painter.layout_no_wrap("q".to_owned(), key_font, key_color);
+        let key_padding = egui::vec2(7.0, 3.0);
+        let key_size = egui::vec2(
+            r.size().x.max(q.size().x) + key_padding.x * 2.0,
+            r.size().y.max(q.size().y) + key_padding.y * 2.0,
+        );
+        let gap = 6.0;
+        let width = press.size().x
+            + gap
+            + key_size.x
+            + gap
+            + recursive.size().x
+            + gap
+            + key_size.x
+            + gap
+            + quit.size().x;
+        let height = press
+            .size()
+            .y
+            .max(recursive.size().y)
+            .max(quit.size().y)
+            .max(key_size.y);
+
+        Self {
+            press,
+            recursive,
+            quit,
+            r,
+            q,
+            key_size,
+            height,
+            width,
+        }
+    }
+
+    fn paint(&self, ui: &egui::Ui, center_x: f32, y: f32) {
+        let painter = ui.painter();
+        let mut x = center_x - self.width * 0.5;
+        let gap = 6.0;
+        let text_color = ui.visuals().text_color();
+
+        paint_row_galley(
+            painter,
+            &mut x,
+            y,
+            self.height,
+            self.press.clone(),
+            gap,
+            text_color,
+        );
+        self.paint_key(ui, &mut x, y, self.r.clone(), gap);
+        paint_row_galley(
+            painter,
+            &mut x,
+            y,
+            self.height,
+            self.recursive.clone(),
+            gap,
+            text_color,
+        );
+        self.paint_key(ui, &mut x, y, self.q.clone(), gap);
+        paint_row_galley(
+            painter,
+            &mut x,
+            y,
+            self.height,
+            self.quit.clone(),
+            0.0,
+            text_color,
+        );
+    }
+
+    fn paint_key(
+        &self,
+        ui: &egui::Ui,
+        x: &mut f32,
+        y: f32,
+        key: std::sync::Arc<egui::Galley>,
+        gap_after: f32,
+    ) {
+        let painter = ui.painter();
+        let key_top = y + (self.height - self.key_size.y) * 0.5;
+        let rect = egui::Rect::from_min_size(egui::pos2(*x, key_top), self.key_size);
+        painter.rect_filled(rect, 4.0, ui.visuals().widgets.inactive.bg_fill);
+        painter.rect_stroke(
+            rect,
+            4.0,
+            ui.visuals().widgets.inactive.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let key_pos = rect.center() - key.size() * 0.5;
+        painter.galley(key_pos, key, ui.visuals().strong_text_color());
+        *x += self.key_size.x + gap_after;
+    }
+}
+
+fn paint_row_galley(
+    painter: &egui::Painter,
+    x: &mut f32,
+    y: f32,
+    row_height: f32,
+    galley: std::sync::Arc<egui::Galley>,
+    gap_after: f32,
+    fallback_color: egui::Color32,
+) {
+    let pos = egui::pos2(*x, y + (row_height - galley.size().y) * 0.5);
+    let width = galley.size().x;
+    painter.galley(pos, galley, fallback_color);
+    *x += width + gap_after;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1098,6 +1318,17 @@ mod tests {
             false
         ));
     }
+
+    #[test]
+    fn empty_media_status_mentions_target_recursive_search_and_quit() {
+        let status = empty_media_status(Path::new("/tmp/empty-media"));
+
+        assert!(status.contains("No media found"));
+        assert!(status.contains("/tmp/empty-media"));
+        assert!(status.contains("`r`"));
+        assert!(status.contains("recursive search"));
+        assert!(status.contains("`q`"));
+    }
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -1112,11 +1343,7 @@ pub fn run(cli: Cli) -> Result<()> {
         extensions: extensions.clone(),
     })?;
     sorter::sort_entries(&mut entries, sort_mode, cli.locale.as_deref());
-
-    if entries.is_empty() {
-        println!("No media found in {}", directory.display());
-        return Ok(());
-    }
+    let empty_media_target = initial_file.clone().unwrap_or_else(|| directory.clone());
 
     let mut state = AppState::new(
         directory,
@@ -1140,7 +1367,12 @@ pub fn run(cli: Cli) -> Result<()> {
         count = state.entries.len(),
         "opened"
     );
-    let app = GuiApp::new(state, cli.locale.clone(), cli.dry_run_delete);
+    let app = GuiApp::new(
+        state,
+        cli.locale.clone(),
+        cli.dry_run_delete,
+        empty_media_target,
+    );
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

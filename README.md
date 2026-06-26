@@ -81,7 +81,7 @@ directory.
 | `j` / `k` | Move down or up one row in grid mode. |
 | `ctrl+d` / `ctrl+u` | Move half a page down or up in grid mode. |
 | `home` / `end` | Jump to the first or last file. |
-| `space` | Toggle the current image in the delete queue, or play/pause the current video. |
+| `space` | Play or pause the current video. |
 | `d` | Toggle the current file in the delete queue. |
 | `u` | Remove the current file from the delete queue. |
 | `shift+D` | Show the delete queue grid. |
@@ -125,7 +125,7 @@ Video support requires FFmpeg shared libraries available to the system linker.
 
 Deletion is intentionally staged:
 
-- Mark files with `space` or `d`.
+- Mark files with `d`.
 - Review the queue with `shift+D`.
 - Press `ctrl+R`, then confirm with `y`.
 
