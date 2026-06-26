@@ -10,9 +10,15 @@ use exif::{In, Reader, Tag, Value};
 use image::ImageReader;
 use time::{PrimitiveDateTime, macros::format_description};
 
-use crate::state::ImageEntry;
+use crate::state::MediaEntry;
 
-pub fn enrich_entry(entry: &mut ImageEntry) {
+pub fn enrich_entry(entry: &mut MediaEntry) {
+    if !entry.media_kind.is_image() {
+        entry.dimensions_attempted = true;
+        entry.exif_attempted = true;
+        return;
+    }
+
     if entry.dimensions.is_none() && !entry.dimensions_attempted {
         entry.dimensions_attempted = true;
         if let Ok((width, height)) = image::image_dimensions(&entry.path) {
@@ -29,8 +35,12 @@ pub fn enrich_entry(entry: &mut ImageEntry) {
     }
 }
 
-pub fn enrich_entries_for_time_sort(entries: &mut [ImageEntry]) {
+pub fn enrich_entries_for_time_sort(entries: &mut [MediaEntry]) {
     for entry in entries {
+        if !entry.media_kind.is_image() {
+            entry.exif_attempted = true;
+            continue;
+        }
         if entry.exif_date.is_none() && !entry.exif_attempted {
             entry.exif_attempted = true;
             if let Ok(exif) = read_exif_metadata(&entry.path) {
@@ -41,7 +51,7 @@ pub fn enrich_entries_for_time_sort(entries: &mut [ImageEntry]) {
     }
 }
 
-pub fn load_oriented_image(entry: &ImageEntry) -> Result<image::DynamicImage> {
+pub fn load_oriented_image(entry: &MediaEntry) -> Result<image::DynamicImage> {
     let image = ImageReader::open(&entry.path)
         .with_context(|| format!("failed to open {}", entry.path.display()))?
         .decode()
@@ -91,7 +101,7 @@ pub fn read_exif_metadata(path: &Path) -> Result<ExifMetadata> {
     Ok(ExifMetadata { date, orientation })
 }
 
-pub fn effective_date(entry: &ImageEntry) -> Option<SystemTime> {
+pub fn effective_date(entry: &MediaEntry) -> Option<SystemTime> {
     entry.exif_date.or(entry.created).or(entry.modified)
 }
 
@@ -119,7 +129,7 @@ fn parse_exif_datetime(value: String) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ImageKind, SortMode};
+    use crate::state::{ImageKind, MediaKind, SortMode};
     use std::{ffi::OsString, path::PathBuf};
 
     #[test]
@@ -131,7 +141,7 @@ mod tests {
     fn effective_date_prefers_exif() {
         let exif = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let created = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let entry = ImageEntry {
+        let entry = MediaEntry {
             path: PathBuf::from("a.jpg"),
             file_name: OsString::from("a.jpg"),
             display_name: "a.jpg".to_owned(),
@@ -141,7 +151,7 @@ mod tests {
             modified: None,
             discovered_order: 0,
             dimensions: None,
-            image_type: Some(ImageKind::Jpeg),
+            media_kind: MediaKind::Image(ImageKind::Jpeg),
             exif_date: Some(exif),
             exif_orientation: None,
             dimensions_attempted: false,

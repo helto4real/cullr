@@ -7,7 +7,7 @@ use std::{
 use indexmap::IndexSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageEntry {
+pub struct MediaEntry {
     pub path: PathBuf,
     pub file_name: OsString,
     pub display_name: String,
@@ -17,14 +17,27 @@ pub struct ImageEntry {
     pub modified: Option<SystemTime>,
     pub discovered_order: usize,
     pub dimensions: Option<(u32, u32)>,
-    pub image_type: Option<ImageKind>,
+    pub media_kind: MediaKind,
     pub exif_date: Option<SystemTime>,
     pub exif_orientation: Option<u16>,
     pub dimensions_attempted: bool,
     pub exif_attempted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaMode {
+    Both,
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MediaKind {
+    Image(ImageKind),
+    Video(VideoKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ImageKind {
     Jpeg,
     Png,
@@ -35,7 +48,23 @@ pub enum ImageKind {
     Avif,
     Qoi,
     Ico,
-    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VideoKind {
+    Mp4,
+    M4v,
+    Mov,
+    Mkv,
+    WebM,
+    Avi,
+    Mpeg,
+    M2v,
+    TransportStream,
+    Wmv,
+    Flv,
+    ThreeGp,
+    Ogv,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +104,7 @@ pub struct AppState {
     pub recursive: bool,
     pub include_hidden: bool,
     pub extensions: Vec<String>,
-    pub entries: Vec<ImageEntry>,
+    pub entries: Vec<MediaEntry>,
     pub current_index: usize,
     pub mode: ViewMode,
     pub sort_mode: SortMode,
@@ -101,7 +130,7 @@ impl AppState {
         include_hidden: bool,
         extensions: Vec<String>,
         sort_mode: SortMode,
-        entries: Vec<ImageEntry>,
+        entries: Vec<MediaEntry>,
     ) -> Self {
         Self {
             directory,
@@ -128,11 +157,11 @@ impl AppState {
         }
     }
 
-    pub fn current_entry(&self) -> Option<&ImageEntry> {
+    pub fn current_entry(&self) -> Option<&MediaEntry> {
         self.entries.get(self.current_index)
     }
 
-    pub fn current_entry_mut(&mut self) -> Option<&mut ImageEntry> {
+    pub fn current_entry_mut(&mut self) -> Option<&mut MediaEntry> {
         self.entries.get_mut(self.current_index)
     }
 
@@ -218,7 +247,7 @@ impl AppState {
 
     pub fn set_entries_preserving_current(
         &mut self,
-        entries: Vec<ImageEntry>,
+        entries: Vec<MediaEntry>,
         previous: Option<PathBuf>,
     ) {
         self.entries = entries;
@@ -328,6 +357,29 @@ impl AppState {
     }
 }
 
+impl MediaKind {
+    pub fn from_extension(ext: Option<&str>) -> Option<Self> {
+        ImageKind::from_extension(ext)
+            .map(Self::Image)
+            .or_else(|| VideoKind::from_extension(ext).map(Self::Video))
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Image(_))
+    }
+
+    pub fn is_video(&self) -> bool {
+        matches!(self, Self::Video(_))
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Image(kind) => kind.as_str(),
+            Self::Video(kind) => kind.as_str(),
+        }
+    }
+}
+
 impl ImageKind {
     pub fn from_extension(ext: Option<&str>) -> Option<Self> {
         match ext?.to_ascii_lowercase().as_str() {
@@ -340,7 +392,7 @@ impl ImageKind {
             "avif" => Some(Self::Avif),
             "qoi" => Some(Self::Qoi),
             "ico" => Some(Self::Ico),
-            other => Some(Self::Unknown(other.to_owned())),
+            _ => None,
         }
     }
 
@@ -355,7 +407,45 @@ impl ImageKind {
             Self::Avif => "AVIF",
             Self::Qoi => "QOI",
             Self::Ico => "ICO",
-            Self::Unknown(value) => value.as_str(),
+        }
+    }
+}
+
+impl VideoKind {
+    pub fn from_extension(ext: Option<&str>) -> Option<Self> {
+        match ext?.to_ascii_lowercase().as_str() {
+            "mp4" => Some(Self::Mp4),
+            "m4v" => Some(Self::M4v),
+            "mov" => Some(Self::Mov),
+            "mkv" => Some(Self::Mkv),
+            "webm" => Some(Self::WebM),
+            "avi" => Some(Self::Avi),
+            "mpg" | "mpeg" => Some(Self::Mpeg),
+            "m2v" => Some(Self::M2v),
+            "ts" | "m2ts" | "mts" => Some(Self::TransportStream),
+            "wmv" => Some(Self::Wmv),
+            "flv" => Some(Self::Flv),
+            "3gp" | "3g2" => Some(Self::ThreeGp),
+            "ogv" => Some(Self::Ogv),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Mp4 => "MP4",
+            Self::M4v => "M4V",
+            Self::Mov => "MOV",
+            Self::Mkv => "Matroska",
+            Self::WebM => "WebM",
+            Self::Avi => "AVI",
+            Self::Mpeg => "MPEG",
+            Self::M2v => "MPEG-2 Video",
+            Self::TransportStream => "Transport Stream",
+            Self::Wmv => "WMV",
+            Self::Flv => "FLV",
+            Self::ThreeGp => "3GP",
+            Self::Ogv => "Ogg Video",
         }
     }
 }
@@ -364,8 +454,8 @@ impl ImageKind {
 mod tests {
     use super::*;
 
-    fn entry(name: &str, order: usize) -> ImageEntry {
-        ImageEntry {
+    fn entry(name: &str, order: usize) -> MediaEntry {
+        MediaEntry {
             path: PathBuf::from(name),
             file_name: OsString::from(name),
             display_name: name.to_owned(),
@@ -375,7 +465,7 @@ mod tests {
             modified: None,
             discovered_order: order,
             dimensions: None,
-            image_type: Some(ImageKind::Jpeg),
+            media_kind: MediaKind::Image(ImageKind::Jpeg),
             exif_date: None,
             exif_orientation: None,
             dimensions_attempted: false,
@@ -432,5 +522,18 @@ mod tests {
         state.page_by(1);
 
         assert_eq!(state.current_index, 4);
+    }
+
+    #[test]
+    fn media_kind_classifies_image_and_video_extensions() {
+        assert_eq!(
+            MediaKind::from_extension(Some("jpg")),
+            Some(MediaKind::Image(ImageKind::Jpeg))
+        );
+        assert_eq!(
+            MediaKind::from_extension(Some("mp4")),
+            Some(MediaKind::Video(VideoKind::Mp4))
+        );
+        assert_eq!(MediaKind::from_extension(Some("txt")), None);
     }
 }

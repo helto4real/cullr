@@ -6,3 +6,4 @@ pub mod metadata;
 pub mod scanner;
 pub mod sorter;
 pub mod state;
+pub mod video;

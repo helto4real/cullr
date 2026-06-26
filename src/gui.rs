@@ -24,7 +24,8 @@ use crate::{
     delete, metadata,
     scanner::{ScanOptions, scan_directory},
     sorter,
-    state::{AppState, ViewMode, ZoomMode},
+    state::{AppState, MediaKind, ViewMode, ZoomMode},
+    video,
 };
 
 /// Long-edge cap for fit-to-window decodes. A fit view never needs more pixels
@@ -32,7 +33,7 @@ use crate::{
 const FIT_CAP: u32 = 3840;
 /// Long-edge cap for grid thumbnails.
 const THUMB_CAP: u32 = 320;
-/// How many images on each side of the current one to decode ahead in preview.
+/// How many media files on each side of the current one to decode ahead in preview.
 const PREFETCH_RADIUS: usize = 4;
 /// Resident texture budgets (previews are large, thumbnails small).
 const PREVIEW_CACHE: usize = 32;
@@ -63,6 +64,7 @@ impl Variant {
 struct TexKey {
     path: PathBuf,
     variant: Variant,
+    media_kind: MediaKind,
 }
 
 struct DecodeRequest {
@@ -92,8 +94,15 @@ impl DecodeService {
             let result_tx = result_tx.clone();
             thread::spawn(move || {
                 for job in job_rx.iter() {
-                    let image =
-                        decode_rgba_capped(&job.key.path, job.key.variant.cap()).map_err(|e| format!("{e:#}"));
+                    let image = match &job.key.media_kind {
+                        MediaKind::Image(_) => {
+                            decode_rgba_capped(&job.key.path, job.key.variant.cap())
+                        }
+                        MediaKind::Video(_) => {
+                            video::decode_first_frame_rgba(&job.key.path, job.key.variant.cap())
+                        }
+                    }
+                    .map_err(|e| format!("{e:#}"));
                     tracing::debug!(path = %job.key.path.display(), ok = image.is_ok(), "decoded");
                     let _ = result_tx.send(DecodeResult {
                         key: job.key,
@@ -113,6 +122,8 @@ impl DecodeService {
 struct GuiApp {
     state: AppState,
     decoder: DecodeService,
+    video_tx: Sender<video::PlaybackEvent>,
+    video_rx: Receiver<video::PlaybackEvent>,
     previews: LruCache<TexKey, egui::TextureHandle>,
     thumbs: LruCache<TexKey, egui::TextureHandle>,
     inflight: HashSet<TexKey>,
@@ -125,17 +136,28 @@ struct GuiApp {
     last_visible_rows: std::ops::Range<usize>,
     scroll_to_current: bool,
     fullscreen: bool,
+    active_video: Option<ActiveVideo>,
+    video_muted: bool,
     // Deferred from inside the input closure (which borrows ctx immutably).
     pending_sort: Option<crate::state::SortMode>,
     pending_enrich: bool,
     pending_rescan: bool,
 }
 
+struct ActiveVideo {
+    handle: video::PlaybackHandle,
+    texture: Option<egui::TextureHandle>,
+    ended: bool,
+}
+
 impl GuiApp {
     fn new(state: AppState, locale: Option<String>, dry_run: bool) -> Self {
+        let (video_tx, video_rx) = flume::unbounded();
         Self {
             state,
             decoder: DecodeService::new(),
+            video_tx,
+            video_rx,
             previews: LruCache::new(NonZeroUsize::new(PREVIEW_CACHE).unwrap()),
             thumbs: LruCache::new(NonZeroUsize::new(THUMB_CACHE).unwrap()),
             inflight: HashSet::new(),
@@ -148,6 +170,8 @@ impl GuiApp {
             last_visible_rows: 0..0,
             scroll_to_current: false,
             fullscreen: false,
+            active_video: None,
+            video_muted: true,
             pending_sort: None,
             pending_enrich: false,
             pending_rescan: false,
@@ -182,8 +206,7 @@ impl GuiApp {
         }
         let current = self.state.current_index as isize;
         let target = (current + delta).clamp(0, len as isize - 1);
-        self.state.current_index = target as usize;
-        self.scroll_to_current = true;
+        self.set_current_index(target as usize);
     }
 
     fn ensure_requested(&mut self) {
@@ -203,7 +226,11 @@ impl GuiApp {
                 for index in wanted {
                     if let Some(entry) = self.state.entries.get(index) {
                         let path = entry.path.clone();
-                        self.request(TexKey { path, variant });
+                        self.request(TexKey {
+                            path,
+                            variant,
+                            media_kind: entry.media_kind.clone(),
+                        });
                     }
                 }
             }
@@ -214,7 +241,10 @@ impl GuiApp {
                 let indices = self.grid_indices();
                 let cols = self.grid_cols.max(1);
                 let total_rows = indices.len().div_ceil(cols);
-                let start = self.last_visible_rows.start.saturating_sub(GRID_PREFETCH_ROWS);
+                let start = self
+                    .last_visible_rows
+                    .start
+                    .saturating_sub(GRID_PREFETCH_ROWS);
                 let end = (self.last_visible_rows.end + GRID_PREFETCH_ROWS).min(total_rows);
                 for slot in (start * cols)..(end * cols).min(indices.len()) {
                     if let Some(&index) = indices.get(slot)
@@ -224,6 +254,7 @@ impl GuiApp {
                         self.request(TexKey {
                             path,
                             variant: Variant::Thumb,
+                            media_kind: entry.media_kind.clone(),
                         });
                     }
                 }
@@ -266,7 +297,119 @@ impl GuiApp {
         }
     }
 
+    fn drain_video_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.video_rx.try_recv() {
+            let Some(active) = self.active_video.as_mut() else {
+                continue;
+            };
+            if active.handle.path() != event.path {
+                continue;
+            }
+            if let Some(error) = event.error {
+                active.ended = true;
+                self.status = format!("video failed: {error}");
+            }
+            if let Some(image) = event.frame {
+                let size = [image.width() as usize, image.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+                active.texture = Some(ctx.load_texture(
+                    format!("video-playback:{}", event.path.display()),
+                    color,
+                    egui::TextureOptions::LINEAR,
+                ));
+                ctx.request_repaint();
+            }
+            if event.ended {
+                active.ended = true;
+                active.handle.set_paused(true);
+                self.status = "video ended".to_owned();
+            }
+        }
+    }
+
+    fn current_is_video(&self) -> bool {
+        self.state
+            .current_entry()
+            .map(|entry| entry.media_kind.is_video())
+            .unwrap_or(false)
+    }
+
+    fn active_video_for(&self, path: &Path) -> Option<&ActiveVideo> {
+        self.active_video
+            .as_ref()
+            .filter(|active| active.handle.path() == path)
+    }
+
+    fn stop_active_video(&mut self) {
+        if let Some(active) = self.active_video.take() {
+            active.handle.stop();
+        }
+    }
+
+    fn toggle_current_video_playback(&mut self) {
+        let Some(entry) = self.state.current_entry() else {
+            return;
+        };
+        if !entry.media_kind.is_video() {
+            return;
+        }
+        let path = entry.path.clone();
+
+        if let Some(active) = self.active_video.as_mut()
+            && active.handle.path() == path
+            && !active.ended
+        {
+            let paused = !active.handle.is_paused();
+            active.handle.set_paused(paused);
+            self.status = if paused {
+                "video paused".to_owned()
+            } else {
+                "video playing".to_owned()
+            };
+            return;
+        }
+
+        self.stop_active_video();
+        let handle = video::spawn_playback(
+            path.clone(),
+            FIT_CAP,
+            self.video_muted,
+            self.video_tx.clone(),
+        );
+        self.active_video = Some(ActiveVideo {
+            handle,
+            texture: None,
+            ended: false,
+        });
+        self.status = if self.video_muted {
+            "video playing muted".to_owned()
+        } else {
+            "video playing with audio".to_owned()
+        };
+    }
+
+    fn toggle_video_mute(&mut self) {
+        self.video_muted = !self.video_muted;
+        if let Some(active) = &self.active_video {
+            active.handle.set_muted(self.video_muted);
+        }
+        self.status = if self.video_muted {
+            "video muted".to_owned()
+        } else {
+            "video unmuted".to_owned()
+        };
+    }
+
+    fn set_current_index(&mut self, index: usize) {
+        if index != self.state.current_index {
+            self.stop_active_video();
+        }
+        self.state.current_index = index.min(self.state.entries.len().saturating_sub(1));
+        self.scroll_to_current = true;
+    }
+
     fn resort(&mut self, new_mode: crate::state::SortMode) {
+        self.stop_active_video();
         let previous = self.state.current_path();
         self.state.sort_mode = new_mode;
         sorter::sort_entries(&mut self.state.entries, new_mode, self.locale.as_deref());
@@ -277,6 +420,7 @@ impl GuiApp {
     }
 
     fn rescan(&mut self) {
+        self.stop_active_video();
         let previous = self.state.current_path();
         let result = scan_directory(ScanOptions {
             root: self.state.directory.clone(),
@@ -289,9 +433,13 @@ impl GuiApp {
                 sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
                 self.state.set_entries_preserving_current(entries, previous);
                 self.status = format!(
-                    "scanned {} images{}",
+                    "scanned {} media files{}",
                     self.state.entries.len(),
-                    if self.state.recursive { " recursively" } else { "" }
+                    if self.state.recursive {
+                        " recursively"
+                    } else {
+                        ""
+                    }
                 );
                 self.scroll_to_current = true;
             }
@@ -302,9 +450,14 @@ impl GuiApp {
     }
 
     fn confirm_delete(&mut self) {
+        self.stop_active_video();
         self.state.confirm_delete = false;
         let report = delete::delete_queued(&mut self.state, self.dry_run);
-        let verb = if report.dry_run { "would delete" } else { "deleted" };
+        let verb = if report.dry_run {
+            "would delete"
+        } else {
+            "deleted"
+        };
         if report.failed.is_empty() {
             self.status = format!("{verb} {} files", report.deleted.len());
         } else {
@@ -337,10 +490,7 @@ impl GuiApp {
 
         let cols = self.grid_cols.max(1);
         let rows = self.grid_rows.max(1);
-        let in_grid = matches!(
-            self.state.mode,
-            ViewMode::Grid | ViewMode::DeleteQueueGrid
-        );
+        let in_grid = matches!(self.state.mode, ViewMode::Grid | ViewMode::DeleteQueueGrid);
 
         // Viewport commands must be issued OUTSIDE the input closure — calling
         // them while ctx.input() holds the context lock silently drops them.
@@ -392,7 +542,11 @@ impl GuiApp {
                     || i.key_pressed(Key::ArrowRight)
                     || i.key_pressed(Key::ArrowDown)
                 {
+                    let before = self.state.current_index;
                     self.state.next();
+                    if self.state.current_index != before {
+                        self.stop_active_video();
+                    }
                     self.scroll_to_current = true;
                 }
                 if i.key_pressed(Key::H)
@@ -400,23 +554,36 @@ impl GuiApp {
                     || i.key_pressed(Key::ArrowLeft)
                     || i.key_pressed(Key::ArrowUp)
                 {
+                    let before = self.state.current_index;
                     self.state.previous();
+                    if self.state.current_index != before {
+                        self.stop_active_video();
+                    }
                     self.scroll_to_current = true;
                 }
             }
             if i.key_pressed(Key::Home) {
+                if self.state.current_index != 0 {
+                    self.stop_active_video();
+                }
                 self.state.first();
                 self.scroll_to_current = true;
             }
             if i.key_pressed(Key::End) {
+                let before = self.state.current_index;
                 self.state.last();
+                if self.state.current_index != before {
+                    self.stop_active_video();
+                }
                 self.scroll_to_current = true;
             }
 
-            // Delete queue. Plain d/space toggle; shift+D opens the queue view.
+            // Delete queue and video playback.
             if i.modifiers.shift && i.key_pressed(Key::D) {
                 self.state.enter_delete_queue_grid();
                 self.scroll_to_current = true;
+            } else if i.key_pressed(Key::Space) && self.current_is_video() {
+                self.toggle_current_video_playback();
             } else if i.key_pressed(Key::Space) || (i.key_pressed(Key::D) && !i.modifiers.ctrl) {
                 self.state.toggle_queue_current();
                 self.status = format!("queued: {}", self.state.queue_count());
@@ -463,6 +630,9 @@ impl GuiApp {
             if i.key_pressed(Key::F) {
                 toggle_fullscreen = true;
             }
+            if i.key_pressed(Key::M) {
+                self.toggle_video_mute();
+            }
             if i.key_pressed(Key::T) {
                 self.pending_sort = Some(sorter::next_time_sort(self.state.sort_mode));
             }
@@ -494,6 +664,7 @@ impl GuiApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
         if close {
+            self.stop_active_video();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -502,17 +673,23 @@ impl GuiApp {
         let variant = self.preview_variant();
         let Some(entry) = self.state.current_entry() else {
             ui.centered_and_justified(|ui| {
-                ui.label("No images found.");
+                ui.label("No media found.");
             });
             return;
         };
         let key = TexKey {
             path: entry.path.clone(),
             variant,
+            media_kind: entry.media_kind.clone(),
         };
         let name = entry.display_name.clone();
 
-        if let Some(handle) = self.previews.get(&key) {
+        if let Some(handle) = self
+            .active_video_for(&entry.path)
+            .and_then(|active| active.texture.as_ref())
+            .cloned()
+            .or_else(|| self.previews.get(&key).cloned())
+        {
             let avail = ui.available_size();
             let tex = handle.size_vec2();
             let scale = match self.state.zoom_mode {
@@ -521,7 +698,7 @@ impl GuiApp {
             };
             let draw = tex * scale;
             ui.centered_and_justified(|ui| {
-                ui.add(egui::Image::new(handle).fit_to_exact_size(draw));
+                ui.add(egui::Image::new(&handle).fit_to_exact_size(draw));
             });
         } else if let Some(error) = self.failed.get(&key) {
             ui.centered_and_justified(|ui| {
@@ -541,7 +718,7 @@ impl GuiApp {
                 ui.label(if self.state.mode == ViewMode::DeleteQueueGrid {
                     "Delete queue is empty."
                 } else {
-                    "No images found."
+                    "No media found."
                 });
             });
             return;
@@ -599,23 +776,25 @@ impl GuiApp {
         let key = TexKey {
             path: path.clone(),
             variant: Variant::Thumb,
+            media_kind: entry.media_kind.clone(),
         };
 
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(CELL, CELL), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL, CELL), egui::Sense::click());
 
-        if let Some(handle) = self.thumbs.get(&key) {
+        if let Some(handle) = self
+            .active_video_for(&path)
+            .and_then(|active| active.texture.as_ref())
+            .cloned()
+            .or_else(|| self.thumbs.get(&key).cloned())
+        {
             let tex = handle.size_vec2();
             let scale = ((CELL - 8.0) / tex.x).min((CELL - 8.0) / tex.y);
             let draw = tex * scale;
             let image_rect = egui::Rect::from_center_size(rect.center(), draw);
-            egui::Image::new(handle).paint_at(ui, image_rect);
+            egui::Image::new(&handle).paint_at(ui, image_rect);
         } else {
-            ui.painter().rect_filled(
-                rect,
-                4.0,
-                ui.visuals().extreme_bg_color,
-            );
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
         }
 
         let stroke = if is_current {
@@ -625,7 +804,8 @@ impl GuiApp {
         } else {
             egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
         };
-        ui.painter().rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
+        ui.painter()
+            .rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
 
         if is_queued {
             ui.painter().text(
@@ -638,10 +818,10 @@ impl GuiApp {
         }
 
         if response.clicked() {
-            self.state.current_index = index;
+            self.set_current_index(index);
         }
         if response.double_clicked() {
-            self.state.current_index = index;
+            self.set_current_index(index);
             self.state.mode = ViewMode::Preview;
         }
     }
@@ -662,11 +842,7 @@ impl GuiApp {
                 .dimensions
                 .map(|(w, h)| format!("{w}×{h}"))
                 .unwrap_or_else(|| "—".to_owned());
-            let kind = entry
-                .image_type
-                .as_ref()
-                .map(|k| k.as_str().to_owned())
-                .unwrap_or_else(|| "—".to_owned());
+            let kind = entry.media_kind.as_str().to_owned();
             let info = format!(
                 "{}\npath: {}\nsize: {} bytes\ndimensions: {}\ntype: {}",
                 entry.display_name,
@@ -701,7 +877,7 @@ impl GuiApp {
 
 const HELP_TEXT: &str = "\
 grid (library) mode:
-  h / l           left / right one image
+  h / l           left / right one file
   j / k           down / up one row
   ctrl+d / ctrl+u half page down / up
   enter           open highlighted
@@ -710,12 +886,14 @@ preview mode:
   l / j / → / ↓   next
 home / end      first / last
 g               toggle grid
-space / d       toggle delete queue
+space           queue images, play/pause videos
+d               toggle delete queue
 u               unqueue current
 shift+D         show delete queue
 ctrl+R          delete queued (confirm)
 z               toggle fit / original zoom
 f               toggle fullscreen window
+m               mute / unmute video audio
 t / n           cycle time / name sort
 r               toggle recursive scan
 shift+R         rescan directory
@@ -727,6 +905,7 @@ impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_input(ctx);
         self.drain_results(ctx);
+        self.drain_video_events(ctx);
         self.ensure_requested();
 
         let mode = match self.state.mode {
@@ -741,12 +920,17 @@ impl eframe::App for GuiApp {
         let position = if self.state.entries.is_empty() {
             "0 / 0".to_owned()
         } else {
-            format!("{} / {}", self.state.current_index + 1, self.state.entries.len())
+            format!(
+                "{} / {}",
+                self.state.current_index + 1,
+                self.state.entries.len()
+            )
         };
         let status = format!(
-            "{mode}  |  {position}  |  {zoom}  |  queued: {}  |  sort: {:?}  |  {}",
+            "{mode}  |  {position}  |  {zoom}  |  queued: {}  |  sort: {:?}  |  audio: {}  |  {}",
             self.state.queue_count(),
             self.state.sort_mode,
+            if self.video_muted { "muted" } else { "on" },
             self.status,
         );
 
@@ -760,7 +944,12 @@ impl eframe::App for GuiApp {
         self.draw_overlays(ctx);
 
         self.scroll_to_current = false;
-        if !self.inflight.is_empty() {
+        if !self.inflight.is_empty()
+            || self
+                .active_video
+                .as_ref()
+                .is_some_and(|active| !active.handle.is_paused() && !active.ended)
+        {
             ctx.request_repaint();
         }
     }
@@ -769,17 +958,7 @@ impl eframe::App for GuiApp {
 pub fn run(cli: Cli) -> Result<()> {
     let input = cli.path.as_deref().or(cli.directory.as_deref());
     let (directory, initial_file) = resolve_input(input)?;
-    let mut extensions = cli.resolved_extensions();
-    // When opening a specific file, make sure its own extension is scanned even
-    // if it isn't in the default/--file_ext set, so it actually shows up.
-    if let Some(file) = &initial_file
-        && let Some(ext) = file.extension().and_then(|e| e.to_str())
-    {
-        let ext = ext.to_ascii_lowercase();
-        if !extensions.contains(&ext) {
-            extensions.push(ext);
-        }
-    }
+    let extensions = cli.resolved_extensions();
     let sort_mode = cli.initial_sort_mode();
     let mut entries = scan_directory(ScanOptions {
         root: directory.clone(),
@@ -790,12 +969,18 @@ pub fn run(cli: Cli) -> Result<()> {
     sorter::sort_entries(&mut entries, sort_mode, cli.locale.as_deref());
 
     if entries.is_empty() {
-        println!("No images found in {}", directory.display());
+        println!("No media found in {}", directory.display());
         return Ok(());
     }
 
-    let mut state =
-        AppState::new(directory, cli.recursive, cli.hidden, extensions, sort_mode, entries);
+    let mut state = AppState::new(
+        directory,
+        cli.recursive,
+        cli.hidden,
+        extensions,
+        sort_mode,
+        entries,
+    );
     // Start positioned on the requested file (after sorting).
     if let Some(file) = &initial_file
         && let Some(index) = state.entries.iter().position(|entry| entry.path == *file)
@@ -842,6 +1027,9 @@ fn resolve_input(input: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>)> {
             .to_path_buf();
         Ok((directory, Some(canonical)))
     } else {
-        Err(anyhow!("{} is not a file or directory", canonical.display()))
+        Err(anyhow!(
+            "{} is not a file or directory",
+            canonical.display()
+        ))
     }
 }

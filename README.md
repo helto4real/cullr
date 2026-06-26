@@ -1,23 +1,24 @@
 # cullr
 
-`cullr` is a fast desktop image viewer and culling tool for reviewing a folder
-of images, marking rejects, and deleting the queued files only after an explicit
-confirmation step.
+`cullr` is a fast desktop media viewer and culling tool for reviewing a folder
+of images and videos, marking rejects, and deleting the queued files only after
+an explicit confirmation step.
 
 ![cullr workflow infographic](docs/cullr-infographic.png)
 
 ## What It Does
 
-- Opens an image directory, or opens a specific file positioned inside its
+- Opens a media directory, or opens a specific file positioned inside its
   parent directory.
 - Shows a large preview view and a thumbnail grid view for fast review.
 - Decodes images on worker threads and uploads them as GPU textures, so the
   window can resize without re-decoding every frame.
 - Uses libjpeg-turbo scaled decode for large JPEG previews, with other formats
   decoded through the Rust `image` crate.
+- Uses linked FFmpeg libraries for video thumbnails and playback.
 - Keeps preview and thumbnail data in memory; it does not write image cache
   files into the input directory.
-- Lets you queue images for deletion, inspect the queue, and confirm before
+- Lets you queue media for deletion, inspect the queue, and confirm before
   files are removed.
 
 ## Quick Start
@@ -25,26 +26,26 @@ confirmation step.
 Run from source with Cargo:
 
 ```sh
-cargo run -- /path/to/images
+cargo run -- /path/to/media
 ```
 
 Scan subfolders too:
 
 ```sh
-cargo run -- --recursive /path/to/images
+cargo run -- --recursive /path/to/media
 ```
 
 Try the delete flow without removing files:
 
 ```sh
-cargo run -- --dry-run-delete /path/to/images
+cargo run -- --dry-run-delete /path/to/media
 ```
 
 Build a release binary:
 
 ```sh
 cargo build --release
-./target/release/cullr /path/to/images
+./target/release/cullr /path/to/media
 ```
 
 ## CLI Options
@@ -55,10 +56,11 @@ Usage: cullr [OPTIONS] [PATH]
 
 | Option | Description |
 | --- | --- |
-| `PATH` | Image file or directory to open. A file opens its folder positioned on that file. |
+| `PATH` | Media file or directory to open. A file opens its folder positioned on that file. |
 | `-d, --directory <DIR>` | Directory to open. |
-| `--recursive` | Include images in subdirectories. |
+| `--recursive` | Include media in subdirectories. |
 | `--file_ext <EXTS>` | Comma-separated extensions to include, for example `jpg,png,webp`. |
+| `--media <MEDIA>` | Media type to include: `both`, `image`, or `video`. Defaults to `both`. |
 | `--sort <SORT>` | Initial sort: `newest`, `oldest`, `name`, or `name-desc`. |
 | `--locale <LOCALE>` | Locale to use for name sorting, for example `sv` or `en`. |
 | `--dry-run-delete` | Exercise the delete flow without deleting files. |
@@ -71,21 +73,23 @@ directory.
 
 | Key | Action |
 | --- | --- |
-| `h` / `k` / left / up | Previous image in preview mode. |
-| `l` / `j` / right / down | Next image in preview mode. |
+| `h` / `k` / left / up | Previous file in preview mode. |
+| `l` / `j` / right / down | Next file in preview mode. |
 | `g` | Toggle between preview and grid. |
-| `enter` | Open the highlighted grid image in preview mode. |
+| `enter` | Open the highlighted grid file in preview mode. |
 | `h` / `l` | Move left or right in grid mode. |
 | `j` / `k` | Move down or up one row in grid mode. |
 | `ctrl+d` / `ctrl+u` | Move half a page down or up in grid mode. |
-| `home` / `end` | Jump to the first or last image. |
-| `space` / `d` | Toggle the current image in the delete queue. |
-| `u` | Remove the current image from the delete queue. |
+| `home` / `end` | Jump to the first or last file. |
+| `space` | Toggle the current image in the delete queue, or play/pause the current video. |
+| `d` | Toggle the current file in the delete queue. |
+| `u` | Remove the current file from the delete queue. |
 | `shift+D` | Show the delete queue grid. |
 | `ctrl+R` | Confirm deletion for queued files. |
 | `y` / `n` | Accept or cancel the delete confirmation. |
 | `z` | Toggle fit-to-window and original-pixels zoom. |
 | `f` | Toggle fullscreen window mode. |
+| `m` | Mute or unmute video audio. Videos start muted. |
 | `t` | Cycle time sorting. |
 | `n` | Cycle name sorting. |
 | `r` | Toggle recursive scanning and rescan. |
@@ -96,13 +100,25 @@ directory.
 
 ## Supported Formats
 
-By default, `cullr` scans for:
+By default, `cullr` scans for images and common video formats.
+
+Images:
 
 ```text
 jpg, jpeg, png, webp, gif, bmp, tiff, tif, avif, qoi, ico
 ```
 
-Use `--file_ext` to choose a different comma-separated extension set.
+Videos:
+
+```text
+mp4, m4v, mov, mkv, webm, avi, mpg, mpeg, m2v, ts, m2ts, mts, wmv, flv, 3gp, 3g2, ogv
+```
+
+Use `--media image` or `--media video` to restrict the scan by media type. Use
+`--file_ext` to choose a different comma-separated extension set; the selected
+`--media` mode still filters that explicit list.
+
+Video support requires FFmpeg shared libraries available to the system linker.
 
 ## Delete Safety
 
@@ -125,8 +141,8 @@ Run the test suite:
 cargo test
 ```
 
-The tests cover scanning, sorting, decode sizing, delete safety, and the
-dry-run delete path.
+The tests cover scanning, sorting, decode sizing, video first-frame decode,
+delete safety, and the dry-run delete path.
 
 ## License
 

@@ -13,6 +13,8 @@ eframe = "0.31"
 image = { version = "0.25", default-features = true }
 # libjpeg-turbo bindings: SIMD + scaled (1/8..1/1) decode for fast JPEG previews.
 turbojpeg = "1"
+ffmpeg-next = { version = "8.1.0", default-features = true }
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
 
 jwalk = "0.8"
 flume = "0.11"

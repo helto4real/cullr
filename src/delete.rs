@@ -59,7 +59,7 @@ pub fn delete_queued(state: &mut AppState, dry_run: bool) -> DeleteReport {
     report
 }
 
-fn safety_check(state: &AppState, entry: &crate::state::ImageEntry) -> Result<(), String> {
+fn safety_check(state: &AppState, entry: &crate::state::MediaEntry) -> Result<(), String> {
     let canonical = entry
         .path
         .canonicalize()
@@ -92,13 +92,13 @@ fn safety_check(state: &AppState, entry: &crate::state::ImageEntry) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ImageEntry, ImageKind, SortMode};
+    use crate::state::{ImageKind, MediaEntry, MediaKind, SortMode};
     use std::{ffi::OsString, time::SystemTime};
     use tempfile::tempdir;
 
     fn make_state(path: PathBuf) -> AppState {
         let metadata = fs::symlink_metadata(&path).unwrap();
-        let entry = ImageEntry {
+        let entry = MediaEntry {
             path: path.clone(),
             file_name: OsString::from("a.jpg"),
             display_name: "a.jpg".to_owned(),
@@ -108,7 +108,7 @@ mod tests {
             modified: metadata.modified().ok(),
             discovered_order: 0,
             dimensions: None,
-            image_type: Some(ImageKind::Jpeg),
+            media_kind: MediaKind::Image(ImageKind::Jpeg),
             exif_date: None,
             exif_orientation: None,
             dimensions_attempted: false,

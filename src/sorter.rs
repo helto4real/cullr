@@ -7,10 +7,10 @@ use icu::{
 
 use crate::{
     metadata::{effective_date, enrich_entries_for_time_sort},
-    state::{ImageEntry, SortMode},
+    state::{MediaEntry, SortMode},
 };
 
-pub fn sort_entries(entries: &mut [ImageEntry], mode: SortMode, locale: Option<&str>) {
+pub fn sort_entries(entries: &mut [MediaEntry], mode: SortMode, locale: Option<&str>) {
     match mode {
         SortMode::Discovered => {
             entries.sort_by_key(|entry| entry.discovered_order);
@@ -40,7 +40,7 @@ pub fn next_name_sort(mode: SortMode) -> SortMode {
     }
 }
 
-fn compare_time(a: &ImageEntry, b: &ImageEntry, mode: SortMode) -> Ordering {
+fn compare_time(a: &MediaEntry, b: &MediaEntry, mode: SortMode) -> Ordering {
     let ordering = match (effective_date(a), effective_date(b)) {
         (Some(left), Some(right)) => left.cmp(&right),
         (Some(_), None) => Ordering::Greater,
@@ -58,8 +58,8 @@ fn compare_time(a: &ImageEntry, b: &ImageEntry, mode: SortMode) -> Ordering {
 }
 
 fn compare_name(
-    a: &ImageEntry,
-    b: &ImageEntry,
+    a: &MediaEntry,
+    b: &MediaEntry,
     mode: SortMode,
     collator: Option<&CollatorBorrowed<'static>>,
 ) -> Ordering {
@@ -89,15 +89,15 @@ fn build_collator(locale: Option<&str>) -> Option<CollatorBorrowed<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::ImageKind;
+    use crate::state::{ImageKind, MediaEntry, MediaKind};
     use std::{
         ffi::OsString,
         path::PathBuf,
         time::{Duration, SystemTime},
     };
 
-    fn entry(name: &str, order: usize, modified_secs: Option<u64>) -> ImageEntry {
-        ImageEntry {
+    fn entry(name: &str, order: usize, modified_secs: Option<u64>) -> MediaEntry {
+        MediaEntry {
             path: PathBuf::from(name),
             file_name: OsString::from(name),
             display_name: name.to_owned(),
@@ -107,7 +107,7 @@ mod tests {
             modified: modified_secs.map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
             discovered_order: order,
             dimensions: None,
-            image_type: Some(ImageKind::Jpeg),
+            media_kind: MediaKind::Image(ImageKind::Jpeg),
             exif_date: None,
             exif_orientation: None,
             dimensions_attempted: false,

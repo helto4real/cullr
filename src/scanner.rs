@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use jwalk::{Parallelism, WalkDir};
 
-use crate::state::{ImageEntry, ImageKind};
+use crate::state::{MediaEntry, MediaKind};
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -18,7 +18,7 @@ pub struct ScanOptions {
     pub extensions: Vec<String>,
 }
 
-pub fn scan_directory(opts: ScanOptions) -> Result<Vec<ImageEntry>> {
+pub fn scan_directory(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
     if opts.recursive {
         scan_recursive_with_jwalk(opts)
     } else {
@@ -26,7 +26,7 @@ pub fn scan_directory(opts: ScanOptions) -> Result<Vec<ImageEntry>> {
     }
 }
 
-fn scan_flat_with_read_dir(opts: ScanOptions) -> Result<Vec<ImageEntry>> {
+fn scan_flat_with_read_dir(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
     let extensions = extension_set(&opts.extensions);
     let mut entries = Vec::new();
 
@@ -52,7 +52,7 @@ fn scan_flat_with_read_dir(opts: ScanOptions) -> Result<Vec<ImageEntry>> {
     Ok(entries)
 }
 
-fn scan_recursive_with_jwalk(opts: ScanOptions) -> Result<Vec<ImageEntry>> {
+fn scan_recursive_with_jwalk(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
     let extensions = extension_set(&opts.extensions);
     let walker = WalkDir::new(&opts.root)
         .parallelism(Parallelism::RayonDefaultPool {
@@ -88,7 +88,7 @@ fn build_entry(
     path: PathBuf,
     discovered_order: usize,
     extensions: &HashSet<String>,
-) -> Result<Option<ImageEntry>> {
+) -> Result<Option<MediaEntry>> {
     let metadata = match fs::symlink_metadata(&path) {
         Ok(value) => value,
         Err(error) => {
@@ -121,7 +121,11 @@ fn build_entry(
         .unwrap_or_else(|| OsString::from(""));
     let display_name = file_name.to_string_lossy().into_owned();
 
-    Ok(Some(ImageEntry {
+    let Some(media_kind) = MediaKind::from_extension(extension.as_deref()) else {
+        return Ok(None);
+    };
+
+    Ok(Some(MediaEntry {
         path,
         file_name,
         display_name,
@@ -131,7 +135,7 @@ fn build_entry(
         modified: metadata.modified().ok(),
         discovered_order,
         dimensions: None,
-        image_type: ImageKind::from_extension(extension.as_deref()),
+        media_kind,
         exif_date: None,
         exif_orientation: None,
         dimensions_attempted: false,
@@ -217,5 +221,41 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].display_name, "visible.png");
+    }
+
+    #[test]
+    fn scans_mixed_image_and_video_extensions() {
+        let temp = tempdir().unwrap();
+        touch(&temp.path().join("image.jpg"));
+        touch(&temp.path().join("clip.mp4"));
+        touch(&temp.path().join("ignored.txt"));
+
+        let entries = scan_directory(ScanOptions {
+            root: temp.path().to_path_buf(),
+            recursive: false,
+            include_hidden: false,
+            extensions: vec!["jpg".to_owned(), "mp4".to_owned(), "txt".to_owned()],
+        })
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.media_kind.is_image()));
+        assert!(entries.iter().any(|entry| entry.media_kind.is_video()));
+    }
+
+    #[test]
+    fn explicit_extensions_still_require_known_media_kind() {
+        let temp = tempdir().unwrap();
+        touch(&temp.path().join("unknown.custom"));
+
+        let entries = scan_directory(ScanOptions {
+            root: temp.path().to_path_buf(),
+            recursive: false,
+            include_hidden: false,
+            extensions: vec!["custom".to_owned()],
+        })
+        .unwrap();
+
+        assert!(entries.is_empty());
     }
 }

@@ -104,7 +104,10 @@ fn decode_jpeg_scaled(
 
     let rgba = image::RgbaImage::from_raw(width as u32, height as u32, image.pixels)
         .context("turbojpeg produced an unexpected buffer size")?;
-    Ok(apply_orientation(DynamicImage::ImageRgba8(rgba), orientation))
+    Ok(apply_orientation(
+        DynamicImage::ImageRgba8(rgba),
+        orientation,
+    ))
 }
 
 /// Pick the most-downscaled supported factor whose output still covers the
