@@ -21,7 +21,7 @@ pub fn enrich_entry(entry: &mut MediaEntry) {
 
     if entry.dimensions.is_none() && !entry.dimensions_attempted {
         entry.dimensions_attempted = true;
-        if let Ok((width, height)) = image::image_dimensions(&entry.path) {
+        if let Ok((width, height)) = read_image_dimensions(&entry.path) {
             entry.dimensions = Some((width, height));
         }
     }
@@ -54,10 +54,21 @@ pub fn enrich_entries_for_time_sort(entries: &mut [MediaEntry]) {
 pub fn load_oriented_image(entry: &MediaEntry) -> Result<image::DynamicImage> {
     let image = ImageReader::open(&entry.path)
         .with_context(|| format!("failed to open {}", entry.path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to detect image format for {}", entry.path.display()))?
         .decode()
         .with_context(|| format!("failed to decode {}", entry.path.display()))?;
 
     Ok(apply_orientation(image, entry.exif_orientation))
+}
+
+fn read_image_dimensions(path: &Path) -> Result<(u32, u32)> {
+    ImageReader::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to detect image format for {}", path.display()))?
+        .into_dimensions()
+        .with_context(|| format!("failed to read image dimensions for {}", path.display()))
 }
 
 pub fn apply_orientation(
@@ -130,7 +141,7 @@ fn parse_exif_datetime(value: String) -> Option<SystemTime> {
 mod tests {
     use super::*;
     use crate::state::{ImageKind, MediaKind, SortMode};
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{ffi::OsString, fs::File, path::PathBuf};
 
     #[test]
     fn exif_datetime_parses() {
@@ -160,5 +171,42 @@ mod tests {
 
         assert_eq!(effective_date(&entry), Some(exif));
         let _ = SortMode::Newest;
+    }
+
+    #[test]
+    fn dimensions_use_image_content_before_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actually_jpeg.png");
+        write_jpeg(&path, 24, 12);
+        let mut entry = MediaEntry {
+            path: path.clone(),
+            file_name: OsString::from("actually_jpeg.png"),
+            display_name: "actually_jpeg.png".to_owned(),
+            extension: Some("png".to_owned()),
+            file_len: path.metadata().unwrap().len(),
+            created: None,
+            modified: None,
+            discovered_order: 0,
+            dimensions: None,
+            media_kind: MediaKind::Image(ImageKind::Png),
+            exif_date: None,
+            exif_orientation: None,
+            dimensions_attempted: false,
+            exif_attempted: false,
+        };
+
+        enrich_entry(&mut entry);
+
+        assert_eq!(entry.dimensions, Some((24, 12)));
+    }
+
+    fn write_jpeg(path: &Path, width: u32, height: u32) {
+        let image = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x % u8::MAX as u32) as u8, (y % u8::MAX as u32) as u8, 200])
+        });
+        let mut file = File::create(path).unwrap();
+        image::codecs::jpeg::JpegEncoder::new(&mut file)
+            .encode_image(&image)
+            .unwrap();
     }
 }

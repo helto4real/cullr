@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use image::{DynamicImage, imageops::FilterType};
+use image::{DynamicImage, ImageFormat, imageops::FilterType};
 
 use crate::metadata::{apply_orientation, read_exif_metadata};
 
@@ -34,7 +34,12 @@ fn decode_at_most(
     max_height: u32,
     orientation: Option<u16>,
 ) -> Result<DynamicImage> {
-    if is_jpeg(path) {
+    let reader = image::ImageReader::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to detect image format for {}", path.display()))?;
+
+    if matches!(reader.format(), Some(ImageFormat::Jpeg)) {
         match decode_jpeg_scaled(path, max_width, max_height, orientation) {
             Ok(image) => return Ok(image),
             Err(error) => {
@@ -47,17 +52,10 @@ fn decode_at_most(
         }
     }
 
-    let image = image::ImageReader::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?
+    let image = reader
         .decode()
         .with_context(|| format!("failed to decode {}", path.display()))?;
     Ok(apply_orientation(image, orientation))
-}
-
-fn is_jpeg(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"))
 }
 
 /// EXIF orientations 5..=8 rotate the image by 90°, swapping its display axes.
@@ -165,5 +163,26 @@ mod tests {
         let rgba = decode_rgba_capped(&path, 512).unwrap();
 
         assert_eq!((rgba.width(), rgba.height()), (100, 80));
+    }
+
+    #[test]
+    fn decodes_jpeg_content_with_png_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actually_jpeg.png");
+        write_jpeg(&path, 32, 16);
+
+        let rgba = decode_rgba_capped(&path, 512).unwrap();
+
+        assert_eq!((rgba.width(), rgba.height()), (32, 16));
+    }
+
+    fn write_jpeg(path: &Path, width: u32, height: u32) {
+        let image = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x % u8::MAX as u32) as u8, (y % u8::MAX as u32) as u8, 180])
+        });
+        let mut file = std::fs::File::create(path).unwrap();
+        image::codecs::jpeg::JpegEncoder::new(&mut file)
+            .encode_image(&image)
+            .unwrap();
     }
 }
