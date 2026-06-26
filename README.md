@@ -8,8 +8,8 @@ an explicit confirmation step.
 
 ## What It Does
 
-- Opens a media directory, or opens a specific file positioned inside its
-  parent directory.
+- Opens a media directory in grid view, or opens a specific file in preview
+  view positioned inside its parent directory.
 - Shows a large preview view and a thumbnail grid view for fast review.
 - Decodes images on worker threads and uploads them as GPU textures, so the
   window can resize without re-decoding every frame.

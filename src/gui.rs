@@ -1111,6 +1111,14 @@ fn empty_media_status(target: &Path) -> String {
     )
 }
 
+fn initial_view_mode(initial_file: Option<&Path>) -> ViewMode {
+    if initial_file.is_some() {
+        ViewMode::Preview
+    } else {
+        ViewMode::Grid
+    }
+}
+
 fn centered_text_galley(
     painter: &egui::Painter,
     text: String,
@@ -1329,6 +1337,15 @@ mod tests {
         assert!(status.contains("recursive search"));
         assert!(status.contains("`q`"));
     }
+
+    #[test]
+    fn initial_view_mode_uses_grid_for_folder_targets() {
+        assert_eq!(initial_view_mode(None), ViewMode::Grid);
+        assert_eq!(
+            initial_view_mode(Some(Path::new("/tmp/media/image.jpg"))),
+            ViewMode::Preview
+        );
+    }
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -1354,6 +1371,7 @@ pub fn run(cli: Cli) -> Result<()> {
         sort_mode,
         entries,
     );
+    state.mode = initial_view_mode(initial_file.as_deref());
     // Start positioned on the requested file (after sorting).
     if let Some(file) = &initial_file
         && let Some(index) = state.entries.iter().position(|entry| entry.path == *file)
