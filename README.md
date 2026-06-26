@@ -90,6 +90,7 @@ directory.
 | `z` | Toggle fit-to-window and original-pixels zoom. |
 | `f` | Toggle fullscreen window mode. |
 | `m` | Mute or unmute video audio. Videos start muted. |
+| `b` | Show or hide gallery media-type badges. |
 | `t` | Cycle time sorting. |
 | `n` | Cycle name sorting. |
 | `r` | Toggle recursive scanning and rescan. |

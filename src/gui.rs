@@ -24,7 +24,7 @@ use crate::{
     delete, metadata,
     scanner::{ScanOptions, scan_directory},
     sorter,
-    state::{AppState, MediaKind, ViewMode, ZoomMode},
+    state::{AppState, MediaKind, MediaMode, ViewMode, ZoomMode},
     video,
 };
 
@@ -138,6 +138,7 @@ struct GuiApp {
     fullscreen: bool,
     active_video: Option<ActiveVideo>,
     video_muted: bool,
+    media_type_badges_visible: bool,
     // Deferred from inside the input closure (which borrows ctx immutably).
     pending_sort: Option<crate::state::SortMode>,
     pending_enrich: bool,
@@ -172,6 +173,7 @@ impl GuiApp {
             fullscreen: false,
             active_video: None,
             video_muted: true,
+            media_type_badges_visible: true,
             pending_sort: None,
             pending_enrich: false,
             pending_rescan: false,
@@ -340,6 +342,11 @@ impl GuiApp {
             .filter(|active| active.handle.path() == path)
     }
 
+    fn active_video_is_playing_for(&self, path: &Path) -> bool {
+        self.active_video_for(path)
+            .is_some_and(|active| !active.handle.is_paused() && !active.ended)
+    }
+
     fn stop_active_video(&mut self) {
         if let Some(active) = self.active_video.take() {
             active.handle.stop();
@@ -397,6 +404,15 @@ impl GuiApp {
             "video muted".to_owned()
         } else {
             "video unmuted".to_owned()
+        };
+    }
+
+    fn toggle_media_type_badges(&mut self) {
+        self.media_type_badges_visible = !self.media_type_badges_visible;
+        self.status = if self.media_type_badges_visible {
+            "media badges shown".to_owned()
+        } else {
+            "media badges hidden".to_owned()
         };
     }
 
@@ -633,6 +649,9 @@ impl GuiApp {
             if i.key_pressed(Key::M) {
                 self.toggle_video_mute();
             }
+            if i.key_pressed(Key::B) {
+                self.toggle_media_type_badges();
+            }
             if i.key_pressed(Key::T) {
                 self.pending_sort = Some(sorter::next_time_sort(self.state.sort_mode));
             }
@@ -771,12 +790,13 @@ impl GuiApp {
             return;
         };
         let path = entry.path.clone();
+        let media_kind = entry.media_kind.clone();
         let is_current = index == self.state.current_index;
         let is_queued = self.state.delete_queue.contains(&path);
         let key = TexKey {
             path: path.clone(),
             variant: Variant::Thumb,
-            media_kind: entry.media_kind.clone(),
+            media_kind: media_kind.clone(),
         };
 
         let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL, CELL), egui::Sense::click());
@@ -815,6 +835,15 @@ impl GuiApp {
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(220, 60, 60),
             );
+        }
+
+        if should_show_media_type_badge(
+            self.media_type_badges_visible,
+            self.state.media_mode,
+            &media_kind,
+            self.active_video_is_playing_for(&path),
+        ) {
+            draw_media_type_badge(ui, rect, &media_kind);
         }
 
         if response.clicked() {
@@ -894,6 +923,7 @@ ctrl+R          delete queued (confirm)
 z               toggle fit / original zoom
 f               toggle fullscreen window
 m               mute / unmute video audio
+b               show / hide media badges
 t / n           cycle time / name sort
 r               toggle recursive scan
 shift+R         rescan directory
@@ -955,6 +985,121 @@ impl eframe::App for GuiApp {
     }
 }
 
+fn should_show_media_type_badge(
+    badges_visible: bool,
+    media_mode: MediaMode,
+    media_kind: &MediaKind,
+    active_video_playing: bool,
+) -> bool {
+    badges_visible
+        && media_mode == MediaMode::Both
+        && !(media_kind.is_video() && active_video_playing)
+}
+
+fn draw_media_type_badge(ui: &egui::Ui, cell_rect: egui::Rect, media_kind: &MediaKind) {
+    let badge_size = 18.0;
+    let margin = 6.0;
+    let badge_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            cell_rect.right() - margin - badge_size,
+            cell_rect.top() + margin,
+        ),
+        egui::vec2(badge_size, badge_size),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(badge_rect, 4.0, egui::Color32::from_black_alpha(150));
+    painter.rect_stroke(
+        badge_rect,
+        4.0,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(170)),
+        egui::StrokeKind::Inside,
+    );
+
+    match media_kind {
+        MediaKind::Image(_) => {
+            let icon = badge_rect.shrink(4.5);
+            let stroke = egui::Stroke::new(1.25, egui::Color32::WHITE);
+            painter.rect_stroke(icon, 1.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    egui::pos2(icon.left() + 2.0, icon.bottom() - 2.5),
+                    egui::pos2(icon.center().x - 1.0, icon.center().y + 1.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon.center().x - 1.0, icon.center().y + 1.0),
+                    egui::pos2(icon.right() - 2.0, icon.bottom() - 2.5),
+                ],
+                stroke,
+            );
+        }
+        MediaKind::Video(_) => {
+            let center = badge_rect.center();
+            let points = vec![
+                egui::pos2(center.x - 3.5, center.y - 5.0),
+                egui::pos2(center.x - 3.5, center.y + 5.0),
+                egui::pos2(center.x + 5.0, center.y),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                egui::Color32::WHITE,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{ImageKind, VideoKind};
+
+    #[test]
+    fn media_type_badge_visibility_matches_mode_and_playback() {
+        let image = MediaKind::Image(ImageKind::Jpeg);
+        let video = MediaKind::Video(VideoKind::Mp4);
+
+        assert!(should_show_media_type_badge(
+            true,
+            MediaMode::Both,
+            &image,
+            false
+        ));
+        assert!(should_show_media_type_badge(
+            true,
+            MediaMode::Both,
+            &video,
+            false
+        ));
+        assert!(!should_show_media_type_badge(
+            true,
+            MediaMode::Both,
+            &video,
+            true
+        ));
+        assert!(!should_show_media_type_badge(
+            false,
+            MediaMode::Both,
+            &image,
+            false
+        ));
+        assert!(!should_show_media_type_badge(
+            true,
+            MediaMode::Image,
+            &image,
+            false
+        ));
+        assert!(!should_show_media_type_badge(
+            true,
+            MediaMode::Video,
+            &video,
+            false
+        ));
+    }
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     let input = cli.path.as_deref().or(cli.directory.as_deref());
     let (directory, initial_file) = resolve_input(input)?;
@@ -977,6 +1122,7 @@ pub fn run(cli: Cli) -> Result<()> {
         directory,
         cli.recursive,
         cli.hidden,
+        MediaMode::from(cli.media),
         extensions,
         sort_mode,
         entries,

@@ -92,7 +92,7 @@ fn safety_check(state: &AppState, entry: &crate::state::MediaEntry) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ImageKind, MediaEntry, MediaKind, SortMode};
+    use crate::state::{ImageKind, MediaEntry, MediaKind, MediaMode, SortMode};
     use std::{ffi::OsString, time::SystemTime};
     use tempfile::tempdir;
 
@@ -119,6 +119,7 @@ mod tests {
             directory,
             false,
             false,
+            MediaMode::Image,
             vec!["jpg".to_owned()],
             SortMode::Discovered,
             vec![entry],

@@ -4,7 +4,7 @@ use cullr::{
     decode::decode_rgba_capped,
     delete::delete_queued,
     scanner::{ScanOptions, scan_directory},
-    state::{AppState, SortMode},
+    state::{AppState, MediaMode, SortMode},
     video::decode_first_frame_rgba,
 };
 use image::{ImageBuffer, Rgba};
@@ -130,6 +130,7 @@ fn state_for_ext(path: &Path, ext: &str) -> AppState {
         path.canonicalize().unwrap(),
         false,
         false,
+        MediaMode::Image,
         vec![ext.to_owned()],
         SortMode::Discovered,
         entries,

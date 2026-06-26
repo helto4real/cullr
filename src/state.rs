@@ -103,6 +103,7 @@ pub struct AppState {
     pub directory: PathBuf,
     pub recursive: bool,
     pub include_hidden: bool,
+    pub media_mode: MediaMode,
     pub extensions: Vec<String>,
     pub entries: Vec<MediaEntry>,
     pub current_index: usize,
@@ -128,6 +129,7 @@ impl AppState {
         directory: PathBuf,
         recursive: bool,
         include_hidden: bool,
+        media_mode: MediaMode,
         extensions: Vec<String>,
         sort_mode: SortMode,
         entries: Vec<MediaEntry>,
@@ -136,6 +138,7 @@ impl AppState {
             directory,
             recursive,
             include_hidden,
+            media_mode,
             extensions,
             entries,
             current_index: 0,
@@ -479,6 +482,7 @@ mod tests {
             PathBuf::from("."),
             false,
             false,
+            MediaMode::Image,
             vec!["jpg".to_owned()],
             SortMode::Discovered,
             vec![entry("a.jpg", 0)],
@@ -496,6 +500,7 @@ mod tests {
             PathBuf::from("."),
             false,
             false,
+            MediaMode::Image,
             vec!["jpg".to_owned()],
             SortMode::Discovered,
             vec![entry("a.jpg", 0), entry("b.jpg", 1)],
@@ -513,6 +518,7 @@ mod tests {
             PathBuf::from("."),
             false,
             false,
+            MediaMode::Image,
             vec!["jpg".to_owned()],
             SortMode::Discovered,
             (0..10).map(|i| entry(&format!("{i}.jpg"), i)).collect(),
@@ -535,5 +541,22 @@ mod tests {
             Some(MediaKind::Video(VideoKind::Mp4))
         );
         assert_eq!(MediaKind::from_extension(Some("txt")), None);
+    }
+
+    #[test]
+    fn app_state_stores_selected_media_mode() {
+        for media_mode in [MediaMode::Both, MediaMode::Image, MediaMode::Video] {
+            let state = AppState::new(
+                PathBuf::from("."),
+                false,
+                false,
+                media_mode,
+                vec!["jpg".to_owned()],
+                SortMode::Discovered,
+                vec![entry("a.jpg", 0)],
+            );
+
+            assert_eq!(state.media_mode, media_mode);
+        }
     }
 }
