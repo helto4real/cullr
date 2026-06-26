@@ -1,8 +1,4 @@
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::{ffi::OsString, path::PathBuf, time::SystemTime};
 
 use indexmap::IndexSet;
 
@@ -89,15 +85,6 @@ pub enum ZoomMode {
     OriginalPixels,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PreviewPrefetchMarker {
-    pub generation: u64,
-    pub width_cells: u16,
-    pub height_cells: u16,
-    pub zoom_mode: ZoomMode,
-    pub entry_count: usize,
-}
-
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub directory: PathBuf,
@@ -113,15 +100,7 @@ pub struct AppState {
     pub delete_queue: IndexSet<PathBuf>,
     pub show_info_overlay: bool,
     pub show_help_overlay: bool,
-    pub fullscreen_ui: bool,
-    pub grid_page: usize,
-    pub status_message: Option<String>,
     pub confirm_delete: bool,
-    pub thumbnail_generation: u64,
-    pub last_grid_page_size: usize,
-    pub last_preview_size: Option<(u16, u16)>,
-    pub last_grid_cell_size: Option<(u16, u16)>,
-    pub eager_preview_prefetch: Option<PreviewPrefetchMarker>,
 }
 
 impl AppState {
@@ -148,15 +127,7 @@ impl AppState {
             delete_queue: IndexSet::new(),
             show_info_overlay: false,
             show_help_overlay: false,
-            fullscreen_ui: false,
-            grid_page: 0,
-            status_message: None,
             confirm_delete: false,
-            thumbnail_generation: 0,
-            last_grid_page_size: 1,
-            last_preview_size: None,
-            last_grid_cell_size: None,
-            eager_preview_prefetch: None,
         }
     }
 
@@ -174,10 +145,6 @@ impl AppState {
 
     pub fn queue_count(&self) -> usize {
         self.delete_queue.len()
-    }
-
-    pub fn is_queued<P: AsRef<Path>>(&self, path: P) -> bool {
-        self.delete_queue.contains(path.as_ref())
     }
 
     pub fn toggle_queue_current(&mut self) {
@@ -203,7 +170,6 @@ impl AppState {
             return;
         }
         self.current_index = (self.current_index + 1).min(self.entries.len() - 1);
-        self.sync_grid_page();
     }
 
     pub fn previous(&mut self) {
@@ -215,37 +181,16 @@ impl AppState {
             return;
         }
         self.current_index = self.current_index.saturating_sub(1);
-        self.sync_grid_page();
     }
 
     pub fn first(&mut self) {
         self.current_index = 0;
-        self.sync_grid_page();
     }
 
     pub fn last(&mut self) {
         if !self.entries.is_empty() {
             self.current_index = self.entries.len() - 1;
-            self.sync_grid_page();
         }
-    }
-
-    pub fn page_by(&mut self, delta_pages: isize) {
-        let page_size = self.last_grid_page_size.max(1);
-        if self.mode == ViewMode::DeleteQueueGrid {
-            self.page_queue_by(delta_pages, page_size);
-            return;
-        }
-        if self.entries.is_empty() {
-            return;
-        }
-        let delta = delta_pages.unsigned_abs().saturating_mul(page_size);
-        if delta_pages.is_negative() {
-            self.current_index = self.current_index.saturating_sub(delta);
-        } else {
-            self.current_index = (self.current_index + delta).min(self.entries.len() - 1);
-        }
-        self.sync_grid_page();
     }
 
     pub fn set_entries_preserving_current(
@@ -260,8 +205,6 @@ impl AppState {
         self.current_index = previous
             .and_then(|path| self.entries.iter().position(|entry| entry.path == path))
             .unwrap_or_else(|| self.current_index.min(self.entries.len().saturating_sub(1)));
-        self.sync_grid_page();
-        self.bump_generation();
     }
 
     pub fn clamp_current_index(&mut self) {
@@ -270,18 +213,6 @@ impl AppState {
         } else {
             self.current_index = self.current_index.min(self.entries.len() - 1);
         }
-        self.sync_grid_page();
-    }
-
-    pub fn bump_generation(&mut self) {
-        self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
-        self.eager_preview_prefetch = None;
-    }
-
-    pub fn forget_render_layout(&mut self) {
-        self.last_preview_size = None;
-        self.last_grid_cell_size = None;
-        self.eager_preview_prefetch = None;
     }
 
     pub fn queued_indices(&self) -> Vec<usize> {
@@ -292,12 +223,6 @@ impl AppState {
             .collect()
     }
 
-    pub fn queue_position(&self) -> Option<usize> {
-        self.queued_indices()
-            .iter()
-            .position(|&index| index == self.current_index)
-    }
-
     pub fn enter_delete_queue_grid(&mut self) {
         self.mode = ViewMode::DeleteQueueGrid;
         if !self.delete_queue.is_empty() && !self.is_queued_current() {
@@ -305,21 +230,12 @@ impl AppState {
                 self.current_index = first_index;
             }
         }
-        self.sync_grid_page();
     }
 
     pub fn is_queued_current(&self) -> bool {
         self.current_entry()
             .map(|entry| self.delete_queue.contains(&entry.path))
             .unwrap_or(false)
-    }
-
-    pub fn sync_grid_page(&mut self) {
-        self.grid_page = if self.last_grid_page_size == 0 {
-            0
-        } else {
-            self.current_index / self.last_grid_page_size.max(1)
-        };
     }
 
     fn move_in_queue(&mut self, delta: isize) {
@@ -337,26 +253,6 @@ impl AppState {
             (current + delta as usize).min(indices.len() - 1)
         };
         self.current_index = indices[next];
-        self.sync_grid_page();
-    }
-
-    fn page_queue_by(&mut self, delta_pages: isize, page_size: usize) {
-        let indices = self.queued_indices();
-        if indices.is_empty() {
-            return;
-        }
-        let current = indices
-            .iter()
-            .position(|&index| index == self.current_index)
-            .unwrap_or(0);
-        let delta = delta_pages.unsigned_abs().saturating_mul(page_size);
-        let next = if delta_pages.is_negative() {
-            current.saturating_sub(delta)
-        } else {
-            (current + delta).min(indices.len() - 1)
-        };
-        self.current_index = indices[next];
-        self.sync_grid_page();
     }
 }
 
@@ -510,24 +406,6 @@ mod tests {
         state.set_entries_preserving_current(vec![entry("a.jpg", 0)], None);
 
         assert_eq!(state.current_index, 0);
-    }
-
-    #[test]
-    fn page_movement_uses_last_grid_page_size() {
-        let mut state = AppState::new(
-            PathBuf::from("."),
-            false,
-            false,
-            MediaMode::Image,
-            vec!["jpg".to_owned()],
-            SortMode::Discovered,
-            (0..10).map(|i| entry(&format!("{i}.jpg"), i)).collect(),
-        );
-        state.last_grid_page_size = 4;
-
-        state.page_by(1);
-
-        assert_eq!(state.current_index, 4);
     }
 
     #[test]

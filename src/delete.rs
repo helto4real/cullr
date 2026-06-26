@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
-use crate::state::AppState;
+use crate::state::{AppState, MediaEntry};
 
 #[derive(Debug, Clone, Default)]
 pub struct DeleteReport {
@@ -14,10 +14,10 @@ pub fn delete_queued(state: &mut AppState, dry_run: bool) -> DeleteReport {
         dry_run,
         ..DeleteReport::default()
     };
-    let discovered: HashMap<PathBuf, _> = state
+    let discovered: HashMap<&PathBuf, &MediaEntry> = state
         .entries
         .iter()
-        .map(|entry| (entry.path.clone(), entry.clone()))
+        .map(|entry| (&entry.path, entry))
         .collect();
     let queued: Vec<PathBuf> = state.delete_queue.iter().cloned().collect();
 
@@ -53,7 +53,6 @@ pub fn delete_queued(state: &mut AppState, dry_run: bool) -> DeleteReport {
             .entries
             .retain(|entry| !report.deleted.iter().any(|path| path == &entry.path));
         state.clamp_current_index();
-        state.bump_generation();
     }
 
     report

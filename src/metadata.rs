@@ -51,17 +51,6 @@ pub fn enrich_entries_for_time_sort(entries: &mut [MediaEntry]) {
     }
 }
 
-pub fn load_oriented_image(entry: &MediaEntry) -> Result<image::DynamicImage> {
-    let image = ImageReader::open(&entry.path)
-        .with_context(|| format!("failed to open {}", entry.path.display()))?
-        .with_guessed_format()
-        .with_context(|| format!("failed to detect image format for {}", entry.path.display()))?
-        .decode()
-        .with_context(|| format!("failed to decode {}", entry.path.display()))?;
-
-    Ok(apply_orientation(image, entry.exif_orientation))
-}
-
 fn read_image_dimensions(path: &Path) -> Result<(u32, u32)> {
     ImageReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?

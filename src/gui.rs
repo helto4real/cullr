@@ -450,6 +450,9 @@ impl GuiApp {
 
     fn rescan(&mut self) {
         self.stop_active_video();
+        // Drop remembered decode failures so files that have since been fixed,
+        // replaced, or were only transiently unreadable get another attempt.
+        self.failed.clear();
         let previous = self.state.current_path();
         let result = scan_directory(ScanOptions {
             root: self.state.directory.clone(),
@@ -914,9 +917,6 @@ impl GuiApp {
                 });
         }
     }
-
-    // Scratch fields driven by input, applied after the input closure.
-    // (declared here as struct fields below via Default-like init)
 }
 
 const HELP_TEXT: &str = "\

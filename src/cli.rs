@@ -90,10 +90,6 @@ impl Cli {
     }
 }
 
-pub fn default_extensions() -> Vec<String> {
-    default_extensions_for(MediaMode::Both)
-}
-
 pub fn default_extensions_for(media_mode: MediaMode) -> Vec<String> {
     media_mode.default_extensions()
 }
