@@ -366,6 +366,26 @@ impl GuiApp {
         }
     }
 
+    fn start_video_playback(&mut self, path: PathBuf) {
+        self.stop_active_video();
+        let handle = video::spawn_playback(
+            path.clone(),
+            FIT_CAP,
+            self.video_muted,
+            self.video_tx.clone(),
+        );
+        self.active_video = Some(ActiveVideo {
+            handle,
+            texture: None,
+            ended: false,
+        });
+        self.status = if self.video_muted {
+            "video playing muted".to_owned()
+        } else {
+            "video playing with audio".to_owned()
+        };
+    }
+
     fn toggle_current_video_playback(&mut self) {
         let Some(entry) = self.state.current_entry() else {
             return;
@@ -389,23 +409,7 @@ impl GuiApp {
             return;
         }
 
-        self.stop_active_video();
-        let handle = video::spawn_playback(
-            path.clone(),
-            FIT_CAP,
-            self.video_muted,
-            self.video_tx.clone(),
-        );
-        self.active_video = Some(ActiveVideo {
-            handle,
-            texture: None,
-            ended: false,
-        });
-        self.status = if self.video_muted {
-            "video playing muted".to_owned()
-        } else {
-            "video playing with audio".to_owned()
-        };
+        self.start_video_playback(path);
     }
 
     fn toggle_video_mute(&mut self) {
@@ -1279,10 +1283,21 @@ fn paint_row_galley(
     *x += width + gap_after;
 }
 
+fn should_autoplay_initial_video(state: &AppState, initial_file: Option<&Path>) -> bool {
+    let Some(initial_file) = initial_file else {
+        return false;
+    };
+
+    state
+        .current_entry()
+        .is_some_and(|entry| entry.path.as_path() == initial_file && entry.media_kind.is_video())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ImageKind, VideoKind};
+    use crate::state::{ImageKind, MediaEntry, SortMode, VideoKind};
+    use std::ffi::OsString;
 
     #[test]
     fn media_type_badge_visibility_matches_mode_and_playback() {
@@ -1346,6 +1361,70 @@ mod tests {
             ViewMode::Preview
         );
     }
+
+    #[test]
+    fn initial_video_autoplay_only_for_matching_direct_video_file() {
+        let image_path = PathBuf::from("/tmp/media/image.jpg");
+        let video_path = PathBuf::from("/tmp/media/video.mp4");
+        let image = media_entry(image_path.clone(), MediaKind::Image(ImageKind::Jpeg), 0);
+        let video = media_entry(video_path.clone(), MediaKind::Video(VideoKind::Mp4), 1);
+
+        let mut state = app_state(vec![image.clone(), video.clone()], 1);
+        assert!(should_autoplay_initial_video(&state, Some(&video_path)));
+
+        assert!(!should_autoplay_initial_video(&state, None));
+
+        state = app_state(vec![image.clone()], 0);
+        assert!(!should_autoplay_initial_video(&state, Some(&image_path)));
+
+        state = app_state(vec![image, video], 0);
+        assert!(!should_autoplay_initial_video(&state, Some(&video_path)));
+
+        state = app_state(Vec::new(), 0);
+        assert!(!should_autoplay_initial_video(&state, Some(&video_path)));
+    }
+
+    fn app_state(entries: Vec<MediaEntry>, current_index: usize) -> AppState {
+        let mut state = AppState::new(
+            PathBuf::from("/tmp/media"),
+            false,
+            false,
+            MediaMode::Both,
+            vec!["jpg".to_owned(), "mp4".to_owned()],
+            SortMode::Discovered,
+            entries,
+        );
+        state.current_index = current_index;
+        state
+    }
+
+    fn media_entry(path: PathBuf, media_kind: MediaKind, discovered_order: usize) -> MediaEntry {
+        let file_name = path
+            .file_name()
+            .map(|value| value.to_os_string())
+            .unwrap_or_else(|| OsString::from("media"));
+        let display_name = file_name.to_string_lossy().into_owned();
+        let extension = path
+            .extension()
+            .map(|value| value.to_string_lossy().into_owned());
+
+        MediaEntry {
+            path,
+            file_name,
+            display_name,
+            extension,
+            file_len: 0,
+            created: None,
+            modified: None,
+            discovered_order,
+            dimensions: None,
+            media_kind,
+            exif_date: None,
+            exif_orientation: None,
+            dimensions_attempted: false,
+            exif_attempted: false,
+        }
+    }
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -1378,6 +1457,7 @@ pub fn run(cli: Cli) -> Result<()> {
     {
         state.current_index = index;
     }
+    let autoplay_initial_video = should_autoplay_initial_video(&state, initial_file.as_deref());
     tracing::debug!(
         directory = %state.directory.display(),
         file = ?initial_file,
@@ -1385,12 +1465,15 @@ pub fn run(cli: Cli) -> Result<()> {
         count = state.entries.len(),
         "opened"
     );
-    let app = GuiApp::new(
+    let mut app = GuiApp::new(
         state,
         cli.locale.clone(),
         cli.dry_run_delete,
         empty_media_target,
     );
+    if autoplay_initial_video && let Some(path) = app.state.current_path() {
+        app.start_video_playback(path);
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
