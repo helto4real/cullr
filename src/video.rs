@@ -4,7 +4,7 @@ use std::{
     slice,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -17,20 +17,29 @@ use ffmpeg::{
         resampling::context::Context as ResampleContext,
         scaling::{context::Context as ScaleContext, flag::Flags as ScaleFlags},
     },
-    util::format::{Pixel, sample},
+    util::{
+        format::{Pixel, sample},
+        mathematics::rescale,
+    },
 };
 use ffmpeg_next as ffmpeg;
 use image::RgbaImage;
 use rodio::buffer::SamplesBuffer;
 
+static NEXT_PLAYBACK_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct PlaybackEvent {
+    pub playback_id: u64,
     pub path: PathBuf,
     pub frame: Option<RgbaImage>,
+    pub position: Option<Duration>,
+    pub duration: Option<Duration>,
     pub ended: bool,
     pub error: Option<String>,
 }
 
 pub struct PlaybackHandle {
+    id: u64,
     path: PathBuf,
     controls: Arc<PlaybackControls>,
 }
@@ -42,6 +51,10 @@ struct PlaybackControls {
 }
 
 impl PlaybackHandle {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -105,47 +118,74 @@ pub fn spawn_playback(
     path: PathBuf,
     cap: u32,
     muted: bool,
+    start_at: Duration,
+    paused: bool,
     frame_tx: flume::Sender<PlaybackEvent>,
 ) -> PlaybackHandle {
+    let id = NEXT_PLAYBACK_ID.fetch_add(1, Ordering::SeqCst);
     let controls = Arc::new(PlaybackControls {
         stop: AtomicBool::new(false),
-        paused: AtomicBool::new(false),
+        paused: AtomicBool::new(paused),
         muted: AtomicBool::new(muted),
     });
     let thread_controls = controls.clone();
     let thread_path = path.clone();
     thread::spawn(move || {
-        if let Err(error) =
-            run_video_playback(thread_path.clone(), cap, thread_controls, frame_tx.clone())
-        {
+        if let Err(error) = run_video_playback(
+            id,
+            thread_path.clone(),
+            cap,
+            start_at,
+            thread_controls,
+            frame_tx.clone(),
+        ) {
             let _ = frame_tx.send(PlaybackEvent {
+                playback_id: id,
                 path: thread_path,
                 frame: None,
+                position: None,
+                duration: None,
                 ended: true,
                 error: Some(format!("{error:#}")),
             });
         }
     });
 
-    PlaybackHandle { path, controls }
+    PlaybackHandle { id, path, controls }
 }
 
 fn run_video_playback(
+    playback_id: u64,
     path: PathBuf,
     cap: u32,
+    start_at: Duration,
     controls: Arc<PlaybackControls>,
     frame_tx: flume::Sender<PlaybackEvent>,
 ) -> Result<()> {
     ffmpeg::init().context("failed to initialize FFmpeg")?;
-    spawn_audio_playback(path.clone(), controls.clone());
 
     let mut input =
         format::input(&path).with_context(|| format!("failed to open video {}", path.display()))?;
+    let duration = format_duration(input.duration());
+    let _ = frame_tx.send(PlaybackEvent {
+        playback_id,
+        path: path.clone(),
+        frame: None,
+        position: Some(start_at),
+        duration,
+        ended: false,
+        error: None,
+    });
     let mut setup = open_video_setup(&mut input, cap)?;
+    seek_input(&mut input, start_at).context("failed to seek video")?;
+    setup.decoder.flush();
+    spawn_audio_playback(path.clone(), controls.clone(), start_at);
+
     let playback_start = Instant::now();
     let mut paused_total = Duration::ZERO;
     let mut first_pts = None;
     let mut fallback_index = 0u64;
+    let mut sent_frames = 0u64;
 
     for (stream, packet) in input.packets() {
         if controls.stop.load(Ordering::SeqCst) {
@@ -154,19 +194,22 @@ fn run_video_playback(
         if stream.index() != setup.stream_index {
             continue;
         }
-        wait_while_paused(&controls, &mut paused_total);
         setup.decoder.send_packet(&packet)?;
         while let Some(frame) = receive_scaled_video_frame(&mut setup)? {
             if !send_playback_frame(
+                playback_id,
                 &path,
                 frame,
                 &controls,
                 &frame_tx,
+                start_at,
                 playback_start,
                 &mut paused_total,
                 &mut first_pts,
                 &mut fallback_index,
+                &mut sent_frames,
                 setup.frame_duration,
+                duration,
             ) {
                 return Ok(());
             }
@@ -176,15 +219,19 @@ fn run_video_playback(
     setup.decoder.send_eof()?;
     while let Some(frame) = receive_scaled_video_frame(&mut setup)? {
         if !send_playback_frame(
+            playback_id,
             &path,
             frame,
             &controls,
             &frame_tx,
+            start_at,
             playback_start,
             &mut paused_total,
             &mut first_pts,
             &mut fallback_index,
+            &mut sent_frames,
             setup.frame_duration,
+            duration,
         ) {
             return Ok(());
         }
@@ -192,8 +239,11 @@ fn run_video_playback(
 
     controls.stop.store(true, Ordering::SeqCst);
     let _ = frame_tx.send(PlaybackEvent {
+        playback_id,
         path,
         frame: None,
+        position: duration,
+        duration,
         ended: true,
         error: None,
     });
@@ -201,34 +251,49 @@ fn run_video_playback(
 }
 
 fn send_playback_frame(
+    playback_id: u64,
     path: &Path,
     frame: VideoFrame,
     controls: &Arc<PlaybackControls>,
     frame_tx: &flume::Sender<PlaybackEvent>,
+    start_at: Duration,
     playback_start: Instant,
     paused_total: &mut Duration,
     first_pts: &mut Option<Duration>,
     fallback_index: &mut u64,
+    sent_frames: &mut u64,
     frame_duration: Duration,
+    duration: Option<Duration>,
 ) -> bool {
-    let fallback_time = mul_duration(frame_duration, *fallback_index);
+    let fallback_time = start_at + mul_duration(frame_duration, *fallback_index);
     *fallback_index += 1;
     let pts = frame.timestamp.unwrap_or(fallback_time);
+    if should_discard_seek_preroll(frame.timestamp, start_at) {
+        return true;
+    }
     let base = *first_pts.get_or_insert(pts);
     let relative = pts.saturating_sub(base);
 
-    if !wait_until(playback_start, relative, controls, paused_total) {
+    let show_initial_paused_frame = *sent_frames == 0 && controls.paused.load(Ordering::SeqCst);
+    if !show_initial_paused_frame && !wait_until(playback_start, relative, controls, paused_total) {
         return false;
     }
 
-    frame_tx
+    let sent = frame_tx
         .send(PlaybackEvent {
+            playback_id,
             path: path.to_path_buf(),
             frame: Some(frame.image),
+            position: Some(pts),
+            duration,
             ended: false,
             error: None,
         })
-        .is_ok()
+        .is_ok();
+    if sent {
+        *sent_frames += 1;
+    }
+    sent
 }
 
 fn wait_until(
@@ -361,19 +426,44 @@ fn timestamp_to_duration(value: i64, time_base: Rational) -> Option<Duration> {
     (seconds >= 0.0).then(|| Duration::from_secs_f64(seconds))
 }
 
+fn format_duration(value: i64) -> Option<Duration> {
+    timestamp_to_duration(value, rescale::TIME_BASE).filter(|duration| !duration.is_zero())
+}
+
+fn duration_to_format_timestamp(duration: Duration) -> i64 {
+    duration.as_micros().min(i64::MAX as u128) as i64
+}
+
+fn seek_input(input: &mut format::context::Input, start_at: Duration) -> Result<()> {
+    if start_at.is_zero() {
+        return Ok(());
+    }
+    let timestamp = duration_to_format_timestamp(start_at);
+    input.seek(timestamp, ..timestamp)?;
+    Ok(())
+}
+
+fn should_discard_seek_preroll(timestamp: Option<Duration>, start_at: Duration) -> bool {
+    !start_at.is_zero() && timestamp.is_some_and(|timestamp| timestamp < start_at)
+}
+
 fn mul_duration(duration: Duration, count: u64) -> Duration {
     Duration::from_secs_f64(duration.as_secs_f64() * count as f64)
 }
 
-fn spawn_audio_playback(path: PathBuf, controls: Arc<PlaybackControls>) {
+fn spawn_audio_playback(path: PathBuf, controls: Arc<PlaybackControls>, start_at: Duration) {
     thread::spawn(move || {
-        if let Err(error) = run_audio_playback(&path, controls) {
+        if let Err(error) = run_audio_playback(&path, controls, start_at) {
             tracing::debug!(path = %path.display(), %error, "audio playback disabled");
         }
     });
 }
 
-fn run_audio_playback(path: &Path, controls: Arc<PlaybackControls>) -> Result<()> {
+fn run_audio_playback(
+    path: &Path,
+    controls: Arc<PlaybackControls>,
+    start_at: Duration,
+) -> Result<()> {
     let stream_handle = rodio::DeviceSinkBuilder::open_default_sink()
         .context("failed to open default audio output")?;
     let player = rodio::Player::connect_new(stream_handle.mixer());
@@ -387,8 +477,11 @@ fn run_audio_playback(path: &Path, controls: Arc<PlaybackControls>) -> Result<()
         .best(media::Type::Audio)
         .ok_or(ffmpeg::Error::StreamNotFound)?;
     let stream_index = stream.index();
+    let time_base = stream.time_base();
     let decoder_context = codec::context::Context::from_parameters(stream.parameters())?;
     let mut decoder = decoder_context.decoder().audio()?;
+    seek_input(&mut input, start_at).context("failed to seek audio")?;
+    decoder.flush();
     let src_layout = usable_channel_layout(decoder.channel_layout(), decoder.channels());
     let dst_layout = if src_layout.channels() > 2 {
         ChannelLayout::STEREO
@@ -423,6 +516,8 @@ fn run_audio_playback(path: &Path, controls: Arc<PlaybackControls>) -> Result<()
             &controls,
             dst_channels,
             dst_rate,
+            time_base,
+            start_at,
         )?;
     }
 
@@ -434,6 +529,8 @@ fn run_audio_playback(path: &Path, controls: Arc<PlaybackControls>) -> Result<()
         &controls,
         dst_channels,
         dst_rate,
+        time_base,
+        start_at,
     )?;
     while !controls.stop.load(Ordering::SeqCst) && !player.empty() {
         apply_audio_controls(&player, &controls);
@@ -450,9 +547,17 @@ fn receive_and_append_audio(
     controls: &Arc<PlaybackControls>,
     channels: u16,
     rate: u32,
+    time_base: Rational,
+    start_at: Duration,
 ) -> Result<()> {
     let mut decoded = frame::Audio::empty();
     while decoder.receive_frame(&mut decoded).is_ok() {
+        let timestamp = decoded
+            .timestamp()
+            .and_then(|value| timestamp_to_duration(value, time_base));
+        if should_discard_seek_preroll(timestamp, start_at) {
+            continue;
+        }
         let mut output = frame::Audio::empty();
         resampler.run(&decoded, &mut output)?;
         append_audio_frame(player, controls, &output, channels, rate)?;
@@ -527,5 +632,25 @@ mod tests {
     fn caps_video_dimensions_on_long_edge() {
         assert_eq!(capped_dimensions(4000, 2000, 1000), (1000, 500));
         assert_eq!(capped_dimensions(320, 240, 1000), (320, 240));
+    }
+
+    #[test]
+    fn discards_seek_preroll_before_requested_target() {
+        let target = Duration::from_secs(10);
+
+        assert!(should_discard_seek_preroll(
+            Some(Duration::from_secs(9)),
+            target
+        ));
+        assert!(!should_discard_seek_preroll(Some(target), target));
+        assert!(!should_discard_seek_preroll(
+            Some(Duration::from_secs(11)),
+            target
+        ));
+        assert!(!should_discard_seek_preroll(None, target));
+        assert!(!should_discard_seek_preroll(
+            Some(Duration::ZERO),
+            Duration::ZERO
+        ));
     }
 }

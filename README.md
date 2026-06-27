@@ -83,8 +83,9 @@ directory.
 | `ctrl+d` / `ctrl+u` | Move half a page down or up in grid mode. |
 | `home` / `end` | Jump to the first or last file. |
 | `space` | Play or pause the current video. |
+| `u` / `o` | Rewind or fast-forward the active video by 10%. |
 | `d` | Toggle the current file in the delete queue. |
-| `u` | Remove the current file from the delete queue. |
+| `u` | Remove the current file from the delete queue when no video is active. |
 | `shift+D` | Show the delete queue grid. |
 | `ctrl+R` | Confirm deletion for queued files. |
 | `y` / `n` | Accept or cancel the delete confirmation. |

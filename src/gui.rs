@@ -11,6 +11,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -153,6 +154,8 @@ struct GuiApp {
 struct ActiveVideo {
     handle: video::PlaybackHandle,
     texture: Option<egui::TextureHandle>,
+    position: Duration,
+    duration: Option<Duration>,
     ended: bool,
 }
 
@@ -324,8 +327,14 @@ impl GuiApp {
             let Some(active) = self.active_video.as_mut() else {
                 continue;
             };
-            if active.handle.path() != event.path {
+            if active.handle.id() != event.playback_id || active.handle.path() != event.path {
                 continue;
+            }
+            if let Some(position) = event.position {
+                active.position = position;
+            }
+            if let Some(duration) = event.duration {
+                active.duration = Some(duration);
             }
             let failed = event.error.is_some();
             if let Some(error) = event.error {
@@ -381,6 +390,14 @@ impl GuiApp {
             .is_some_and(|active| !active.handle.is_paused() && !active.ended)
     }
 
+    fn active_current_video_can_seek(&self) -> bool {
+        self.state
+            .current_entry()
+            .filter(|entry| entry.media_kind.is_video())
+            .and_then(|entry| self.active_video_for(&entry.path))
+            .is_some_and(|active| !active.ended)
+    }
+
     fn handle_focus_change(&mut self, focused: bool) {
         let effect = focus_playback_effect(
             self.window_focused,
@@ -405,20 +422,41 @@ impl GuiApp {
     }
 
     fn start_video_playback(&mut self, path: PathBuf) {
+        self.start_video_playback_from(
+            path,
+            Duration::ZERO,
+            false,
+            selection_autoplay_after_playback_start(),
+        );
+    }
+
+    fn start_video_playback_from(
+        &mut self,
+        path: PathBuf,
+        start_at: Duration,
+        paused: bool,
+        selection_autoplay_armed: bool,
+    ) {
         self.stop_active_video();
-        self.selection_autoplay_armed = selection_autoplay_after_playback_start();
+        self.selection_autoplay_armed = selection_autoplay_armed;
         let handle = video::spawn_playback(
             path.clone(),
             FIT_CAP,
             self.video_muted,
+            start_at,
+            paused,
             self.video_tx.clone(),
         );
         self.active_video = Some(ActiveVideo {
             handle,
             texture: None,
+            position: start_at,
+            duration: None,
             ended: false,
         });
-        self.status = if self.video_muted {
+        self.status = if paused {
+            "video paused".to_owned()
+        } else if self.video_muted {
             "video playing muted".to_owned()
         } else {
             "video playing with audio".to_owned()
@@ -450,6 +488,37 @@ impl GuiApp {
         }
 
         self.start_video_playback(path);
+    }
+
+    fn seek_current_video(&mut self, direction: VideoSeekDirection) -> bool {
+        let Some(entry) = self.state.current_entry() else {
+            return false;
+        };
+        if !entry.media_kind.is_video() {
+            return false;
+        }
+        let path = entry.path.clone();
+        let Some((position, duration, was_paused)) = self
+            .active_video_for(&path)
+            .filter(|active| !active.ended)
+            .map(|active| (active.position, active.duration, active.handle.is_paused()))
+        else {
+            return false;
+        };
+        let Some(target) = video_seek_target(position, duration, direction) else {
+            self.status = "video duration unavailable".to_owned();
+            return true;
+        };
+
+        let selection_autoplay_armed = selection_autoplay_after_seek(was_paused);
+        self.start_video_playback_from(path, target, was_paused, selection_autoplay_armed);
+        let verb = match direction {
+            VideoSeekDirection::Backward => "rewound",
+            VideoSeekDirection::Forward => "fast-forwarded",
+        };
+        let state = if was_paused { "paused" } else { "playing" };
+        self.status = format!("video {verb} 10% ({state})");
+        true
     }
 
     fn autoplay_current_video_if_armed(&mut self) {
@@ -692,8 +761,18 @@ impl GuiApp {
                 self.status = format!("queued: {}", self.state.queue_count());
             }
             if i.key_pressed(Key::U) && !i.modifiers.ctrl {
-                self.state.unqueue_current();
-                self.status = format!("queued: {}", self.state.queue_count());
+                match contextual_u_key_action(self.active_current_video_can_seek()) {
+                    UKeyAction::SeekBackward => {
+                        self.seek_current_video(VideoSeekDirection::Backward);
+                    }
+                    UKeyAction::Unqueue => {
+                        self.state.unqueue_current();
+                        self.status = format!("queued: {}", self.state.queue_count());
+                    }
+                }
+            }
+            if i.key_pressed(Key::O) && !i.modifiers.ctrl {
+                self.seek_current_video(VideoSeekDirection::Forward);
             }
             if i.key_pressed(Key::R) {
                 if i.modifiers.ctrl {
@@ -1001,8 +1080,9 @@ preview mode:
 home / end      first / last
 g               toggle grid
 space           play / pause videos
+u / o           rewind / fast-forward active video 10%
 d               toggle delete queue
-u               unqueue current
+u               unqueue current when no video is active
 shift+D         show delete queue
 ctrl+R          delete queued (confirm)
 z               toggle fit / original zoom
@@ -1375,6 +1455,48 @@ fn should_autoplay_selected_video(armed: bool, entry: Option<&MediaEntry>) -> bo
     armed && entry.is_some_and(|entry| entry.media_kind.is_video())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoSeekDirection {
+    Backward,
+    Forward,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UKeyAction {
+    SeekBackward,
+    Unqueue,
+}
+
+fn contextual_u_key_action(active_current_video_can_seek: bool) -> UKeyAction {
+    if active_current_video_can_seek {
+        UKeyAction::SeekBackward
+    } else {
+        UKeyAction::Unqueue
+    }
+}
+
+fn video_seek_step(duration: Duration) -> Option<Duration> {
+    (!duration.is_zero()).then(|| Duration::from_secs_f64(duration.as_secs_f64() * 0.10))
+}
+
+fn video_seek_target(
+    position: Duration,
+    duration: Option<Duration>,
+    direction: VideoSeekDirection,
+) -> Option<Duration> {
+    let duration = duration?;
+    let step = video_seek_step(duration)?;
+    let target = match direction {
+        VideoSeekDirection::Backward => position.saturating_sub(step),
+        VideoSeekDirection::Forward => position.checked_add(step).unwrap_or(duration),
+    };
+    Some(target.min(duration))
+}
+
+fn selection_autoplay_after_seek(was_paused: bool) -> bool {
+    !was_paused
+}
+
 fn next_video_index_after(entries: &[MediaEntry], current_index: usize) -> Option<usize> {
     let start = current_index.checked_add(1)?;
     entries
@@ -1516,6 +1638,72 @@ mod tests {
         assert!(should_autoplay_selected_video(true, Some(&video)));
         assert!(!selection_autoplay_after_pause_state(true));
         assert!(selection_autoplay_after_pause_state(false));
+    }
+
+    #[test]
+    fn video_seek_target_moves_by_ten_percent_and_clamps() {
+        let duration = Duration::from_secs(100);
+
+        assert_eq!(
+            video_seek_target(
+                Duration::from_secs(50),
+                Some(duration),
+                VideoSeekDirection::Backward
+            ),
+            Some(Duration::from_secs(40))
+        );
+        assert_eq!(
+            video_seek_target(
+                Duration::from_secs(50),
+                Some(duration),
+                VideoSeekDirection::Forward
+            ),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            video_seek_target(
+                Duration::from_secs(5),
+                Some(duration),
+                VideoSeekDirection::Backward
+            ),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            video_seek_target(
+                Duration::from_secs(95),
+                Some(duration),
+                VideoSeekDirection::Forward
+            ),
+            Some(duration)
+        );
+    }
+
+    #[test]
+    fn video_seek_target_requires_known_nonzero_duration() {
+        assert_eq!(
+            video_seek_target(Duration::from_secs(5), None, VideoSeekDirection::Forward),
+            None
+        );
+        assert_eq!(
+            video_seek_target(
+                Duration::from_secs(5),
+                Some(Duration::ZERO),
+                VideoSeekDirection::Backward
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn video_seek_preserves_playing_session_but_not_paused_session() {
+        assert!(selection_autoplay_after_seek(false));
+        assert!(!selection_autoplay_after_seek(true));
+    }
+
+    #[test]
+    fn contextual_u_rewinds_active_video_otherwise_unqueues() {
+        assert_eq!(contextual_u_key_action(true), UKeyAction::SeekBackward);
+        assert_eq!(contextual_u_key_action(false), UKeyAction::Unqueue);
     }
 
     #[test]
