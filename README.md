@@ -65,6 +65,7 @@ Usage: cullr [OPTIONS] [PATH]
 | `--locale <LOCALE>` | Locale to use for name sorting, for example `sv` or `en`. |
 | `--dry-run-delete` | Exercise the delete flow without deleting files. |
 | `--hidden` | Include hidden files and directories. |
+| `--auto-next` | Automatically advance to the next video when playback ends. |
 
 If no path or directory is supplied, `cullr` opens the current working
 directory.
@@ -90,6 +91,7 @@ directory.
 | `z` | Toggle fit-to-window and original-pixels zoom. |
 | `f` | Toggle fullscreen window mode. |
 | `m` | Mute or unmute video audio. Videos start muted. |
+| `a` | Toggle automatically advancing to the next video when playback ends. |
 | `b` | Show or hide gallery media-type badges. |
 | `t` | Cycle time sorting. |
 | `n` | Cycle name sorting. |

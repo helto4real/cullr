@@ -38,6 +38,9 @@ pub struct Cli {
 
     #[arg(long)]
     pub hidden: bool,
+
+    #[arg(long)]
+    pub auto_next: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -145,6 +148,7 @@ pub fn is_video_extension(ext: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn default_extensions_include_images_and_videos() {
@@ -158,6 +162,7 @@ mod tests {
             locale: None,
             dry_run_delete: false,
             hidden: false,
+            auto_next: false,
         };
 
         let extensions = cli.resolved_extensions();
@@ -178,6 +183,7 @@ mod tests {
             locale: None,
             dry_run_delete: false,
             hidden: false,
+            auto_next: false,
         };
 
         assert_eq!(cli.resolved_extensions(), vec!["mp4".to_owned()]);
@@ -187,5 +193,13 @@ mod tests {
     fn image_and_video_defaults_are_separate() {
         assert!(!default_extensions_for(MediaMode::Image).contains(&"mp4".to_owned()));
         assert!(!default_extensions_for(MediaMode::Video).contains(&"jpg".to_owned()));
+    }
+
+    #[test]
+    fn auto_next_flag_parses() {
+        let cli = Cli::parse_from(["cullr", "--auto-next", "/tmp/media"]);
+
+        assert!(cli.auto_next);
+        assert_eq!(cli.path, Some(PathBuf::from("/tmp/media")));
     }
 }

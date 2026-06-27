@@ -24,7 +24,7 @@ use crate::{
     delete, metadata,
     scanner::{ScanOptions, scan_directory},
     sorter,
-    state::{AppState, MediaKind, MediaMode, ViewMode, ZoomMode},
+    state::{AppState, MediaEntry, MediaKind, MediaMode, ViewMode, ZoomMode},
     video,
 };
 
@@ -139,6 +139,8 @@ struct GuiApp {
     fullscreen: bool,
     active_video: Option<ActiveVideo>,
     video_muted: bool,
+    selection_autoplay_armed: bool,
+    auto_next: bool,
     media_type_badges_visible: bool,
     empty_media_target: PathBuf,
     // Deferred from inside the input closure (which borrows ctx immutably).
@@ -158,6 +160,7 @@ impl GuiApp {
         state: AppState,
         locale: Option<String>,
         dry_run: bool,
+        auto_next: bool,
         empty_media_target: PathBuf,
     ) -> Self {
         let (video_tx, video_rx) = flume::unbounded();
@@ -185,6 +188,8 @@ impl GuiApp {
             fullscreen: false,
             active_video: None,
             video_muted: true,
+            selection_autoplay_armed: false,
+            auto_next,
             media_type_badges_visible: true,
             empty_media_target,
             pending_sort: None,
@@ -320,6 +325,7 @@ impl GuiApp {
             if active.handle.path() != event.path {
                 continue;
             }
+            let failed = event.error.is_some();
             if let Some(error) = event.error {
                 active.ended = true;
                 self.status = format!("video failed: {error}");
@@ -338,6 +344,9 @@ impl GuiApp {
                 active.ended = true;
                 active.handle.set_paused(true);
                 self.status = "video ended".to_owned();
+            }
+            if event.ended && self.auto_next && !failed {
+                self.play_next_video_after_current();
             }
         }
     }
@@ -368,6 +377,7 @@ impl GuiApp {
 
     fn start_video_playback(&mut self, path: PathBuf) {
         self.stop_active_video();
+        self.selection_autoplay_armed = selection_autoplay_after_playback_start();
         let handle = video::spawn_playback(
             path.clone(),
             FIT_CAP,
@@ -401,6 +411,7 @@ impl GuiApp {
         {
             let paused = !active.handle.is_paused();
             active.handle.set_paused(paused);
+            self.selection_autoplay_armed = selection_autoplay_after_pause_state(paused);
             self.status = if paused {
                 "video paused".to_owned()
             } else {
@@ -410,6 +421,31 @@ impl GuiApp {
         }
 
         self.start_video_playback(path);
+    }
+
+    fn autoplay_current_video_if_armed(&mut self) {
+        let Some(entry) = self.state.current_entry() else {
+            return;
+        };
+        if !should_autoplay_selected_video(self.selection_autoplay_armed, Some(entry)) {
+            return;
+        }
+        let path = entry.path.clone();
+        if self
+            .active_video_for(&path)
+            .is_some_and(|active| !active.handle.is_paused() && !active.ended)
+        {
+            return;
+        }
+        self.start_video_playback(path);
+    }
+
+    fn play_next_video_after_current(&mut self) {
+        if let Some(index) = next_video_index_after(&self.state.entries, self.state.current_index) {
+            self.set_current_index(index);
+        } else {
+            self.status = "video ended; no next video".to_owned();
+        }
     }
 
     fn toggle_video_mute(&mut self) {
@@ -433,11 +469,26 @@ impl GuiApp {
         };
     }
 
+    fn toggle_auto_next(&mut self) {
+        self.auto_next = !self.auto_next;
+        self.status = if self.auto_next {
+            "auto-next enabled".to_owned()
+        } else {
+            "auto-next disabled".to_owned()
+        };
+    }
+
     fn set_current_index(&mut self, index: usize) {
-        if index != self.state.current_index {
-            self.stop_active_video();
-        }
+        let previous = self.state.current_index;
         self.state.current_index = index.min(self.state.entries.len().saturating_sub(1));
+        self.finish_selection_change(previous);
+    }
+
+    fn finish_selection_change(&mut self, previous_index: usize) {
+        if self.state.current_index != previous_index {
+            self.stop_active_video();
+            self.autoplay_current_video_if_armed();
+        }
         self.scroll_to_current = true;
     }
 
@@ -582,46 +633,29 @@ impl GuiApp {
                     || i.key_pressed(Key::ArrowRight)
                     || i.key_pressed(Key::ArrowDown)
                 {
-                    let before = self.state.current_index;
-                    self.state.next();
-                    if self.state.current_index != before {
-                        self.stop_active_video();
-                    }
-                    self.scroll_to_current = true;
+                    self.move_by(1);
                 }
                 if i.key_pressed(Key::H)
                     || i.key_pressed(Key::K)
                     || i.key_pressed(Key::ArrowLeft)
                     || i.key_pressed(Key::ArrowUp)
                 {
-                    let before = self.state.current_index;
-                    self.state.previous();
-                    if self.state.current_index != before {
-                        self.stop_active_video();
-                    }
-                    self.scroll_to_current = true;
+                    self.move_by(-1);
                 }
             }
             if i.key_pressed(Key::Home) {
-                if self.state.current_index != 0 {
-                    self.stop_active_video();
-                }
-                self.state.first();
-                self.scroll_to_current = true;
+                self.set_current_index(0);
             }
             if i.key_pressed(Key::End) {
-                let before = self.state.current_index;
-                self.state.last();
-                if self.state.current_index != before {
-                    self.stop_active_video();
-                }
-                self.scroll_to_current = true;
+                let last = self.state.entries.len().saturating_sub(1);
+                self.set_current_index(last);
             }
 
             // Delete queue and video playback.
             if i.modifiers.shift && i.key_pressed(Key::D) {
+                let before = self.state.current_index;
                 self.state.enter_delete_queue_grid();
-                self.scroll_to_current = true;
+                self.finish_selection_change(before);
             } else if i.key_pressed(Key::Space) && self.current_is_video() {
                 self.toggle_current_video_playback();
             } else if i.key_pressed(Key::D) && !i.modifiers.ctrl {
@@ -672,6 +706,9 @@ impl GuiApp {
             }
             if i.key_pressed(Key::M) {
                 self.toggle_video_mute();
+            }
+            if i.key_pressed(Key::A) {
+                self.toggle_auto_next();
             }
             if i.key_pressed(Key::B) {
                 self.toggle_media_type_badges();
@@ -942,6 +979,7 @@ ctrl+R          delete queued (confirm)
 z               toggle fit / original zoom
 f               toggle fullscreen window
 m               mute / unmute video audio
+a               toggle auto-next video advance
 b               show / hide media badges
 t / n           cycle time / name sort
 r               toggle recursive scan
@@ -976,10 +1014,11 @@ impl eframe::App for GuiApp {
             )
         };
         let status = format!(
-            "{mode}  |  {position}  |  {zoom}  |  queued: {}  |  sort: {:?}  |  audio: {}  |  {}",
+            "{mode}  |  {position}  |  {zoom}  |  queued: {}  |  sort: {:?}  |  audio: {}  |  auto-next: {}  |  {}",
             self.state.queue_count(),
             self.state.sort_mode,
             if self.video_muted { "muted" } else { "on" },
+            if self.auto_next { "on" } else { "off" },
             self.status,
         );
 
@@ -1293,6 +1332,27 @@ fn should_autoplay_initial_video(state: &AppState, initial_file: Option<&Path>) 
         .is_some_and(|entry| entry.path.as_path() == initial_file && entry.media_kind.is_video())
 }
 
+fn selection_autoplay_after_playback_start() -> bool {
+    true
+}
+
+fn selection_autoplay_after_pause_state(paused: bool) -> bool {
+    !paused
+}
+
+fn should_autoplay_selected_video(armed: bool, entry: Option<&MediaEntry>) -> bool {
+    armed && entry.is_some_and(|entry| entry.media_kind.is_video())
+}
+
+fn next_video_index_after(entries: &[MediaEntry], current_index: usize) -> Option<usize> {
+    let start = current_index.checked_add(1)?;
+    entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, entry)| entry.media_kind.is_video().then_some(index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,6 +1444,52 @@ mod tests {
         assert!(!should_autoplay_initial_video(&state, Some(&video_path)));
     }
 
+    #[test]
+    fn selection_autoplay_stays_armed_across_images_until_pause() {
+        let image = media_entry(
+            PathBuf::from("/tmp/media/image.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            0,
+        );
+        let video = media_entry(
+            PathBuf::from("/tmp/media/video.mp4"),
+            MediaKind::Video(VideoKind::Mp4),
+            1,
+        );
+
+        assert!(selection_autoplay_after_playback_start());
+        assert!(!should_autoplay_selected_video(true, Some(&image)));
+        assert!(should_autoplay_selected_video(true, Some(&video)));
+        assert!(!selection_autoplay_after_pause_state(true));
+        assert!(selection_autoplay_after_pause_state(false));
+    }
+
+    #[test]
+    fn auto_next_finds_next_video_without_wrapping() {
+        let entries = vec![
+            media_entry(
+                PathBuf::from("/tmp/media/first.mp4"),
+                MediaKind::Video(VideoKind::Mp4),
+                0,
+            ),
+            media_entry(
+                PathBuf::from("/tmp/media/image.jpg"),
+                MediaKind::Image(ImageKind::Jpeg),
+                1,
+            ),
+            media_entry(
+                PathBuf::from("/tmp/media/second.mov"),
+                MediaKind::Video(VideoKind::Mov),
+                2,
+            ),
+        ];
+
+        assert_eq!(next_video_index_after(&entries, 0), Some(2));
+        assert_eq!(next_video_index_after(&entries, 1), Some(2));
+        assert_eq!(next_video_index_after(&entries, 2), None);
+        assert_eq!(next_video_index_after(&entries, usize::MAX), None);
+    }
+
     fn app_state(entries: Vec<MediaEntry>, current_index: usize) -> AppState {
         let mut state = AppState::new(
             PathBuf::from("/tmp/media"),
@@ -1469,6 +1575,7 @@ pub fn run(cli: Cli) -> Result<()> {
         state,
         cli.locale.clone(),
         cli.dry_run_delete,
+        cli.auto_next,
         empty_media_target,
     );
     if autoplay_initial_video && let Some(path) = app.state.current_path() {
