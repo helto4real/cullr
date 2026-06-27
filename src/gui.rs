@@ -137,6 +137,7 @@ struct GuiApp {
     last_visible_rows: std::ops::Range<usize>,
     scroll_to_current: bool,
     fullscreen: bool,
+    window_focused: bool,
     active_video: Option<ActiveVideo>,
     video_muted: bool,
     selection_autoplay_armed: bool,
@@ -186,6 +187,7 @@ impl GuiApp {
             last_visible_rows: 0..0,
             scroll_to_current: false,
             fullscreen: false,
+            window_focused: true,
             active_video: None,
             video_muted: true,
             selection_autoplay_armed: false,
@@ -333,11 +335,15 @@ impl GuiApp {
             if let Some(image) = event.frame {
                 let size = [image.width() as usize, image.height() as usize];
                 let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-                active.texture = Some(ctx.load_texture(
-                    format!("video-playback:{}", event.path.display()),
-                    color,
-                    egui::TextureOptions::LINEAR,
-                ));
+                if let Some(texture) = active.texture.as_mut() {
+                    texture.set(color, egui::TextureOptions::LINEAR);
+                } else {
+                    active.texture = Some(ctx.load_texture(
+                        format!("video-playback:{}", event.path.display()),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
                 ctx.request_repaint();
             }
             if event.ended {
@@ -367,6 +373,29 @@ impl GuiApp {
     fn active_video_is_playing_for(&self, path: &Path) -> bool {
         self.active_video_for(path)
             .is_some_and(|active| !active.handle.is_paused() && !active.ended)
+    }
+
+    fn active_video_is_playing(&self) -> bool {
+        self.active_video
+            .as_ref()
+            .is_some_and(|active| !active.handle.is_paused() && !active.ended)
+    }
+
+    fn handle_focus_change(&mut self, focused: bool) {
+        let effect = focus_playback_effect(
+            self.window_focused,
+            focused,
+            self.active_video_is_playing(),
+            self.selection_autoplay_armed,
+        );
+        if effect.pause_video {
+            if let Some(active) = &self.active_video {
+                active.handle.set_paused(true);
+            }
+            self.status = "video paused: window lost focus".to_owned();
+        }
+        self.selection_autoplay_armed = effect.selection_autoplay_armed;
+        self.window_focused = focused;
     }
 
     fn stop_active_video(&mut self) {
@@ -990,6 +1019,8 @@ q / esc         quit / close";
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let focused = ctx.input(|input| input.focused);
+        self.handle_focus_change(focused);
         self.handle_input(ctx);
         self.drain_results(ctx);
         self.drain_video_events(ctx);
@@ -1353,6 +1384,29 @@ fn next_video_index_after(entries: &[MediaEntry], current_index: usize) -> Optio
         .find_map(|(index, entry)| entry.media_kind.is_video().then_some(index))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FocusPlaybackEffect {
+    pause_video: bool,
+    selection_autoplay_armed: bool,
+}
+
+fn focus_playback_effect(
+    was_focused: bool,
+    is_focused: bool,
+    active_video_playing: bool,
+    selection_autoplay_armed: bool,
+) -> FocusPlaybackEffect {
+    let pause_video = was_focused && !is_focused && active_video_playing;
+    FocusPlaybackEffect {
+        pause_video,
+        selection_autoplay_armed: if pause_video {
+            false
+        } else {
+            selection_autoplay_armed
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1488,6 +1542,46 @@ mod tests {
         assert_eq!(next_video_index_after(&entries, 1), Some(2));
         assert_eq!(next_video_index_after(&entries, 2), None);
         assert_eq!(next_video_index_after(&entries, usize::MAX), None);
+    }
+
+    #[test]
+    fn focus_loss_pauses_video_and_clears_selection_autoplay() {
+        assert_eq!(
+            focus_playback_effect(true, false, true, true),
+            FocusPlaybackEffect {
+                pause_video: true,
+                selection_autoplay_armed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn focus_gain_does_not_auto_resume() {
+        assert_eq!(
+            focus_playback_effect(false, true, false, false),
+            FocusPlaybackEffect {
+                pause_video: false,
+                selection_autoplay_armed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unchanged_focus_state_preserves_playback_state() {
+        assert_eq!(
+            focus_playback_effect(true, true, true, true),
+            FocusPlaybackEffect {
+                pause_video: false,
+                selection_autoplay_armed: true,
+            }
+        );
+        assert_eq!(
+            focus_playback_effect(false, false, false, false),
+            FocusPlaybackEffect {
+                pause_video: false,
+                selection_autoplay_armed: false,
+            }
+        );
     }
 
     fn app_state(entries: Vec<MediaEntry>, current_index: usize) -> AppState {
