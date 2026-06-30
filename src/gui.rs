@@ -1220,7 +1220,7 @@ d               toggle delete queue
 u               unqueue current when no video is active
 shift+D         show delete queue
 ctrl+R          delete queued (confirm)
-z               toggle fit / original zoom
+z               toggle fit / actual size
 f               toggle fullscreen window
 m               mute / unmute video audio
 a               toggle auto-next video advance

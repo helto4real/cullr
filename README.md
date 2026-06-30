@@ -91,7 +91,7 @@ directory. If multiple paths are supplied, they must all be files.
 | `shift+D` | Show the delete queue grid. |
 | `ctrl+R` | Confirm deletion for queued files. |
 | `y` / `n` | Accept or cancel the delete confirmation. |
-| `z` | Toggle fit-to-window and original-pixels zoom. |
+| `z` | Toggle fit-to-window and actual-size / 1:1 zoom. |
 | `f` | Toggle fullscreen window mode. |
 | `m` | Mute or unmute video audio. Videos start muted. |
 | `a` | Toggle automatically advancing to the next video when playback ends. |
