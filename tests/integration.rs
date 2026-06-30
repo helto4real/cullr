@@ -42,7 +42,7 @@ fn dry_run_delete_keeps_files() {
     let image_path = temp.path().join("sample.png");
     write_sample_image(&image_path);
     let mut state = state_for(temp.path());
-    state.delete_queue.insert(image_path.clone());
+    queue_first_entry(&mut state);
 
     let report = delete_queued(&mut state, true);
 
@@ -57,7 +57,7 @@ fn real_delete_removes_queued_file() {
     let image_path = temp.path().join("sample.png");
     write_sample_image(&image_path);
     let mut state = state_for(temp.path());
-    state.delete_queue.insert(image_path.clone());
+    queue_first_entry(&mut state);
 
     let report = delete_queued(&mut state, false);
 
@@ -72,7 +72,7 @@ fn real_delete_removes_queued_video_file() {
     let video_path = temp.path().join("sample.mp4");
     fs::write(&video_path, b"not actually decoded for delete").unwrap();
     let mut state = state_for_ext(temp.path(), "mp4");
-    state.delete_queue.insert(video_path.clone());
+    queue_first_entry(&mut state);
 
     let report = delete_queued(&mut state, false);
 
@@ -146,6 +146,11 @@ fn write_sample_image(path: &Path) {
         }
     });
     image.save(path).unwrap();
+}
+
+fn queue_first_entry(state: &mut AppState) {
+    let path = state.entries[0].path.clone();
+    state.delete_queue.insert(path);
 }
 
 fn file_set(path: &Path) -> BTreeSet<String> {
