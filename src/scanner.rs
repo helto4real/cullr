@@ -26,6 +26,19 @@ pub fn scan_directory(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
     }
 }
 
+pub fn scan_files(paths: &[PathBuf], extensions: &[String]) -> Result<Vec<MediaEntry>> {
+    let extensions = extension_set(extensions);
+    let mut entries = Vec::new();
+
+    for path in paths {
+        if let Some(entry) = build_entry(path.clone(), entries.len(), &extensions)? {
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
+}
+
 fn scan_flat_with_read_dir(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
     let extensions = extension_set(&opts.extensions);
     let mut entries = Vec::new();
@@ -257,5 +270,51 @@ mod tests {
         .unwrap();
 
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn scan_files_uses_only_explicit_paths_and_preserves_order() {
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("image.jpg");
+        let video = temp.path().join("clip.mp4");
+        let ignored = temp.path().join("ignored.jpg");
+        touch(&image);
+        touch(&video);
+        touch(&ignored);
+
+        let entries = scan_files(
+            &[video.clone(), image.clone()],
+            &["jpg".to_owned(), "mp4".to_owned()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![video, image]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.discovered_order)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn scan_files_applies_extension_filter() {
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("image.jpg");
+        let video = temp.path().join("clip.mp4");
+        touch(&image);
+        touch(&video);
+
+        let entries = scan_files(&[video, image.clone()], &["jpg".to_owned()]).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, image);
     }
 }

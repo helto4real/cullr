@@ -11,9 +11,9 @@ use crate::state::{MediaMode, SortMode};
     about = "Fast GPU-windowed media viewer and culler"
 )]
 pub struct Cli {
-    /// Media file or directory to open. A file opens its folder positioned on it.
+    /// Media file(s) or directory to open. One file opens its folder positioned on it.
     #[arg(value_name = "PATH")]
-    pub path: Option<PathBuf>,
+    pub paths: Vec<PathBuf>,
 
     #[arg(short = 'd', long = "directory", value_name = "DIR")]
     pub directory: Option<PathBuf>,
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn default_extensions_include_images_and_videos() {
         let cli = Cli {
-            path: None,
+            paths: Vec::new(),
             directory: None,
             recursive: false,
             file_ext: None,
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn media_mode_filters_explicit_extensions() {
         let cli = Cli {
-            path: None,
+            paths: Vec::new(),
             directory: None,
             recursive: false,
             file_ext: Some("jpg,mp4,txt".to_owned()),
@@ -200,6 +200,21 @@ mod tests {
         let cli = Cli::parse_from(["cullr", "--auto-next", "/tmp/media"]);
 
         assert!(cli.auto_next);
-        assert_eq!(cli.path, Some(PathBuf::from("/tmp/media")));
+        assert_eq!(cli.paths, vec![PathBuf::from("/tmp/media")]);
+    }
+
+    #[test]
+    fn positional_paths_are_optional_and_repeatable() {
+        let cli = Cli::parse_from(["cullr"]);
+        assert!(cli.paths.is_empty());
+
+        let cli = Cli::parse_from(["cullr", "/tmp/a.jpg"]);
+        assert_eq!(cli.paths, vec![PathBuf::from("/tmp/a.jpg")]);
+
+        let cli = Cli::parse_from(["cullr", "/tmp/a.jpg", "/tmp/b.mp4"]);
+        assert_eq!(
+            cli.paths,
+            vec![PathBuf::from("/tmp/a.jpg"), PathBuf::from("/tmp/b.mp4")]
+        );
     }
 }

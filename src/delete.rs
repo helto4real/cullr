@@ -63,7 +63,11 @@ fn safety_check(state: &AppState, entry: &crate::state::MediaEntry) -> Result<()
         .path
         .canonicalize()
         .map_err(|error| format!("cannot canonicalize path: {error}"))?;
-    if !canonical.starts_with(&state.directory) {
+    if let Some(selected_files) = &state.selected_files {
+        if !selected_files.contains(&canonical) {
+            return Err("path is outside selected file set".to_owned());
+        }
+    } else if !canonical.starts_with(&state.directory) {
         return Err("path is outside selected directory".to_owned());
     }
 
@@ -155,6 +159,40 @@ mod tests {
         assert!(!path.exists());
         assert!(state.entries.is_empty());
         assert!(state.delete_queue.is_empty());
+    }
+
+    #[test]
+    fn selected_file_scope_allows_deleting_selected_file() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("a.jpg");
+        fs::write(&path, b"x").unwrap();
+        let mut state = make_state(path.clone());
+        state.selected_files = Some([path.canonicalize().unwrap()].into_iter().collect());
+
+        let report = delete_queued(&mut state, false);
+
+        assert!(report.failed.is_empty());
+        assert_eq!(report.deleted, vec![path]);
+        assert!(state.entries.is_empty());
+        assert!(state.delete_queue.is_empty());
+    }
+
+    #[test]
+    fn selected_file_scope_rejects_entry_outside_selected_set() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("a.jpg");
+        let other = temp.path().join("b.jpg");
+        fs::write(&path, b"x").unwrap();
+        fs::write(&other, b"x").unwrap();
+        let mut state = make_state(path.clone());
+        state.selected_files = Some([other.canonicalize().unwrap()].into_iter().collect());
+
+        let report = delete_queued(&mut state, false);
+
+        assert!(path.exists());
+        assert!(report.deleted.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].1, "path is outside selected file set");
     }
 
     #[test]

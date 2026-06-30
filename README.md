@@ -8,8 +8,9 @@ an explicit confirmation step.
 
 ## What It Does
 
-- Opens a media directory in grid view, or opens a specific file in preview
-  view positioned inside its parent directory.
+- Opens a media directory in grid view, opens a specific file in preview view
+  positioned inside its parent directory, or opens multiple explicit files as a
+  focused review set.
 - Shows a large preview view and a thumbnail grid view for fast review.
 - Decodes images on worker threads and uploads them as GPU textures, so the
   window can resize without re-decoding every frame.
@@ -51,12 +52,12 @@ cargo build --release
 ## CLI Options
 
 ```text
-Usage: cullr [OPTIONS] [PATH]
+Usage: cullr [OPTIONS] [PATH]...
 ```
 
 | Option | Description |
 | --- | --- |
-| `PATH` | Media file or directory to open. A file opens its folder positioned on that file. |
+| `PATH` | Media file(s) or directory to open. One file opens its folder positioned on that file; multiple files open only that explicit set. |
 | `-d, --directory <DIR>` | Directory to open. |
 | `--recursive` | Include media in subdirectories. |
 | `--file_ext <EXTS>` | Comma-separated extensions to include, for example `jpg,png,webp`. |
@@ -68,7 +69,7 @@ Usage: cullr [OPTIONS] [PATH]
 | `--auto-next` | Automatically advance to the next video when playback ends. |
 
 If no path or directory is supplied, `cullr` opens the current working
-directory.
+directory. If multiple paths are supplied, they must all be files.
 
 ## Keyboard Shortcuts
 
@@ -84,6 +85,7 @@ directory.
 | `home` / `end` | Jump to the first or last file. |
 | `space` | Play or pause the current video. |
 | `u` / `o` | Rewind or fast-forward the active video by 10%. |
+| `y` | Briefly show the active video progress overlay. |
 | `d` | Toggle the current file in the delete queue. |
 | `u` | Remove the current file from the delete queue when no video is active. |
 | `shift+D` | Show the delete queue grid. |
@@ -133,9 +135,9 @@ Deletion is intentionally staged:
 - Press `ctrl+R`, then confirm with `y`.
 
 Before deleting, `cullr` checks that each queued path still belongs to the
-selected directory, is a real file rather than a symlink, and has not changed
-size or modification time since it was scanned. `--dry-run-delete` keeps the
-same flow but leaves all files on disk.
+selected directory or explicit selected-file set, is a real file rather than a
+symlink, and has not changed size or modification time since it was scanned.
+`--dry-run-delete` keeps the same flow but leaves all files on disk.
 
 ## Development
 

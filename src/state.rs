@@ -98,6 +98,7 @@ pub struct AppState {
     pub sort_mode: SortMode,
     pub zoom_mode: ZoomMode,
     pub delete_queue: IndexSet<PathBuf>,
+    pub selected_files: Option<IndexSet<PathBuf>>,
     pub show_info_overlay: bool,
     pub show_help_overlay: bool,
     pub confirm_delete: bool,
@@ -125,6 +126,7 @@ impl AppState {
             sort_mode,
             zoom_mode: ZoomMode::Fit,
             delete_queue: IndexSet::new(),
+            selected_files: None,
             show_info_overlay: false,
             show_help_overlay: false,
             confirm_delete: false,
@@ -236,6 +238,10 @@ impl AppState {
         self.current_entry()
             .map(|entry| self.delete_queue.contains(&entry.path))
             .unwrap_or(false)
+    }
+
+    pub fn is_selected_file_scope(&self) -> bool {
+        self.selected_files.is_some()
     }
 
     fn move_in_queue(&mut self, delta: isize) {

@@ -17,13 +17,14 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use eframe::egui;
 use flume::{Receiver, Sender};
+use indexmap::IndexSet;
 use lru::LruCache;
 
 use crate::{
     cli::Cli,
     decode::decode_rgba_capped,
     delete, metadata,
-    scanner::{ScanOptions, scan_directory},
+    scanner::{ScanOptions, scan_directory, scan_files},
     sorter,
     state::{AppState, MediaEntry, MediaKind, MediaMode, ViewMode, ZoomMode},
     video,
@@ -44,6 +45,8 @@ const CELL: f32 = 168.0;
 /// Extra grid rows to decode above/below the viewport for smooth scrolling.
 const GRID_PREFETCH_ROWS: usize = 3;
 const EMPTY_MEDIA_PROMPT: &str = "press `r` for recursive search or `q` to quit";
+const VIDEO_PROGRESS_OVERLAY_SECONDS: f64 = 2.0;
+const VIDEO_PROGRESS_OVERLAY_FADE_SECONDS: f32 = 0.18;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Variant {
@@ -144,6 +147,7 @@ struct GuiApp {
     selection_autoplay_armed: bool,
     auto_next: bool,
     media_type_badges_visible: bool,
+    video_progress_overlay_visible_until: f64,
     empty_media_target: PathBuf,
     // Deferred from inside the input closure (which borrows ctx immutably).
     pending_sort: Option<crate::state::SortMode>,
@@ -196,6 +200,7 @@ impl GuiApp {
             selection_autoplay_armed: false,
             auto_next,
             media_type_badges_visible: true,
+            video_progress_overlay_visible_until: 0.0,
             empty_media_target,
             pending_sort: None,
             pending_enrich: false,
@@ -390,12 +395,38 @@ impl GuiApp {
             .is_some_and(|active| !active.handle.is_paused() && !active.ended)
     }
 
+    fn active_video_progress_for(&self, path: &Path) -> Option<VideoProgress> {
+        self.active_video_for(path)
+            .and_then(|active| video_progress(active.position, active.duration))
+    }
+
     fn active_current_video_can_seek(&self) -> bool {
         self.state
             .current_entry()
             .filter(|entry| entry.media_kind.is_video())
             .and_then(|entry| self.active_video_for(&entry.path))
             .is_some_and(|active| !active.ended)
+    }
+
+    fn active_current_video_progress(&self) -> Option<VideoProgress> {
+        self.state
+            .current_entry()
+            .filter(|entry| entry.media_kind.is_video())
+            .and_then(|entry| self.active_video_progress_for(&entry.path))
+    }
+
+    fn show_video_progress_overlay(&mut self, now: f64) {
+        if let Some(deadline) = video_progress_overlay_deadline_for_trigger(
+            now,
+            matches!(self.state.mode, ViewMode::Preview)
+                && self.active_current_video_progress().is_some(),
+        ) {
+            self.video_progress_overlay_visible_until = deadline;
+        }
+    }
+
+    fn hide_video_progress_overlay(&mut self) {
+        self.video_progress_overlay_visible_until = 0.0;
     }
 
     fn handle_focus_change(&mut self, focused: bool) {
@@ -419,6 +450,7 @@ impl GuiApp {
         if let Some(active) = self.active_video.take() {
             active.handle.stop();
         }
+        self.hide_video_progress_overlay();
     }
 
     fn start_video_playback(&mut self, path: PathBuf) {
@@ -490,7 +522,7 @@ impl GuiApp {
         self.start_video_playback(path);
     }
 
-    fn seek_current_video(&mut self, direction: VideoSeekDirection) -> bool {
+    fn seek_current_video(&mut self, direction: VideoSeekDirection, now: f64) -> bool {
         let Some(entry) = self.state.current_entry() else {
             return false;
         };
@@ -509,9 +541,14 @@ impl GuiApp {
             self.status = "video duration unavailable".to_owned();
             return true;
         };
+        let duration_for_overlay = duration;
 
         let selection_autoplay_armed = selection_autoplay_after_seek(was_paused);
         self.start_video_playback_from(path, target, was_paused, selection_autoplay_armed);
+        if let Some(active) = self.active_video.as_mut() {
+            active.duration = duration_for_overlay;
+        }
+        self.show_video_progress_overlay(now);
         let verb = match direction {
             VideoSeekDirection::Backward => "rewound",
             VideoSeekDirection::Forward => "fast-forwarded",
@@ -607,18 +644,15 @@ impl GuiApp {
         // replaced, or were only transiently unreadable get another attempt.
         self.failed.clear();
         let previous = self.state.current_path();
-        let result = scan_directory(ScanOptions {
-            root: self.state.directory.clone(),
-            recursive: self.state.recursive,
-            include_hidden: self.state.include_hidden,
-            extensions: self.state.extensions.clone(),
-        });
+        let result = scan_state_entries(&self.state);
         match result {
             Ok(mut entries) => {
                 sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
                 self.state.set_entries_preserving_current(entries, previous);
                 if self.state.entries.is_empty() {
                     self.status = empty_media_status(&self.empty_media_target);
+                } else if self.state.is_selected_file_scope() {
+                    self.status = format!("scanned {} selected files", self.state.entries.len());
                 } else {
                     self.status = format!(
                         "scanned {} media files{}",
@@ -668,7 +702,9 @@ impl GuiApp {
         if self.state.confirm_delete {
             ctx.input(|i| {
                 if i.key_pressed(Key::Y) {
-                    self.confirm_delete();
+                    if y_key_action(true) == YKeyAction::ConfirmDelete {
+                        self.confirm_delete();
+                    }
                 } else if i.key_pressed(Key::N) || i.key_pressed(Key::Escape) {
                     self.state.confirm_delete = false;
                     self.status = "delete cancelled".to_owned();
@@ -763,7 +799,7 @@ impl GuiApp {
             if i.key_pressed(Key::U) && !i.modifiers.ctrl {
                 match contextual_u_key_action(self.active_current_video_can_seek()) {
                     UKeyAction::SeekBackward => {
-                        self.seek_current_video(VideoSeekDirection::Backward);
+                        self.seek_current_video(VideoSeekDirection::Backward, i.time);
                     }
                     UKeyAction::Unqueue => {
                         self.state.unqueue_current();
@@ -772,7 +808,10 @@ impl GuiApp {
                 }
             }
             if i.key_pressed(Key::O) && !i.modifiers.ctrl {
-                self.seek_current_video(VideoSeekDirection::Forward);
+                self.seek_current_video(VideoSeekDirection::Forward, i.time);
+            }
+            if i.key_pressed(Key::Y) && y_key_action(false) == YKeyAction::ShowProgress {
+                self.show_video_progress_overlay(i.time);
             }
             if i.key_pressed(Key::R) {
                 if i.modifiers.ctrl {
@@ -784,6 +823,9 @@ impl GuiApp {
                     }
                 } else if i.modifiers.shift {
                     // Shift+R: rescan the directory.
+                    self.pending_rescan = true;
+                } else if self.state.is_selected_file_scope() {
+                    // In selected-file mode, keep rescans scoped to the explicit file set.
                     self.pending_rescan = true;
                 } else {
                     // r: toggle recursive scanning, then rescan.
@@ -869,6 +911,7 @@ impl GuiApp {
             media_kind: entry.media_kind.clone(),
         };
         let name = entry.display_name.clone();
+        let progress = self.active_video_progress_for(&entry.path);
 
         if let Some(handle) = self
             .active_video_for(&entry.path)
@@ -876,16 +919,19 @@ impl GuiApp {
             .cloned()
             .or_else(|| self.previews.get(&key).cloned())
         {
-            let avail = ui.available_size();
+            let (container_rect, _response) =
+                ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
             let tex = handle.size_vec2();
             let scale = match self.state.zoom_mode {
-                ZoomMode::Fit => (avail.x / tex.x).min(avail.y / tex.y),
+                ZoomMode::Fit => {
+                    (container_rect.width() / tex.x).min(container_rect.height() / tex.y)
+                }
                 ZoomMode::OriginalPixels => 1.0,
             };
             let draw = tex * scale;
-            ui.centered_and_justified(|ui| {
-                ui.add(egui::Image::new(&handle).fit_to_exact_size(draw));
-            });
+            let image_rect = egui::Rect::from_center_size(container_rect.center(), draw);
+            egui::Image::new(&handle).paint_at(ui, image_rect);
+            self.draw_video_progress_overlay(ui, image_rect.intersect(container_rect), progress);
         } else if let Some(error) = self.failed.get(&key) {
             ui.centered_and_justified(|ui| {
                 ui.label(format!("Failed to decode {name}\n{error}"));
@@ -894,6 +940,94 @@ impl GuiApp {
             ui.centered_and_justified(|ui| {
                 ui.label(format!("Loading {name}…"));
             });
+        }
+    }
+
+    fn draw_video_progress_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        video_rect: egui::Rect,
+        progress: Option<VideoProgress>,
+    ) {
+        let now = ui.ctx().input(|input| input.time);
+        let target_visible = progress.is_some()
+            && video_progress_overlay_target_visible(
+                now,
+                self.video_progress_overlay_visible_until,
+            );
+        let alpha = ui.ctx().animate_bool_with_time(
+            egui::Id::new("video-progress-overlay"),
+            target_visible,
+            VIDEO_PROGRESS_OVERLAY_FADE_SECONDS,
+        );
+        let Some(progress) = progress else {
+            return;
+        };
+        if alpha <= 0.01 || video_rect.width() < 96.0 || video_rect.height() < 54.0 {
+            return;
+        }
+
+        let margin = (video_rect.width() * 0.035).clamp(8.0, 18.0);
+        let overlay_height = 38.0_f32.min((video_rect.height() - margin * 2.0).max(0.0));
+        if overlay_height < 24.0 {
+            return;
+        }
+        let overlay_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                video_rect.left() + margin,
+                video_rect.bottom() - margin - overlay_height,
+            ),
+            egui::pos2(video_rect.right() - margin, video_rect.bottom() - margin),
+        );
+        if overlay_rect.width() < 80.0 {
+            return;
+        }
+
+        let painter = ui.painter();
+        painter.rect_filled(
+            overlay_rect,
+            6.0,
+            egui::Color32::from_black_alpha(scaled_alpha(alpha, 150)),
+        );
+
+        let inner = overlay_rect.shrink2(egui::vec2(10.0, 8.0));
+        let label_y = inner.top() + 6.0;
+        let text_color = egui::Color32::from_white_alpha(scaled_alpha(alpha, 230));
+        painter.text(
+            egui::pos2(inner.left(), label_y),
+            egui::Align2::LEFT_CENTER,
+            format_video_timestamp(progress.position),
+            egui::FontId::proportional(12.0),
+            text_color,
+        );
+        painter.text(
+            egui::pos2(inner.right(), label_y),
+            egui::Align2::RIGHT_CENTER,
+            format_video_timestamp(progress.duration),
+            egui::FontId::proportional(12.0),
+            text_color,
+        );
+
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), inner.bottom() - 7.0),
+            egui::pos2(inner.right(), inner.bottom() - 2.0),
+        );
+        painter.rect_filled(
+            bar_rect,
+            3.0,
+            egui::Color32::from_white_alpha(scaled_alpha(alpha, 70)),
+        );
+        let fill_width = bar_rect.width() * progress.fraction;
+        if fill_width > 0.5 {
+            let fill_rect = egui::Rect::from_min_max(
+                bar_rect.left_top(),
+                egui::pos2(bar_rect.left() + fill_width, bar_rect.bottom()),
+            );
+            painter.rect_filled(
+                fill_rect,
+                3.0,
+                egui::Color32::from_rgba_unmultiplied(94, 204, 255, scaled_alpha(alpha, 240)),
+            );
         }
     }
 
@@ -1081,6 +1215,7 @@ home / end      first / last
 g               toggle grid
 space           play / pause videos
 u / o           rewind / fast-forward active video 10%
+y               show video progress
 d               toggle delete queue
 u               unqueue current when no video is active
 shift+D         show delete queue
@@ -1143,7 +1278,15 @@ impl eframe::App for GuiApp {
         self.draw_overlays(ctx);
 
         self.scroll_to_current = false;
+        let now = ctx.input(|input| input.time);
+        let progress_overlay_visible =
+            video_progress_overlay_target_visible(now, self.video_progress_overlay_visible_until);
+        if progress_overlay_visible {
+            let remaining = (self.video_progress_overlay_visible_until - now).max(0.0);
+            ctx.request_repaint_after(Duration::from_secs_f64(remaining));
+        }
         if !self.inflight.is_empty()
+            || progress_overlay_visible
             || self
                 .active_video
                 .as_ref()
@@ -1467,11 +1610,32 @@ enum UKeyAction {
     Unqueue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YKeyAction {
+    ConfirmDelete,
+    ShowProgress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VideoProgress {
+    position: Duration,
+    duration: Duration,
+    fraction: f32,
+}
+
 fn contextual_u_key_action(active_current_video_can_seek: bool) -> UKeyAction {
     if active_current_video_can_seek {
         UKeyAction::SeekBackward
     } else {
         UKeyAction::Unqueue
+    }
+}
+
+fn y_key_action(confirm_delete: bool) -> YKeyAction {
+    if confirm_delete {
+        YKeyAction::ConfirmDelete
+    } else {
+        YKeyAction::ShowProgress
     }
 }
 
@@ -1495,6 +1659,44 @@ fn video_seek_target(
 
 fn selection_autoplay_after_seek(was_paused: bool) -> bool {
     !was_paused
+}
+
+fn video_progress(position: Duration, duration: Option<Duration>) -> Option<VideoProgress> {
+    let duration = duration.filter(|duration| !duration.is_zero())?;
+    let fraction = (position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0) as f32;
+    Some(VideoProgress {
+        position: position.min(duration),
+        duration,
+        fraction,
+    })
+}
+
+fn video_progress_overlay_deadline(now: f64) -> f64 {
+    now + VIDEO_PROGRESS_OVERLAY_SECONDS
+}
+
+fn video_progress_overlay_deadline_for_trigger(now: f64, can_show: bool) -> Option<f64> {
+    can_show.then(|| video_progress_overlay_deadline(now))
+}
+
+fn video_progress_overlay_target_visible(now: f64, visible_until: f64) -> bool {
+    now < visible_until
+}
+
+fn scaled_alpha(alpha: f32, max_alpha: u8) -> u8 {
+    (alpha.clamp(0.0, 1.0) * f32::from(max_alpha)).round() as u8
+}
+
+fn format_video_timestamp(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 fn next_video_index_after(entries: &[MediaEntry], current_index: usize) -> Option<usize> {
@@ -1533,7 +1735,8 @@ fn focus_playback_effect(
 mod tests {
     use super::*;
     use crate::state::{ImageKind, MediaEntry, SortMode, VideoKind};
-    use std::ffi::OsString;
+    use std::{ffi::OsString, fs};
+    use tempfile::tempdir;
 
     #[test]
     fn media_type_badge_visibility_matches_mode_and_playback() {
@@ -1595,6 +1798,158 @@ mod tests {
         assert_eq!(
             initial_view_mode(Some(Path::new("/tmp/media/image.jpg"))),
             ViewMode::Preview
+        );
+    }
+
+    #[test]
+    fn resolve_launch_without_paths_uses_current_directory() {
+        let launch = resolve_launch(&[], None).unwrap();
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+
+        assert_eq!(
+            launch,
+            LaunchTarget::Directory {
+                directory: cwd,
+                initial_file: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_launch_keeps_single_directory_as_directory_mode() {
+        let temp = tempdir().unwrap();
+        let launch = resolve_launch(&[temp.path().to_path_buf()], None).unwrap();
+
+        assert_eq!(
+            launch,
+            LaunchTarget::Directory {
+                directory: temp.path().canonicalize().unwrap(),
+                initial_file: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_launch_keeps_single_file_as_parent_directory_mode() {
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("image.jpg");
+        touch(&image);
+        let launch = resolve_launch(std::slice::from_ref(&image), None).unwrap();
+        let canonical_image = image.canonicalize().unwrap();
+
+        assert_eq!(
+            launch,
+            LaunchTarget::Directory {
+                directory: temp.path().canonicalize().unwrap(),
+                initial_file: Some(canonical_image),
+            }
+        );
+        assert_eq!(initial_view_mode_for_launch(&launch), ViewMode::Preview);
+    }
+
+    #[test]
+    fn resolve_launch_multiple_files_become_selected_file_scope_and_dedupe() {
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("image.jpg");
+        let video = temp.path().join("clip.mp4");
+        touch(&image);
+        touch(&video);
+
+        let launch = resolve_launch(&[video.clone(), image.clone(), video.clone()], None).unwrap();
+        let canonical_video = video.canonicalize().unwrap();
+        let canonical_image = image.canonicalize().unwrap();
+
+        assert_eq!(
+            launch,
+            LaunchTarget::SelectedFiles {
+                directory: temp.path().canonicalize().unwrap(),
+                files: vec![canonical_video, canonical_image],
+            }
+        );
+        assert_eq!(initial_view_mode_for_launch(&launch), ViewMode::Grid);
+    }
+
+    #[test]
+    fn resolve_launch_rejects_directories_in_selected_file_scope() {
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("image.jpg");
+        touch(&image);
+
+        let error = resolve_launch(&[image, temp.path().to_path_buf()], None).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("multiple path launch accepts files only")
+        );
+    }
+
+    #[test]
+    fn selected_launch_entries_filter_and_follow_argument_order() {
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("image.jpg");
+        let video = temp.path().join("clip.mp4");
+        let ignored = temp.path().join("ignored.txt");
+        touch(&image);
+        touch(&video);
+        touch(&ignored);
+        let launch = resolve_launch(&[video.clone(), ignored, image.clone()], None).unwrap();
+
+        let entries =
+            scan_launch_entries(&launch, false, false, &["jpg".to_owned(), "mp4".to_owned()])
+                .unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![video.canonicalize().unwrap(), image.canonicalize().unwrap()]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.discovered_order)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn selected_file_scope_rescans_only_original_selected_files() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first.jpg");
+        let second = temp.path().join("second.jpg");
+        let unselected = temp.path().join("unselected.jpg");
+        touch(&first);
+        touch(&second);
+        touch(&unselected);
+        let launch = resolve_launch(&[second.clone(), first.clone()], None).unwrap();
+        let LaunchTarget::SelectedFiles { files, .. } = launch else {
+            panic!("expected selected files launch");
+        };
+        let mut state = AppState::new(
+            temp.path().canonicalize().unwrap(),
+            false,
+            false,
+            MediaMode::Image,
+            vec!["jpg".to_owned()],
+            SortMode::Discovered,
+            Vec::new(),
+        );
+        state.selected_files = Some(files.iter().cloned().collect());
+
+        let entries = scan_state_entries(&state).unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                second.canonicalize().unwrap(),
+                first.canonicalize().unwrap()
+            ]
         );
     }
 
@@ -1707,6 +2062,66 @@ mod tests {
     }
 
     #[test]
+    fn y_confirms_delete_only_inside_confirmation_modal() {
+        assert_eq!(y_key_action(true), YKeyAction::ConfirmDelete);
+        assert_eq!(y_key_action(false), YKeyAction::ShowProgress);
+    }
+
+    #[test]
+    fn video_progress_fraction_clamps_and_requires_duration() {
+        let duration = Duration::from_secs(100);
+
+        assert_eq!(
+            video_progress(Duration::from_secs(25), Some(duration)),
+            Some(VideoProgress {
+                position: Duration::from_secs(25),
+                duration,
+                fraction: 0.25,
+            })
+        );
+        assert_eq!(
+            video_progress(Duration::from_secs(125), Some(duration)),
+            Some(VideoProgress {
+                position: duration,
+                duration,
+                fraction: 1.0,
+            })
+        );
+        assert_eq!(video_progress(Duration::from_secs(1), None), None);
+        assert_eq!(
+            video_progress(Duration::from_secs(1), Some(Duration::ZERO)),
+            None
+        );
+    }
+
+    #[test]
+    fn progress_overlay_trigger_extends_deadline_for_manual_or_seek_reveal() {
+        let first = video_progress_overlay_deadline_for_trigger(10.0, true);
+        let second = video_progress_overlay_deadline_for_trigger(11.5, true);
+
+        assert_eq!(first, Some(12.0));
+        assert_eq!(second, Some(13.5));
+        assert!(second > first);
+        assert_eq!(
+            video_progress_overlay_deadline_for_trigger(10.0, false),
+            None
+        );
+    }
+
+    #[test]
+    fn progress_overlay_visibility_uses_deadline() {
+        assert!(video_progress_overlay_target_visible(11.99, 12.0));
+        assert!(!video_progress_overlay_target_visible(12.0, 12.0));
+        assert!(!video_progress_overlay_target_visible(12.01, 12.0));
+    }
+
+    #[test]
+    fn video_timestamp_formats_minutes_and_hours() {
+        assert_eq!(format_video_timestamp(Duration::from_secs(65)), "1:05");
+        assert_eq!(format_video_timestamp(Duration::from_secs(3661)), "1:01:01");
+    }
+
+    #[test]
     fn auto_next_finds_next_video_without_wrapping() {
         let entries = vec![
             media_entry(
@@ -1772,6 +2187,10 @@ mod tests {
         );
     }
 
+    fn touch(path: &Path) {
+        fs::write(path, b"not actually decoded").unwrap();
+    }
+
     fn app_state(entries: Vec<MediaEntry>, current_index: usize) -> AppState {
         let mut state = AppState::new(
             PathBuf::from("/tmp/media"),
@@ -1816,18 +2235,14 @@ mod tests {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    let input = cli.path.as_deref().or(cli.directory.as_deref());
-    let (directory, initial_file) = resolve_input(input)?;
+    let launch = resolve_launch(&cli.paths, cli.directory.as_deref())?;
     let extensions = cli.resolved_extensions();
     let sort_mode = cli.initial_sort_mode();
-    let mut entries = scan_directory(ScanOptions {
-        root: directory.clone(),
-        recursive: cli.recursive,
-        include_hidden: cli.hidden,
-        extensions: extensions.clone(),
-    })?;
+    let mut entries = scan_launch_entries(&launch, cli.recursive, cli.hidden, &extensions)?;
     sorter::sort_entries(&mut entries, sort_mode, cli.locale.as_deref());
-    let empty_media_target = initial_file.clone().unwrap_or_else(|| directory.clone());
+    let directory = launch.directory().to_path_buf();
+    let initial_file = launch.initial_file().cloned();
+    let empty_media_target = launch.empty_media_target();
 
     let mut state = AppState::new(
         directory,
@@ -1838,7 +2253,10 @@ pub fn run(cli: Cli) -> Result<()> {
         sort_mode,
         entries,
     );
-    state.mode = initial_view_mode(initial_file.as_deref());
+    if let LaunchTarget::SelectedFiles { files, .. } = &launch {
+        state.selected_files = Some(files.iter().cloned().collect());
+    }
+    state.mode = initial_view_mode_for_launch(&launch);
     // Start positioned on the requested file (after sorting).
     if let Some(file) = &initial_file
         && let Some(index) = state.entries.iter().position(|entry| entry.path == *file)
@@ -1849,6 +2267,7 @@ pub fn run(cli: Cli) -> Result<()> {
     tracing::debug!(
         directory = %state.directory.display(),
         file = ?initial_file,
+        selected_files = state.selected_files.as_ref().map(IndexSet::len).unwrap_or(0),
         start_index = state.current_index,
         count = state.entries.len(),
         "opened"
@@ -1873,6 +2292,129 @@ pub fn run(cli: Cli) -> Result<()> {
     eframe::run_native("cullr", options, Box::new(|_cc| Ok(Box::new(app))))
         .map_err(|error| anyhow!("eframe failed: {error}"))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchTarget {
+    Directory {
+        directory: PathBuf,
+        initial_file: Option<PathBuf>,
+    },
+    SelectedFiles {
+        directory: PathBuf,
+        files: Vec<PathBuf>,
+    },
+}
+
+impl LaunchTarget {
+    fn directory(&self) -> &Path {
+        match self {
+            Self::Directory { directory, .. } | Self::SelectedFiles { directory, .. } => directory,
+        }
+    }
+
+    fn initial_file(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Directory { initial_file, .. } => initial_file.as_ref(),
+            Self::SelectedFiles { .. } => None,
+        }
+    }
+
+    fn empty_media_target(&self) -> PathBuf {
+        match self {
+            Self::Directory {
+                directory,
+                initial_file,
+            } => initial_file.clone().unwrap_or_else(|| directory.clone()),
+            Self::SelectedFiles { directory, files } => {
+                files.first().cloned().unwrap_or_else(|| directory.clone())
+            }
+        }
+    }
+}
+
+fn resolve_launch(paths: &[PathBuf], directory: Option<&Path>) -> Result<LaunchTarget> {
+    if paths.len() > 1 {
+        return resolve_selected_files(paths);
+    }
+
+    let input = paths.first().map(PathBuf::as_path).or(directory);
+    let (directory, initial_file) = resolve_input(input)?;
+    Ok(LaunchTarget::Directory {
+        directory,
+        initial_file,
+    })
+}
+
+fn resolve_selected_files(paths: &[PathBuf]) -> Result<LaunchTarget> {
+    let mut seen = IndexSet::new();
+    let mut files = Vec::new();
+
+    for path in paths {
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", path.display()))?;
+        if canonical.is_dir() {
+            return Err(anyhow!(
+                "{} is a directory; multiple path launch accepts files only",
+                canonical.display()
+            ));
+        }
+        if !canonical.is_file() {
+            return Err(anyhow!("{} is not a file", canonical.display()));
+        }
+        if seen.insert(canonical.clone()) {
+            files.push(canonical);
+        }
+    }
+
+    let first = files
+        .first()
+        .context("selected file launch requires at least one file")?;
+    let directory = first
+        .parent()
+        .context("selected file has no parent directory")?
+        .to_path_buf();
+
+    Ok(LaunchTarget::SelectedFiles { directory, files })
+}
+
+fn scan_launch_entries(
+    launch: &LaunchTarget,
+    recursive: bool,
+    include_hidden: bool,
+    extensions: &[String],
+) -> Result<Vec<MediaEntry>> {
+    match launch {
+        LaunchTarget::Directory { directory, .. } => scan_directory(ScanOptions {
+            root: directory.clone(),
+            recursive,
+            include_hidden,
+            extensions: extensions.to_vec(),
+        }),
+        LaunchTarget::SelectedFiles { files, .. } => scan_files(files, extensions),
+    }
+}
+
+fn scan_state_entries(state: &AppState) -> Result<Vec<MediaEntry>> {
+    if let Some(selected_files) = &state.selected_files {
+        let files = selected_files.iter().cloned().collect::<Vec<_>>();
+        scan_files(&files, &state.extensions)
+    } else {
+        scan_directory(ScanOptions {
+            root: state.directory.clone(),
+            recursive: state.recursive,
+            include_hidden: state.include_hidden,
+            extensions: state.extensions.clone(),
+        })
+    }
+}
+
+fn initial_view_mode_for_launch(launch: &LaunchTarget) -> ViewMode {
+    match launch {
+        LaunchTarget::Directory { initial_file, .. } => initial_view_mode(initial_file.as_deref()),
+        LaunchTarget::SelectedFiles { .. } => ViewMode::Grid,
+    }
 }
 
 /// Resolve the input path into a directory to scan plus, if a file was given,
