@@ -1,0 +1,441 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-22.04
+
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Validate Cargo version matches release tag
+        id: version
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must look like vX.Y.Z, got: $tag" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ "$cargo_version" != "$version" ]]; then
+            echo "Cargo.toml version $cargo_version does not match release tag $tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  coverage:
+    name: Release coverage
+    runs-on: ubuntu-22.04
+    needs: validate
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            ffmpeg \
+            libasound2-dev \
+            libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libgl1-mesa-dev \
+            libjpeg-turbo8-dev \
+            libswresample-dev \
+            libswscale-dev \
+            libudev-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Generate coverage
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-lcov
+          path: lcov.info
+
+      - name: Upload coverage to Codecov with token
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          flags: release
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: Upload coverage to Codecov with OIDC
+        if: env.CODECOV_TOKEN == ''
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          flags: release
+          use_oidc: true
+          fail_ci_if_error: false
+
+  linux:
+    name: Linux tarball, deb, and AppImage
+    runs-on: ubuntu-22.04
+    needs: validate
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            desktop-file-utils \
+            ffmpeg \
+            file \
+            fuse \
+            libasound2-dev \
+            libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libfuse2 \
+            libgl1-mesa-dev \
+            libjpeg-turbo8-dev \
+            libswresample-dev \
+            libswscale-dev \
+            libudev-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            patchelf \
+            pkg-config
+
+      - name: Install packaging tools
+        run: cargo install --locked cargo-deb
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Linux tarball
+        run: |
+          tag="${{ needs.validate.outputs.tag }}"
+          stage="target/package/cullr-$tag-linux-x86_64"
+          mkdir -p "$stage"
+          install -m 755 target/release/cullr "$stage/cullr"
+          install -m 644 README.md "$stage/README.md"
+          install -m 644 LICENSE "$stage/LICENSE"
+
+          mkdir -p dist
+          tar -C target/package -czf "dist/cullr-$tag-linux-x86_64.tar.gz" "cullr-$tag-linux-x86_64"
+
+          smoke="$(mktemp -d)"
+          tar -C "$smoke" -xzf "dist/cullr-$tag-linux-x86_64.tar.gz"
+          "$smoke/cullr-$tag-linux-x86_64/cullr" --help
+
+      - name: Package and smoke-test deb
+        run: |
+          version="${{ needs.validate.outputs.version }}"
+          deb="dist/cullr_${version}_amd64.deb"
+          cargo deb --output "$deb"
+          sudo apt-get install -y "./$deb"
+          cullr --help
+
+      - name: Package and smoke-test AppImage
+        run: |
+          version="${{ needs.validate.outputs.version }}"
+          appdir="target/appimage/Cullr.AppDir"
+          rm -rf "$appdir"
+          mkdir -p "$appdir/usr/bin" \
+            "$appdir/usr/share/applications" \
+            "$appdir/usr/share/icons/hicolor/scalable/apps"
+
+          install -m 755 target/release/cullr "$appdir/usr/bin/cullr"
+          install -m 755 packaging/linux/AppRun "$appdir/AppRun"
+          install -m 644 packaging/linux/cullr.desktop "$appdir/cullr.desktop"
+          install -m 644 packaging/linux/cullr.svg "$appdir/cullr.svg"
+          install -m 644 packaging/linux/cullr.desktop "$appdir/usr/share/applications/cullr.desktop"
+          install -m 644 packaging/linux/cullr.svg "$appdir/usr/share/icons/hicolor/scalable/apps/cullr.svg"
+
+          curl -L https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -o target/linuxdeploy-x86_64.AppImage
+          chmod +x target/linuxdeploy-x86_64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 target/linuxdeploy-x86_64.AppImage \
+            --appdir "$appdir" \
+            --executable "$appdir/usr/bin/cullr" \
+            --desktop-file "$appdir/cullr.desktop" \
+            --icon-file "$appdir/cullr.svg" \
+            --output appimage
+
+          mv Cullr-*.AppImage "dist/Cullr-${version}-x86_64.AppImage"
+          chmod +x "dist/Cullr-${version}-x86_64.AppImage"
+          APPIMAGE_EXTRACT_AND_RUN=1 "dist/Cullr-${version}-x86_64.AppImage" --help
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-artifacts
+          path: |
+            dist/cullr-${{ needs.validate.outputs.tag }}-linux-x86_64.tar.gz
+            dist/cullr_${{ needs.validate.outputs.version }}_amd64.deb
+            dist/Cullr-${{ needs.validate.outputs.version }}-x86_64.AppImage
+
+  rpm:
+    name: RPM
+    runs-on: ubuntu-22.04
+    container: fedora:latest
+    needs: validate
+
+    steps:
+      - name: Install base tools
+        run: |
+          dnf -y install \
+            clang \
+            cmake \
+            curl \
+            file \
+            gcc \
+            gcc-c++ \
+            git \
+            gzip \
+            libjpeg-turbo-devel \
+            libX11-devel \
+            libxkbcommon-devel \
+            make \
+            mesa-libGL-devel \
+            pkgconf-pkg-config \
+            rpm-build \
+            tar \
+            vulkan-loader-devel \
+            wayland-devel
+          dnf -y install ffmpeg-free-devel || dnf -y install ffmpeg-devel
+          dnf -y install alsa-lib-devel systemd-devel
+
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install RPM packaging tool
+        run: cargo install --locked cargo-generate-rpm
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package and smoke-test rpm
+        run: |
+          version="${{ needs.validate.outputs.version }}"
+          mkdir -p dist
+          cargo generate-rpm -o "dist/cullr-${version}-1.x86_64.rpm"
+          dnf -y install "./dist/cullr-${version}-1.x86_64.rpm"
+          cullr --help
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpm-artifact
+          path: dist/cullr-${{ needs.validate.outputs.version }}-1.x86_64.rpm
+
+  windows:
+    name: Windows zip and MSI
+    runs-on: windows-latest
+    needs: validate
+
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static
+      VCPKGRS_DYNAMIC: "0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          choco install wixtoolset --no-progress -y
+          $candle = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset*" -Recurse -Filter candle.exe | Select-Object -First 1
+          if (-not $candle) {
+            throw "Could not find candle.exe after installing WiX Toolset"
+          }
+
+          $wixBin = $candle.Directory.FullName
+          $wixRoot = $candle.Directory.Parent.FullName
+          "PATH=$env:PATH;$wixBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "WIX=$wixRoot\" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install native dependencies
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_ROOT
+          if (-not $vcpkgRoot) {
+            $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          }
+          if (-not $vcpkgRoot) {
+            $vcpkgRoot = "C:\vcpkg"
+          }
+
+          $vcpkgExe = Join-Path $vcpkgRoot "vcpkg.exe"
+          & $vcpkgExe install ffmpeg libjpeg-turbo --triplet x64-windows-static
+
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKG_DEFAULT_TRIPLET=x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKGRS_DYNAMIC=0" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install cargo-wix
+        run: cargo install --locked cargo-wix
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package and smoke-test Windows zip
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.validate.outputs.tag }}"
+          $stage = "target\package\cullr-$tag-windows-x86_64"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "target\release\cullr.exe" "$stage\cullr.exe"
+          Copy-Item "README.md" "$stage\README.md"
+          Copy-Item "LICENSE" "$stage\LICENSE"
+
+          New-Item -ItemType Directory -Force "dist" | Out-Null
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\cullr-$tag-windows-x86_64.zip" -Force
+          & "$stage\cullr.exe" --help
+
+      - name: Package and smoke-test MSI
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.validate.outputs.tag }}"
+          $msi = "dist\cullr-$tag-windows-x86_64.msi"
+
+          cargo wix init
+          cargo wix
+          $builtMsi = Get-ChildItem "target\wix" -Filter "*.msi" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $builtMsi) {
+            throw "cargo-wix did not produce an MSI"
+          }
+          Copy-Item $builtMsi.FullName $msi
+
+          $extract = Join-Path $env:RUNNER_TEMP "cullr-msi"
+          New-Item -ItemType Directory -Force $extract | Out-Null
+          $msiPath = Resolve-Path $msi
+          Start-Process msiexec.exe -ArgumentList "/a", "`"$msiPath`"", "/qn", "TARGETDIR=`"$extract`"" -Wait -NoNewWindow
+          $installedExe = Get-ChildItem $extract -Recurse -Filter cullr.exe | Select-Object -First 1
+          if (-not $installedExe) {
+            throw "MSI smoke test could not find cullr.exe after administrative install"
+          }
+          & $installedExe.FullName --help
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-artifacts
+          path: |
+            dist/cullr-${{ needs.validate.outputs.tag }}-windows-x86_64.zip
+            dist/cullr-${{ needs.validate.outputs.tag }}-windows-x86_64.msi
+
+  publish:
+    name: Publish release assets
+    runs-on: ubuntu-22.04
+    needs: [validate, coverage, linux, rpm, windows]
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify expected artifacts and checksums
+        run: |
+          tag="${{ needs.validate.outputs.tag }}"
+          version="${{ needs.validate.outputs.version }}"
+
+          expected=(
+            "cullr-$tag-windows-x86_64.zip"
+            "cullr-$tag-windows-x86_64.msi"
+            "cullr-$tag-linux-x86_64.tar.gz"
+            "cullr_${version}_amd64.deb"
+            "cullr-${version}-1.x86_64.rpm"
+            "Cullr-${version}-x86_64.AppImage"
+          )
+
+          for artifact in "${expected[@]}"; do
+            test -f "dist/$artifact" || {
+              echo "Missing expected artifact: $artifact" >&2
+              exit 1
+            }
+          done
+
+          cd dist
+          sha256sum "${expected[@]}" > SHA256SUMS
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ needs.validate.outputs.tag }}"
+          gh release upload "$tag" \
+            "dist/cullr-$tag-windows-x86_64.zip" \
+            "dist/cullr-$tag-windows-x86_64.msi" \
+            "dist/cullr-$tag-linux-x86_64.tar.gz" \
+            "dist/cullr_${{ needs.validate.outputs.version }}_amd64.deb" \
+            "dist/cullr-${{ needs.validate.outputs.version }}-1.x86_64.rpm" \
+            "dist/Cullr-${{ needs.validate.outputs.version }}-x86_64.AppImage" \
+            "dist/SHA256SUMS" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber

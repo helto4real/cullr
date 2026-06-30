@@ -2,6 +2,12 @@
 name = "cullr"
 version = "0.1.0"
 edition = "2024"
+authors = ["Tomas Hellstrom"]
+description = "Fast desktop media viewer and culling tool for images and videos."
+license = "MIT"
+repository = "https://github.com/helto4real/cullr"
+homepage = "https://github.com/helto4real/cullr"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
@@ -31,3 +37,36 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[package.metadata.deb]
+maintainer = "Tomas Hellstrom"
+copyright = "2026, Tomas Hellstrom"
+license-file = ["LICENSE", "0"]
+extended-description = """
+cullr is a fast desktop media viewer and culling tool for reviewing image and
+video folders, marking rejects, and deleting queued files only after explicit
+confirmation.
+"""
+depends = "$auto"
+section = "graphics"
+priority = "optional"
+assets = [
+  ["target/release/cullr", "usr/bin/cullr", "755"],
+  ["README.md", "usr/share/doc/cullr/README.md", "644"],
+  ["LICENSE", "usr/share/doc/cullr/LICENSE", "644"],
+  ["packaging/linux/cullr.desktop", "usr/share/applications/cullr.desktop", "644"],
+  ["packaging/linux/cullr.svg", "usr/share/icons/hicolor/scalable/apps/cullr.svg", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/cullr", dest = "/usr/bin/cullr", mode = "755" },
+  { source = "README.md", dest = "/usr/share/doc/cullr/README.md", mode = "644", doc = true },
+  { source = "LICENSE", dest = "/usr/share/licenses/cullr/LICENSE", mode = "644", doc = true },
+  { source = "packaging/linux/cullr.desktop", dest = "/usr/share/applications/cullr.desktop", mode = "644" },
+  { source = "packaging/linux/cullr.svg", dest = "/usr/share/icons/hicolor/scalable/apps/cullr.svg", mode = "644" },
+]
+
+[package.metadata.wix]
+upgrade-guid = "C34F4EA5-7BDD-4AA9-8F29-3500195A59BF"
+path-guid = "16F353D4-6FD5-4CF7-9C5A-D6D38022F975"

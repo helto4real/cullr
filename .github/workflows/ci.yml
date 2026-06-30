@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            ffmpeg \
+            libasound2-dev \
+            libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libgl1-mesa-dev \
+            libjpeg-turbo8-dev \
+            libswresample-dev \
+            libswscale-dev \
+            libudev-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static
+      VCPKGRS_DYNAMIC: "0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install native dependencies
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_ROOT
+          if (-not $vcpkgRoot) {
+            $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          }
+          if (-not $vcpkgRoot) {
+            $vcpkgRoot = "C:\vcpkg"
+          }
+
+          $vcpkgExe = Join-Path $vcpkgRoot "vcpkg.exe"
+          & $vcpkgExe install ffmpeg libjpeg-turbo --triplet x64-windows-static
+
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKG_DEFAULT_TRIPLET=x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKGRS_DYNAMIC=0" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-22.04
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            ffmpeg \
+            libasound2-dev \
+            libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libgl1-mesa-dev \
+            libjpeg-turbo8-dev \
+            libswresample-dev \
+            libswscale-dev \
+            libudev-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Generate coverage
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lcov
+          path: lcov.info
+
+      - name: Upload coverage to Codecov with token
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          flags: ci
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: Upload coverage to Codecov with OIDC
+        if: env.CODECOV_TOKEN == ''
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          flags: ci
+          use_oidc: true
+          fail_ci_if_error: false
