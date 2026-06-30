@@ -83,6 +83,7 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libxkbcommon-dev \
+            nasm \
             pkg-config
 
       - name: Generate coverage
@@ -151,6 +152,7 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libxkbcommon-dev \
+            nasm \
             patchelf \
             pkg-config
 
@@ -248,6 +250,7 @@ jobs:
             libxkbcommon-devel \
             make \
             mesa-libGL-devel \
+            nasm \
             pkgconf-pkg-config \
             rpm-build \
             tar \
@@ -318,6 +321,8 @@ jobs:
       - name: Install native dependencies
         shell: pwsh
         run: |
+          choco install nasm --no-progress -y
+
           $vcpkgRoot = $env:VCPKG_ROOT
           if (-not $vcpkgRoot) {
             $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
