@@ -12,6 +12,8 @@ an explicit confirmation step.
   positioned inside its parent directory, or opens multiple explicit files as a
   focused review set.
 - Shows a large preview view and a thumbnail grid view for fast review.
+- Adds a file browser view with a folder/file list beside the preview or
+  gallery pane.
 - Decodes images on worker threads and uploads them as GPU textures, so the
   window can resize without re-decoding every frame.
 - Uses libjpeg-turbo scaled decode for large JPEG previews, with other formats
@@ -63,6 +65,7 @@ Usage: cullr [OPTIONS] [PATH]...
 | `--file_ext <EXTS>` | Comma-separated extensions to include, for example `jpg,png,webp`. |
 | `--media <MEDIA>` | Media type to include: `both`, `image`, or `video`. Defaults to `both`. |
 | `--sort <SORT>` | Initial sort: `newest`, `oldest`, `name`, or `name-desc`. |
+| `--view <VIEW>` | Initial view: `auto` or `browser`. Defaults to `auto`. |
 | `--locale <LOCALE>` | Locale to use for name sorting, for example `sv` or `en`. |
 | `--dry-run-delete` | Exercise the delete flow without deleting files. |
 | `--hidden` | Include hidden files and directories. |
@@ -70,6 +73,9 @@ Usage: cullr [OPTIONS] [PATH]...
 
 If no path or directory is supplied, `cullr` opens the current working
 directory. If multiple paths are supplied, they must all be files.
+With `--view browser`, a folder launch opens the browser on the parent folder
+with the launched folder highlighted; a file launch highlights that file.
+Multiple explicit files still open as the focused grid review set.
 
 ## Keyboard Shortcuts
 
@@ -78,10 +84,16 @@ directory. If multiple paths are supplied, they must all be files.
 | `h` / `k` / left / up | Previous file in preview mode. |
 | `l` / `j` / right / down | Next file in preview mode. |
 | `g` | Toggle between preview and grid. |
+| `e` | Toggle the file browser view. |
 | `enter` | Open the highlighted grid file in preview mode. |
 | `h` / `l` | Move left or right in grid mode. |
 | `j` / `k` | Move down or up one row in grid mode. |
 | `ctrl+d` / `ctrl+u` | Move half a page down or up in grid mode. |
+| `ctrl+h` / `ctrl+l` | Move focus between browser and preview/gallery panes. |
+| `j` / `k` | Move down or up in the browser pane. |
+| `ctrl+d` / `ctrl+u` | Move half a page down or up in the browser pane. |
+| `l` / `h` | Enter the selected browser folder or go to its parent. |
+| `.` | Show or hide hidden files and folders. |
 | `home` / `end` | Jump to the first or last file. |
 | `space` | Play or pause the current video. |
 | `u` / `o` | Rewind or fast-forward the active video by 10%. |

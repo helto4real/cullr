@@ -1,4 +1,4 @@
-use std::{ffi::OsString, path::PathBuf, time::SystemTime};
+use std::{collections::HashMap, ffi::OsString, path::PathBuf, time::SystemTime};
 
 use indexmap::IndexSet;
 
@@ -71,6 +71,36 @@ pub enum ViewMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserPaneFocus {
+    Browser,
+    Preview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserEntryKind {
+    Directory,
+    Media(MediaKind),
+    UnsupportedFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserEntry {
+    pub path: PathBuf,
+    pub display_name: String,
+    pub kind: BrowserEntryKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserState {
+    pub listed_directory: PathBuf,
+    pub entries: Vec<BrowserEntry>,
+    pub selected_index: usize,
+    pub focus: BrowserPaneFocus,
+    pub remembered_selection: HashMap<PathBuf, PathBuf>,
+    pub scroll_to_selection: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
     Discovered,
     Newest,
@@ -99,6 +129,7 @@ pub struct AppState {
     pub zoom_mode: ZoomMode,
     pub delete_queue: IndexSet<PathBuf>,
     pub selected_files: Option<IndexSet<PathBuf>>,
+    pub browser: Option<BrowserState>,
     pub show_info_overlay: bool,
     pub show_help_overlay: bool,
     pub confirm_delete: bool,
@@ -127,6 +158,7 @@ impl AppState {
             zoom_mode: ZoomMode::Fit,
             delete_queue: IndexSet::new(),
             selected_files: None,
+            browser: None,
             show_info_overlay: false,
             show_help_overlay: false,
             confirm_delete: false,
@@ -242,6 +274,10 @@ impl AppState {
 
     pub fn is_selected_file_scope(&self) -> bool {
         self.selected_files.is_some()
+    }
+
+    pub fn is_browser_active(&self) -> bool {
+        self.browser.is_some()
     }
 
     fn move_in_queue(&mut self, delta: isize) {

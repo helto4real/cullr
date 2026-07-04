@@ -8,6 +8,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     thread,
@@ -21,12 +22,15 @@ use indexmap::IndexSet;
 use lru::LruCache;
 
 use crate::{
-    cli::Cli,
+    cli::{Cli, CliViewMode},
     decode::decode_rgba_capped,
     delete, metadata,
     scanner::{ScanOptions, scan_directory, scan_files},
     sorter,
-    state::{AppState, MediaEntry, MediaKind, MediaMode, ViewMode, ZoomMode},
+    state::{
+        AppState, BrowserEntry, BrowserEntryKind, BrowserPaneFocus, BrowserState, MediaEntry,
+        MediaKind, MediaMode, ViewMode, ZoomMode,
+    },
     video,
 };
 
@@ -42,6 +46,8 @@ const PREVIEW_CACHE: usize = 32;
 const THUMB_CACHE: usize = 512;
 /// Grid cell edge in points.
 const CELL: f32 = 168.0;
+const BROWSER_DEFAULT_WIDTH: f32 = 320.0;
+const BROWSER_ROW_HEIGHT: f32 = 26.0;
 /// Extra grid rows to decode above/below the viewport for smooth scrolling.
 const GRID_PREFETCH_ROWS: usize = 3;
 const EMPTY_MEDIA_PROMPT: &str = "press `r` for recursive search or `q` to quit";
@@ -138,6 +144,7 @@ struct GuiApp {
     status: String,
     grid_cols: usize,
     grid_rows: usize,
+    browser_rows: usize,
     last_visible_rows: std::ops::Range<usize>,
     scroll_to_current: bool,
     fullscreen: bool,
@@ -191,6 +198,7 @@ impl GuiApp {
             status,
             grid_cols: 1,
             grid_rows: 1,
+            browser_rows: 1,
             last_visible_rows: 0..0,
             scroll_to_current: false,
             fullscreen: false,
@@ -239,7 +247,313 @@ impl GuiApp {
         self.set_current_index(target as usize);
     }
 
+    fn browser_is_focused(&self) -> bool {
+        self.state
+            .browser
+            .as_ref()
+            .is_some_and(|browser| browser.focus == BrowserPaneFocus::Browser)
+    }
+
+    fn browser_selected_entry(&self) -> Option<&BrowserEntry> {
+        self.state
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.entries.get(browser.selected_index))
+    }
+
+    fn browser_selected_entry_cloned(&self) -> Option<BrowserEntry> {
+        self.browser_selected_entry().cloned()
+    }
+
+    fn browser_selected_is_unsupported(&self) -> bool {
+        self.browser_selected_entry()
+            .is_some_and(|entry| entry.kind == BrowserEntryKind::UnsupportedFile)
+    }
+
+    fn browser_selected_is_previewed_media(&self) -> bool {
+        self.browser_selected_entry()
+            .is_some_and(|entry| matches!(entry.kind, BrowserEntryKind::Media(_)))
+    }
+
+    fn set_browser_focus(&mut self, focus: BrowserPaneFocus) {
+        if let Some(browser) = self.state.browser.as_mut() {
+            browser.focus = focus;
+            self.status = match focus {
+                BrowserPaneFocus::Browser => "browser focus".to_owned(),
+                BrowserPaneFocus::Preview => "preview focus".to_owned(),
+            };
+        }
+    }
+
+    fn toggle_browser_view(&mut self) {
+        if self.state.browser.is_some() {
+            self.state.browser = None;
+            self.status = "browser closed".to_owned();
+            return;
+        }
+        if self.state.is_selected_file_scope() {
+            self.status = "browser unavailable for explicit selected-file launches".to_owned();
+            return;
+        }
+
+        match browser_state_for_current_view(&self.state, self.state.include_hidden) {
+            Ok(browser) => {
+                self.state.browser = Some(browser);
+                self.status = "browser opened".to_owned();
+                self.apply_browser_selection();
+            }
+            Err(error) => {
+                self.status = format!("browser failed: {error}");
+            }
+        }
+    }
+
+    fn refresh_browser_listing_preserving_selection(&mut self) -> Result<()> {
+        let Some(browser) = self.state.browser.as_mut() else {
+            return Ok(());
+        };
+        let previous = browser.selected_path();
+        let fallback = browser
+            .remembered_selection
+            .get(&browser.listed_directory)
+            .cloned();
+        let entries = read_browser_entries(
+            &browser.listed_directory,
+            self.state.include_hidden,
+            &self.state.extensions,
+        )?;
+        browser.entries = entries;
+        browser.selected_index = preferred_browser_index(
+            &browser.entries,
+            previous.as_ref().or(fallback.as_ref()),
+            browser.selected_index,
+        );
+        browser.scroll_to_selection = true;
+        browser.remember_current_selection();
+        Ok(())
+    }
+
+    fn toggle_hidden_files(&mut self) {
+        self.state.include_hidden = !self.state.include_hidden;
+        let hidden = self.state.include_hidden;
+        if self.state.browser.is_some() {
+            match self.refresh_browser_listing_preserving_selection() {
+                Ok(()) => {
+                    self.apply_browser_selection();
+                    self.status = if hidden {
+                        "hidden files shown".to_owned()
+                    } else {
+                        "hidden files hidden".to_owned()
+                    };
+                }
+                Err(error) => {
+                    self.status = format!("browser refresh failed: {error}");
+                }
+            }
+        } else {
+            self.pending_rescan = true;
+            self.status = if hidden {
+                "hidden files shown".to_owned()
+            } else {
+                "hidden files hidden".to_owned()
+            };
+        }
+    }
+
+    fn select_browser_index(&mut self, index: usize) {
+        let Some(browser) = self.state.browser.as_mut() else {
+            return;
+        };
+        if browser.entries.is_empty() {
+            return;
+        }
+        browser.selected_index = index.min(browser.entries.len() - 1);
+        browser.scroll_to_selection = true;
+        browser.remember_current_selection();
+        self.apply_browser_selection();
+    }
+
+    fn move_browser_selection(&mut self, delta: isize) {
+        let Some(browser) = self.state.browser.as_ref() else {
+            return;
+        };
+        let target = browser_move_index(browser.selected_index, delta, browser.entries.len());
+        self.select_browser_index(target);
+    }
+
+    fn enter_selected_browser_directory(&mut self) {
+        let Some(entry) = self.browser_selected_entry_cloned() else {
+            return;
+        };
+        if entry.kind != BrowserEntryKind::Directory {
+            return;
+        }
+        self.open_browser_directory(entry.path, None);
+    }
+
+    fn open_browser_parent(&mut self) {
+        let Some(browser) = self.state.browser.as_ref() else {
+            return;
+        };
+        let current_directory = browser.listed_directory.clone();
+        let Some(parent) = current_directory.parent().map(Path::to_path_buf) else {
+            self.status = "already at filesystem root".to_owned();
+            return;
+        };
+        self.open_browser_directory(parent, Some(current_directory));
+    }
+
+    fn open_browser_directory(&mut self, directory: PathBuf, preferred_selection: Option<PathBuf>) {
+        let remembered = self
+            .state
+            .browser
+            .as_ref()
+            .map(|browser| browser.remembered_selection.clone())
+            .unwrap_or_default();
+        match BrowserState::for_directory(
+            directory,
+            preferred_selection,
+            remembered,
+            self.state.include_hidden,
+            &self.state.extensions,
+        ) {
+            Ok(browser) => {
+                self.state.browser = Some(browser);
+                self.apply_browser_selection();
+            }
+            Err(error) => {
+                self.status = format!("browser failed: {error}");
+            }
+        }
+    }
+
+    fn apply_browser_selection(&mut self) {
+        let Some(entry) = self.browser_selected_entry_cloned() else {
+            if let Some(directory) = self
+                .state
+                .browser
+                .as_ref()
+                .map(|browser| browser.listed_directory.clone())
+            {
+                self.load_right_pane_directory(directory);
+            }
+            return;
+        };
+
+        match entry.kind {
+            BrowserEntryKind::Directory => {
+                self.load_right_pane_directory(entry.path);
+            }
+            BrowserEntryKind::Media(_) => {
+                self.load_right_pane_file(entry.path);
+            }
+            BrowserEntryKind::UnsupportedFile => {
+                self.stop_active_video();
+                self.state.mode = ViewMode::Preview;
+                self.empty_media_target = entry.path.clone();
+                self.status = format!("unsupported file: {}", entry.display_name);
+            }
+        }
+    }
+
+    fn load_right_pane_directory(&mut self, directory: PathBuf) {
+        self.stop_active_video();
+        self.failed.clear();
+        let previous = if self.state.directory == directory {
+            self.state.current_path()
+        } else {
+            None
+        };
+        self.state.selected_files = None;
+        self.state.directory = directory.clone();
+        self.state.mode = ViewMode::Grid;
+        self.empty_media_target = directory.clone();
+        match scan_directory(ScanOptions {
+            root: directory.clone(),
+            recursive: self.state.recursive,
+            include_hidden: self.state.include_hidden,
+            extensions: self.state.extensions.clone(),
+        }) {
+            Ok(mut entries) => {
+                sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
+                self.state.set_entries_preserving_current(entries, previous);
+                self.status = format!(
+                    "scanned {} media files{}",
+                    self.state.entries.len(),
+                    if self.state.recursive {
+                        " recursively"
+                    } else {
+                        ""
+                    }
+                );
+                self.scroll_to_current = true;
+            }
+            Err(error) => {
+                self.status = format!("scan failed: {error}");
+            }
+        }
+    }
+
+    fn load_right_pane_file(&mut self, path: PathBuf) {
+        self.stop_active_video();
+        self.failed.clear();
+        let Some(directory) = path.parent().map(Path::to_path_buf) else {
+            self.status = format!("file has no parent: {}", path.display());
+            return;
+        };
+        self.state.selected_files = None;
+        self.state.directory = directory.clone();
+        self.state.mode = ViewMode::Preview;
+        self.empty_media_target = path.clone();
+        match scan_directory(ScanOptions {
+            root: directory,
+            recursive: self.state.recursive,
+            include_hidden: self.state.include_hidden,
+            extensions: self.state.extensions.clone(),
+        }) {
+            Ok(mut entries) => {
+                sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
+                self.state
+                    .set_entries_preserving_current(entries, Some(path.clone()));
+                if let Some(index) = self
+                    .state
+                    .entries
+                    .iter()
+                    .position(|entry| entry.path == path)
+                {
+                    self.state.current_index = index;
+                }
+                self.status = format!("preview: {}", path.display());
+                self.scroll_to_current = true;
+            }
+            Err(error) => {
+                self.status = format!("scan failed: {error}");
+            }
+        }
+    }
+
+    fn sync_browser_to_current_path(&mut self) {
+        let Some(current_path) = self.state.current_path() else {
+            return;
+        };
+        let Some(browser) = self.state.browser.as_mut() else {
+            return;
+        };
+        if let Some(index) = browser
+            .entries
+            .iter()
+            .position(|entry| entry.path == current_path)
+        {
+            browser.selected_index = index;
+            browser.scroll_to_selection = true;
+            browser.remember_current_selection();
+        }
+    }
+
     fn ensure_requested(&mut self) {
+        if self.browser_selected_is_unsupported() {
+            return;
+        }
         let len = self.state.entries.len();
         if len == 0 {
             return;
@@ -372,6 +686,12 @@ impl GuiApp {
     }
 
     fn current_is_video(&self) -> bool {
+        if self.browser_selected_is_unsupported() {
+            return false;
+        }
+        if self.browser_is_focused() && !self.browser_selected_is_previewed_media() {
+            return false;
+        }
         self.state
             .current_entry()
             .map(|entry| entry.media_kind.is_video())
@@ -401,6 +721,12 @@ impl GuiApp {
     }
 
     fn active_current_video_can_seek(&self) -> bool {
+        if self.browser_selected_is_unsupported() {
+            return false;
+        }
+        if self.browser_is_focused() && !self.browser_selected_is_previewed_media() {
+            return false;
+        }
         self.state
             .current_entry()
             .filter(|entry| entry.media_kind.is_video())
@@ -624,6 +950,7 @@ impl GuiApp {
             self.stop_active_video();
             self.autoplay_current_video_if_armed();
         }
+        self.sync_browser_to_current_path();
         self.scroll_to_current = true;
     }
 
@@ -639,6 +966,16 @@ impl GuiApp {
     }
 
     fn rescan(&mut self) {
+        if self.state.browser.is_some() {
+            match self.refresh_browser_listing_preserving_selection() {
+                Ok(()) => self.apply_browser_selection(),
+                Err(error) => {
+                    self.status = format!("browser refresh failed: {error}");
+                }
+            }
+            return;
+        }
+
         self.stop_active_video();
         // Drop remembered decode failures so files that have since been fixed,
         // replaced, or were only transiently unreadable get another attempt.
@@ -693,6 +1030,10 @@ impl GuiApp {
         if self.state.entries.is_empty() {
             self.state.mode = ViewMode::Preview;
         }
+        if self.state.browser.is_some() {
+            let _ = self.refresh_browser_listing_preserving_selection();
+            self.apply_browser_selection();
+        }
         self.scroll_to_current = true;
     }
 
@@ -716,6 +1057,7 @@ impl GuiApp {
         let cols = self.grid_cols.max(1);
         let rows = self.grid_rows.max(1);
         let in_grid = matches!(self.state.mode, ViewMode::Grid | ViewMode::DeleteQueueGrid);
+        let browser_half_page = (self.browser_rows / 2).max(1) as isize;
 
         // Viewport commands must be issued OUTSIDE the input closure — calling
         // them while ctx.input() holds the context lock silently drops them.
@@ -731,14 +1073,57 @@ impl GuiApp {
                 if self.state.show_help_overlay || self.state.show_info_overlay {
                     self.state.show_help_overlay = false;
                     self.state.show_info_overlay = false;
-                } else if in_grid {
+                } else if in_grid && !self.browser_is_focused() {
                     self.state.mode = ViewMode::Preview;
                 } else {
                     close = true;
                 }
             }
 
-            if in_grid {
+            if i.key_pressed(Key::E) && !i.modifiers.ctrl {
+                self.toggle_browser_view();
+            }
+            if i.modifiers.ctrl && i.key_pressed(Key::L) {
+                self.set_browser_focus(BrowserPaneFocus::Preview);
+            }
+            if i.modifiers.ctrl && i.key_pressed(Key::H) {
+                self.set_browser_focus(BrowserPaneFocus::Browser);
+            }
+            if i.key_pressed(Key::Period) && !i.modifiers.ctrl {
+                self.toggle_hidden_files();
+            }
+
+            let browser_navigation = self.browser_is_focused();
+            let right_pane_disabled = self.browser_selected_is_unsupported();
+
+            if browser_navigation {
+                if i.key_pressed(Key::J) || i.key_pressed(Key::ArrowDown) {
+                    self.move_browser_selection(1);
+                }
+                if i.key_pressed(Key::K) || i.key_pressed(Key::ArrowUp) {
+                    self.move_browser_selection(-1);
+                }
+                if i.modifiers.ctrl && i.key_pressed(Key::D) {
+                    self.move_browser_selection(browser_half_page);
+                }
+                if i.modifiers.ctrl && i.key_pressed(Key::U) {
+                    self.move_browser_selection(-browser_half_page);
+                }
+                if !i.modifiers.ctrl && i.key_pressed(Key::L) {
+                    self.enter_selected_browser_directory();
+                }
+                if !i.modifiers.ctrl && i.key_pressed(Key::H) {
+                    self.open_browser_parent();
+                }
+                if i.key_pressed(Key::Home) {
+                    self.select_browser_index(0);
+                }
+                if i.key_pressed(Key::End)
+                    && let Some(browser) = self.state.browser.as_ref()
+                {
+                    self.select_browser_index(browser.entries.len().saturating_sub(1));
+                }
+            } else if !right_pane_disabled && in_grid {
                 // Vim-style spatial navigation in the library grid:
                 // h/l move within a row, j/k move between rows, ctrl+d/u half-page.
                 if i.key_pressed(Key::H) || i.key_pressed(Key::ArrowLeft) {
@@ -760,7 +1145,7 @@ impl GuiApp {
                 if i.modifiers.ctrl && i.key_pressed(Key::U) {
                     self.move_by(-half_page);
                 }
-            } else {
+            } else if !right_pane_disabled {
                 // Preview is a one-wide list: h/k/←/↑ previous, l/j/→/↓ next.
                 if i.key_pressed(Key::L)
                     || i.key_pressed(Key::J)
@@ -777,22 +1162,32 @@ impl GuiApp {
                     self.move_by(-1);
                 }
             }
-            if i.key_pressed(Key::Home) {
-                self.set_current_index(0);
-            }
-            if i.key_pressed(Key::End) {
-                let last = self.state.entries.len().saturating_sub(1);
-                self.set_current_index(last);
+            if !browser_navigation && !right_pane_disabled {
+                if i.key_pressed(Key::Home) {
+                    self.set_current_index(0);
+                }
+                if i.key_pressed(Key::End) {
+                    let last = self.state.entries.len().saturating_sub(1);
+                    self.set_current_index(last);
+                }
             }
 
             // Delete queue and video playback.
-            if i.modifiers.shift && i.key_pressed(Key::D) {
+            if !browser_navigation
+                && !right_pane_disabled
+                && i.modifiers.shift
+                && i.key_pressed(Key::D)
+            {
                 let before = self.state.current_index;
                 self.state.enter_delete_queue_grid();
                 self.finish_selection_change(before);
             } else if i.key_pressed(Key::Space) && self.current_is_video() {
                 self.toggle_current_video_playback();
-            } else if i.key_pressed(Key::D) && !i.modifiers.ctrl {
+            } else if !browser_navigation
+                && !right_pane_disabled
+                && i.key_pressed(Key::D)
+                && !i.modifiers.ctrl
+            {
                 self.state.toggle_queue_current();
                 self.status = format!("queued: {}", self.state.queue_count());
             }
@@ -802,8 +1197,10 @@ impl GuiApp {
                         self.seek_current_video(VideoSeekDirection::Backward, i.time);
                     }
                     UKeyAction::Unqueue => {
-                        self.state.unqueue_current();
-                        self.status = format!("queued: {}", self.state.queue_count());
+                        if !browser_navigation && !right_pane_disabled {
+                            self.state.unqueue_current();
+                            self.status = format!("queued: {}", self.state.queue_count());
+                        }
                     }
                 }
             }
@@ -814,7 +1211,7 @@ impl GuiApp {
                 self.show_video_progress_overlay(i.time);
             }
             if i.key_pressed(Key::R) {
-                if i.modifiers.ctrl {
+                if i.modifiers.ctrl && !browser_navigation && !right_pane_disabled {
                     // Ctrl+R: delete the queued files (with confirmation).
                     if self.state.queue_count() == 0 {
                         self.status = "delete queue is empty".to_owned();
@@ -835,17 +1232,17 @@ impl GuiApp {
             }
 
             // Views / overlays / zoom / sort.
-            if i.key_pressed(Key::G) {
+            if !browser_navigation && !right_pane_disabled && i.key_pressed(Key::G) {
                 self.state.mode = match self.state.mode {
                     ViewMode::Preview => ViewMode::Grid,
                     ViewMode::Grid | ViewMode::DeleteQueueGrid => ViewMode::Preview,
                 };
                 self.scroll_to_current = true;
             }
-            if in_grid && i.key_pressed(Key::Enter) {
+            if !browser_navigation && !right_pane_disabled && in_grid && i.key_pressed(Key::Enter) {
                 self.state.mode = ViewMode::Preview;
             }
-            if i.key_pressed(Key::Z) {
+            if !browser_navigation && !right_pane_disabled && i.key_pressed(Key::Z) {
                 self.state.zoom_mode = match self.state.zoom_mode {
                     ZoomMode::Fit => ZoomMode::OriginalPixels,
                     ZoomMode::OriginalPixels => ZoomMode::Fit,
@@ -854,22 +1251,22 @@ impl GuiApp {
             if i.key_pressed(Key::F) {
                 toggle_fullscreen = true;
             }
-            if i.key_pressed(Key::M) {
+            if !right_pane_disabled && i.key_pressed(Key::M) {
                 self.toggle_video_mute();
             }
             if i.key_pressed(Key::A) {
                 self.toggle_auto_next();
             }
-            if i.key_pressed(Key::B) {
+            if !browser_navigation && !right_pane_disabled && i.key_pressed(Key::B) {
                 self.toggle_media_type_badges();
             }
-            if i.key_pressed(Key::T) {
+            if !browser_navigation && !right_pane_disabled && i.key_pressed(Key::T) {
                 self.pending_sort = Some(sorter::next_time_sort(self.state.sort_mode));
             }
-            if i.key_pressed(Key::N) {
+            if !browser_navigation && !right_pane_disabled && i.key_pressed(Key::N) {
                 self.pending_sort = Some(sorter::next_name_sort(self.state.sort_mode));
             }
-            if i.key_pressed(Key::I) {
+            if !browser_navigation && !right_pane_disabled && i.key_pressed(Key::I) {
                 self.state.show_info_overlay = !self.state.show_info_overlay;
                 self.pending_enrich = self.state.show_info_overlay;
             }
@@ -896,6 +1293,128 @@ impl GuiApp {
         if close {
             self.stop_active_video();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn draw_browser_pane(&mut self, ui: &mut egui::Ui) {
+        let Some(browser) = self.state.browser.as_ref() else {
+            return;
+        };
+        let listed_directory = browser.listed_directory.clone();
+        let entry_count = browser.entries.len();
+        let focused = browser.focus == BrowserPaneFocus::Browser;
+        let header = if self.state.include_hidden {
+            format!("{}  [hidden]", listed_directory.display())
+        } else {
+            listed_directory.display().to_string()
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Files").strong());
+            if focused {
+                ui.label(egui::RichText::new("focus").small().strong());
+            }
+        });
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(header).small().monospace());
+        ui.separator();
+
+        if entry_count == 0 {
+            ui.centered_and_justified(|ui| {
+                ui.label("No visible files.");
+            });
+            return;
+        }
+
+        let available_height = ui.available_height();
+        self.browser_rows = ((available_height / BROWSER_ROW_HEIGHT).floor() as usize).max(1);
+        egui::ScrollArea::vertical().show_rows(
+            ui,
+            BROWSER_ROW_HEIGHT,
+            entry_count,
+            |ui, row_range| {
+                for index in row_range {
+                    self.draw_browser_row(ui, index);
+                }
+            },
+        );
+        if let Some(browser) = self.state.browser.as_mut() {
+            browser.scroll_to_selection = false;
+        }
+    }
+
+    fn draw_browser_row(&mut self, ui: &mut egui::Ui, index: usize) {
+        let Some(browser) = self.state.browser.as_ref() else {
+            return;
+        };
+        let Some(entry) = browser.entries.get(index).cloned() else {
+            return;
+        };
+        let selected = index == browser.selected_index;
+        let focused = browser.focus == BrowserPaneFocus::Browser;
+        let should_scroll = selected && browser.scroll_to_selection;
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), BROWSER_ROW_HEIGHT),
+            egui::Sense::click(),
+        );
+
+        if selected {
+            let fill = if focused {
+                egui::Color32::from_rgb(62, 76, 96)
+            } else {
+                ui.visuals().selection.bg_fill
+            };
+            ui.painter()
+                .rect_filled(rect.shrink2(egui::vec2(0.0, 1.0)), 3.0, fill);
+        } else if response.hovered() {
+            ui.painter().rect_filled(
+                rect.shrink2(egui::vec2(0.0, 1.0)),
+                3.0,
+                ui.visuals().faint_bg_color,
+            );
+        }
+
+        let icon_rect = egui::Rect::from_min_size(
+            rect.left_center() + egui::vec2(8.0, -8.0),
+            egui::vec2(16.0, 16.0),
+        );
+        draw_browser_icon(ui, icon_rect, &entry.kind);
+        let text_pos = egui::pos2(icon_rect.right() + 8.0, rect.center().y);
+        let color = if selected {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().text_color()
+        };
+        ui.painter().text(
+            text_pos,
+            egui::Align2::LEFT_CENTER,
+            entry.display_name.clone(),
+            egui::FontId::proportional(13.0),
+            color,
+        );
+
+        if should_scroll {
+            response.scroll_to_me(Some(egui::Align::Center));
+        }
+        if response.clicked() {
+            self.select_browser_index(index);
+        }
+        if response.double_clicked() && entry.kind == BrowserEntryKind::Directory {
+            self.select_browser_index(index);
+            self.enter_selected_browser_directory();
+        }
+    }
+
+    fn draw_browser_right_pane(&mut self, ui: &mut egui::Ui) {
+        if let Some(entry) = self.browser_selected_entry()
+            && entry.kind == BrowserEntryKind::UnsupportedFile
+        {
+            draw_unsupported_file_message(ui, &entry.path);
+            return;
+        }
+        match self.state.mode {
+            ViewMode::Preview => self.draw_preview(ui),
+            ViewMode::Grid | ViewMode::DeleteQueueGrid => self.draw_grid(ui),
         }
     }
 
@@ -1166,6 +1685,7 @@ impl GuiApp {
                 });
         }
         if self.state.show_info_overlay
+            && !self.browser_selected_is_unsupported()
             && let Some(entry) = self.state.current_entry()
         {
             let dims = entry
@@ -1211,6 +1731,13 @@ grid (library) mode:
 preview mode:
   h / k / ← / ↑   previous
   l / j / → / ↓   next
+browser mode:
+  e               toggle browser
+  ctrl+h / ctrl+l focus browser / preview pane
+  j / k           browser down / up
+  ctrl+d / ctrl+u browser half page down / up
+  l / h           enter folder / parent folder
+  .               show / hide hidden files
 home / end      first / last
 g               toggle grid
 space           play / pause videos
@@ -1241,16 +1768,27 @@ impl eframe::App for GuiApp {
         self.drain_video_events(ctx);
         self.ensure_requested();
 
-        let mode = match self.state.mode {
+        let right_mode = match self.state.mode {
             ViewMode::Preview => "preview",
             ViewMode::Grid => "grid",
             ViewMode::DeleteQueueGrid => "delete-queue",
+        };
+        let mode = if let Some(browser) = &self.state.browser {
+            let focus = match browser.focus {
+                BrowserPaneFocus::Browser => "browser",
+                BrowserPaneFocus::Preview => "preview",
+            };
+            format!("browser/{right_mode}/{focus}")
+        } else {
+            right_mode.to_owned()
         };
         let zoom = match self.state.zoom_mode {
             ZoomMode::Fit => "fit",
             ZoomMode::OriginalPixels => "original",
         };
-        let position = if self.state.entries.is_empty() {
+        let position = if self.browser_selected_is_unsupported() {
+            "unsupported".to_owned()
+        } else if self.state.entries.is_empty() {
             "0 / 0".to_owned()
         } else {
             format!(
@@ -1271,9 +1809,22 @@ impl eframe::App for GuiApp {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| ui.label(status));
         });
-        egui::CentralPanel::default().show(ctx, |ui| match self.state.mode {
-            ViewMode::Preview => self.draw_preview(ui),
-            ViewMode::Grid | ViewMode::DeleteQueueGrid => self.draw_grid(ui),
+        if self.state.browser.is_some() {
+            egui::SidePanel::left("file-browser")
+                .resizable(true)
+                .default_width(BROWSER_DEFAULT_WIDTH)
+                .width_range(220.0..=520.0)
+                .show(ctx, |ui| self.draw_browser_pane(ui));
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.state.browser.is_some() {
+                self.draw_browser_right_pane(ui);
+            } else {
+                match self.state.mode {
+                    ViewMode::Preview => self.draw_preview(ui),
+                    ViewMode::Grid | ViewMode::DeleteQueueGrid => self.draw_grid(ui),
+                }
+            }
         });
         self.draw_overlays(ctx);
 
@@ -1363,6 +1914,84 @@ fn draw_media_type_badge(ui: &egui::Ui, cell_rect: egui::Rect, media_kind: &Medi
     }
 }
 
+fn draw_browser_icon(ui: &egui::Ui, rect: egui::Rect, kind: &BrowserEntryKind) {
+    let painter = ui.painter();
+    let stroke = egui::Stroke::new(1.3, ui.visuals().strong_text_color());
+    match kind {
+        BrowserEntryKind::Directory => {
+            let tab = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 1.0, rect.top() + 3.0),
+                egui::pos2(rect.left() + 7.0, rect.top() + 6.0),
+            );
+            let body = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 1.0, rect.top() + 5.0),
+                egui::pos2(rect.right() - 1.0, rect.bottom() - 2.0),
+            );
+            painter.rect_filled(tab, 1.0, egui::Color32::from_rgb(220, 180, 72));
+            painter.rect_filled(body, 2.0, egui::Color32::from_rgb(216, 165, 56));
+            painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+        }
+        BrowserEntryKind::Media(media_kind) if media_kind.is_video() => {
+            painter.rect_stroke(rect.shrink(1.5), 2.0, stroke, egui::StrokeKind::Inside);
+            let center = rect.center();
+            let points = vec![
+                egui::pos2(center.x - 3.0, center.y - 5.0),
+                egui::pos2(center.x - 3.0, center.y + 5.0),
+                egui::pos2(center.x + 5.0, center.y),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                ui.visuals().strong_text_color(),
+                egui::Stroke::NONE,
+            ));
+        }
+        BrowserEntryKind::Media(_) => {
+            let frame = rect.shrink(1.5);
+            painter.rect_stroke(frame, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.circle_filled(
+                egui::pos2(frame.left() + 4.0, frame.top() + 4.0),
+                1.5,
+                ui.visuals().strong_text_color(),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(frame.left() + 3.0, frame.bottom() - 3.0),
+                    egui::pos2(frame.center().x - 1.0, frame.center().y + 1.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(frame.center().x - 1.0, frame.center().y + 1.0),
+                    egui::pos2(frame.right() - 3.0, frame.bottom() - 3.0),
+                ],
+                stroke,
+            );
+        }
+        BrowserEntryKind::UnsupportedFile => {
+            let page = rect.shrink(1.5);
+            painter.rect_stroke(page, 1.5, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    egui::pos2(page.left() + 3.0, page.center().y),
+                    egui::pos2(page.right() - 3.0, page.center().y),
+                ],
+                stroke,
+            );
+        }
+    }
+}
+
+fn draw_unsupported_file_message(ui: &mut egui::Ui, target: &Path) {
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new("Unsupported file").strong().size(20.0));
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(target.display().to_string()).monospace());
+        });
+    });
+}
+
 fn draw_empty_media_message(ui: &mut egui::Ui, target: &Path) {
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, egui::Sense::hover());
@@ -1414,6 +2043,214 @@ fn initial_view_mode(initial_file: Option<&Path>) -> ViewMode {
     } else {
         ViewMode::Grid
     }
+}
+
+impl BrowserState {
+    fn for_directory(
+        listed_directory: PathBuf,
+        preferred_selection: Option<PathBuf>,
+        mut remembered_selection: HashMap<PathBuf, PathBuf>,
+        include_hidden: bool,
+        extensions: &[String],
+    ) -> Result<Self> {
+        let entries = read_browser_entries(&listed_directory, include_hidden, extensions)?;
+        let remembered = remembered_selection.get(&listed_directory).cloned();
+        let selected_index = preferred_browser_index(
+            &entries,
+            preferred_selection.as_ref().or(remembered.as_ref()),
+            0,
+        );
+        if let Some(entry) = entries.get(selected_index) {
+            remembered_selection.insert(listed_directory.clone(), entry.path.clone());
+        }
+        Ok(Self {
+            listed_directory,
+            entries,
+            selected_index,
+            focus: BrowserPaneFocus::Browser,
+            remembered_selection,
+            scroll_to_selection: true,
+        })
+    }
+
+    fn selected_path(&self) -> Option<PathBuf> {
+        self.entries
+            .get(self.selected_index)
+            .map(|entry| entry.path.clone())
+    }
+
+    fn remember_current_selection(&mut self) {
+        if let Some(path) = self.selected_path() {
+            self.remembered_selection
+                .insert(self.listed_directory.clone(), path);
+        }
+    }
+}
+
+fn browser_state_for_launch(
+    launch: &LaunchTarget,
+    include_hidden: bool,
+    extensions: &[String],
+) -> Result<Option<BrowserState>> {
+    let LaunchTarget::Directory {
+        directory,
+        initial_file,
+    } = launch
+    else {
+        return Ok(None);
+    };
+
+    let target = initial_file.as_ref().unwrap_or(directory);
+    let listed_directory = browser_listed_directory_for_target(target, initial_file.is_some());
+    BrowserState::for_directory(
+        listed_directory,
+        Some(target.clone()),
+        HashMap::new(),
+        include_hidden,
+        extensions,
+    )
+    .map(Some)
+}
+
+fn browser_state_for_current_view(state: &AppState, include_hidden: bool) -> Result<BrowserState> {
+    let target = if matches!(state.mode, ViewMode::Preview) {
+        state
+            .current_path()
+            .unwrap_or_else(|| state.directory.clone())
+    } else {
+        state.directory.clone()
+    };
+    let is_file = target.is_file();
+    let listed_directory = browser_listed_directory_for_target(&target, is_file);
+    BrowserState::for_directory(
+        listed_directory,
+        Some(target),
+        HashMap::new(),
+        include_hidden,
+        &state.extensions,
+    )
+}
+
+fn browser_listed_directory_for_target(target: &Path, _target_is_file: bool) -> PathBuf {
+    target
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| target.to_path_buf())
+}
+
+fn read_browser_entries(
+    directory: &Path,
+    include_hidden: bool,
+    extensions: &[String],
+) -> Result<Vec<BrowserEntry>> {
+    let mut entries = Vec::new();
+    for dir_entry in fs::read_dir(directory)
+        .with_context(|| format!("failed to read {}", directory.display()))?
+    {
+        let dir_entry = match dir_entry {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "skipping unreadable browser entry");
+                continue;
+            }
+        };
+        let path = dir_entry.path();
+        if !include_hidden && is_hidden_browser_path(&path) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "skipping unreadable browser metadata");
+                continue;
+            }
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        let kind = if file_type.is_dir() {
+            BrowserEntryKind::Directory
+        } else if file_type.is_file() {
+            browser_file_kind(&path, extensions)
+        } else {
+            continue;
+        };
+        let display_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        entries.push(BrowserEntry {
+            path,
+            display_name,
+            kind,
+        });
+    }
+    sort_browser_entries(&mut entries);
+    Ok(entries)
+}
+
+fn browser_file_kind(path: &Path, extensions: &[String]) -> BrowserEntryKind {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+    let allowed = extension
+        .as_ref()
+        .is_some_and(|ext| extensions.iter().any(|allowed| allowed == ext));
+    if allowed && let Some(media_kind) = MediaKind::from_extension(extension.as_deref()) {
+        BrowserEntryKind::Media(media_kind)
+    } else {
+        BrowserEntryKind::UnsupportedFile
+    }
+}
+
+fn sort_browser_entries(entries: &mut [BrowserEntry]) {
+    entries.sort_by(|a, b| {
+        browser_kind_rank(&a.kind)
+            .cmp(&browser_kind_rank(&b.kind))
+            .then_with(|| {
+                a.display_name
+                    .to_ascii_lowercase()
+                    .cmp(&b.display_name.to_ascii_lowercase())
+            })
+            .then_with(|| a.display_name.cmp(&b.display_name))
+    });
+}
+
+fn browser_kind_rank(kind: &BrowserEntryKind) -> u8 {
+    match kind {
+        BrowserEntryKind::Directory => 0,
+        BrowserEntryKind::Media(_) => 1,
+        BrowserEntryKind::UnsupportedFile => 2,
+    }
+}
+
+fn preferred_browser_index(
+    entries: &[BrowserEntry],
+    preferred_path: Option<&PathBuf>,
+    fallback: usize,
+) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    preferred_path
+        .and_then(|path| entries.iter().position(|entry| &entry.path == path))
+        .unwrap_or_else(|| fallback.min(entries.len() - 1))
+}
+
+fn browser_move_index(current: usize, delta: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (current as isize + delta).clamp(0, len as isize - 1) as usize
+}
+
+fn is_hidden_browser_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with('.'))
+        .unwrap_or(false)
 }
 
 fn centered_text_galley(
@@ -1870,6 +2707,247 @@ mod tests {
     }
 
     #[test]
+    fn browser_launch_for_folder_lists_parent_and_selects_folder() {
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        let launch = resolve_launch(std::slice::from_ref(&folder), None).unwrap();
+
+        let browser = browser_state_for_launch(&launch, false, &["jpg".to_owned()])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            browser.listed_directory,
+            temp.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            browser.selected_path(),
+            Some(folder.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn browser_launch_for_file_lists_parent_and_selects_file() {
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("image.jpg");
+        touch(&image);
+        let launch = resolve_launch(std::slice::from_ref(&image), None).unwrap();
+
+        let browser = browser_state_for_launch(&launch, false, &["jpg".to_owned()])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            browser.listed_directory,
+            temp.path().canonicalize().unwrap()
+        );
+        assert_eq!(browser.selected_path(), Some(image.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn browser_launch_ignores_selected_file_scope() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first.jpg");
+        let second = temp.path().join("second.jpg");
+        touch(&first);
+        touch(&second);
+        let launch = resolve_launch(&[first, second], None).unwrap();
+
+        assert!(
+            browser_state_for_launch(&launch, false, &["jpg".to_owned()])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(initial_view_mode_for_launch(&launch), ViewMode::Grid);
+    }
+
+    #[test]
+    fn browser_listing_sorts_folders_media_and_unsupported_files() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("folder")).unwrap();
+        touch(&temp.path().join("image.jpg"));
+        touch(&temp.path().join("clip.mp4"));
+        touch(&temp.path().join("note.txt"));
+
+        let entries =
+            read_browser_entries(temp.path(), false, &["jpg".to_owned(), "mp4".to_owned()])
+                .unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["folder", "clip.mp4", "image.jpg", "note.txt"]
+        );
+        assert_eq!(entries[0].kind, BrowserEntryKind::Directory);
+        assert!(matches!(entries[1].kind, BrowserEntryKind::Media(_)));
+        assert_eq!(entries[3].kind, BrowserEntryKind::UnsupportedFile);
+    }
+
+    #[test]
+    fn browser_listing_respects_hidden_toggle() {
+        let temp = tempdir().unwrap();
+        touch(&temp.path().join(".hidden.jpg"));
+        touch(&temp.path().join("visible.jpg"));
+
+        let hidden_off = read_browser_entries(temp.path(), false, &["jpg".to_owned()]).unwrap();
+        let hidden_on = read_browser_entries(temp.path(), true, &["jpg".to_owned()]).unwrap();
+
+        assert_eq!(hidden_off.len(), 1);
+        assert_eq!(hidden_off[0].display_name, "visible.jpg");
+        assert!(
+            hidden_on
+                .iter()
+                .any(|entry| entry.display_name == ".hidden.jpg")
+        );
+    }
+
+    #[test]
+    fn browser_navigation_clamps_to_visible_range() {
+        assert_eq!(browser_move_index(0, -1, 4), 0);
+        assert_eq!(browser_move_index(1, 2, 4), 3);
+        assert_eq!(browser_move_index(3, 8, 4), 3);
+        assert_eq!(browser_move_index(0, 1, 0), 0);
+    }
+
+    #[test]
+    fn browser_state_restores_remembered_child_selection() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("a.jpg");
+        let second = temp.path().join("b.jpg");
+        touch(&first);
+        touch(&second);
+        let directory = temp.path().canonicalize().unwrap();
+        let remembered = [(directory.clone(), second.canonicalize().unwrap())]
+            .into_iter()
+            .collect();
+
+        let browser =
+            BrowserState::for_directory(directory, None, remembered, false, &["jpg".to_owned()])
+                .unwrap();
+
+        assert_eq!(
+            browser.selected_path(),
+            Some(second.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn browser_folder_selection_loads_right_pane_gallery() {
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        let image = folder.join("image.jpg");
+        touch(&image);
+        let mut app = app_for_browser_tests(temp.path());
+        app.state.browser = Some(
+            BrowserState::for_directory(
+                temp.path().canonicalize().unwrap(),
+                Some(folder.canonicalize().unwrap()),
+                HashMap::new(),
+                false,
+                &["jpg".to_owned()],
+            )
+            .unwrap(),
+        );
+
+        app.apply_browser_selection();
+
+        assert_eq!(app.state.directory, folder.canonicalize().unwrap());
+        assert_eq!(app.state.mode, ViewMode::Grid);
+        assert_eq!(app.state.entries.len(), 1);
+        assert_eq!(app.state.entries[0].path, image);
+    }
+
+    #[test]
+    fn browser_empty_folder_selection_shows_empty_folder_gallery() {
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        let mut app = app_for_browser_tests(temp.path());
+        app.open_browser_directory(folder.canonicalize().unwrap(), None);
+
+        assert_eq!(app.state.directory, folder.canonicalize().unwrap());
+        assert_eq!(app.state.mode, ViewMode::Grid);
+        assert!(app.state.entries.is_empty());
+    }
+
+    #[test]
+    fn browser_file_selection_loads_right_pane_preview() {
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("image.jpg");
+        touch(&image);
+        let mut app = app_for_browser_tests(temp.path());
+        app.state.browser = Some(
+            BrowserState::for_directory(
+                temp.path().canonicalize().unwrap(),
+                Some(image.canonicalize().unwrap()),
+                HashMap::new(),
+                false,
+                &["jpg".to_owned()],
+            )
+            .unwrap(),
+        );
+
+        app.apply_browser_selection();
+
+        assert_eq!(app.state.mode, ViewMode::Preview);
+        assert_eq!(app.state.current_path(), Some(image));
+    }
+
+    #[test]
+    fn browser_unsupported_selection_disables_current_video_context() {
+        let temp = tempdir().unwrap();
+        let unsupported = temp.path().join("note.txt");
+        touch(&unsupported);
+        let video_entry = media_entry(
+            temp.path().join("clip.mp4"),
+            MediaKind::Video(VideoKind::Mp4),
+            0,
+        );
+        let mut state = app_state(vec![video_entry], 0);
+        state.browser = Some(
+            BrowserState::for_directory(
+                temp.path().canonicalize().unwrap(),
+                Some(unsupported.canonicalize().unwrap()),
+                HashMap::new(),
+                false,
+                &["jpg".to_owned(), "mp4".to_owned()],
+            )
+            .unwrap(),
+        );
+        let app = GuiApp::new(state, None, true, false, temp.path().to_path_buf());
+
+        assert!(app.browser_selected_is_unsupported());
+        assert!(!app.current_is_video());
+    }
+
+    #[test]
+    fn browser_focus_allows_selected_video_context() {
+        let temp = tempdir().unwrap();
+        let video = temp.path().join("clip.mp4");
+        touch(&video);
+        let video_entry = media_entry(video.clone(), MediaKind::Video(VideoKind::Mp4), 0);
+        let mut state = app_state(vec![video_entry], 0);
+        state.browser = Some(
+            BrowserState::for_directory(
+                temp.path().canonicalize().unwrap(),
+                Some(video.canonicalize().unwrap()),
+                HashMap::new(),
+                false,
+                &["mp4".to_owned()],
+            )
+            .unwrap(),
+        );
+        let app = GuiApp::new(state, None, true, false, temp.path().to_path_buf());
+
+        assert!(app.browser_is_focused());
+        assert!(app.current_is_video());
+    }
+
+    #[test]
     fn resolve_launch_rejects_directories_in_selected_file_scope() {
         let temp = tempdir().unwrap();
         let image = temp.path().join("image.jpg");
@@ -2205,6 +3283,19 @@ mod tests {
         state
     }
 
+    fn app_for_browser_tests(directory: &Path) -> GuiApp {
+        let state = AppState::new(
+            directory.canonicalize().unwrap(),
+            false,
+            false,
+            MediaMode::Image,
+            vec!["jpg".to_owned()],
+            SortMode::Discovered,
+            Vec::new(),
+        );
+        GuiApp::new(state, None, true, false, directory.to_path_buf())
+    }
+
     fn media_entry(path: PathBuf, media_kind: MediaKind, discovered_order: usize) -> MediaEntry {
         let file_name = path
             .file_name()
@@ -2257,6 +3348,9 @@ pub fn run(cli: Cli) -> Result<()> {
         state.selected_files = Some(files.iter().cloned().collect());
     }
     state.mode = initial_view_mode_for_launch(&launch);
+    if cli.view == CliViewMode::Browser {
+        state.browser = browser_state_for_launch(&launch, cli.hidden, &state.extensions)?;
+    }
     // Start positioned on the requested file (after sorting).
     if let Some(file) = &initial_file
         && let Some(index) = state.entries.iter().position(|entry| entry.path == *file)

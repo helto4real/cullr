@@ -30,6 +30,9 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub sort: Option<CliSortMode>,
 
+    #[arg(long, value_enum, default_value_t = CliViewMode::Auto)]
+    pub view: CliViewMode,
+
     #[arg(long)]
     pub locale: Option<String>,
 
@@ -56,6 +59,12 @@ pub enum CliMediaMode {
     Both,
     Image,
     Video,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum CliViewMode {
+    Auto,
+    Browser,
 }
 
 impl From<CliMediaMode> for MediaMode {
@@ -159,6 +168,7 @@ mod tests {
             file_ext: None,
             media: CliMediaMode::Both,
             sort: None,
+            view: CliViewMode::Auto,
             locale: None,
             dry_run_delete: false,
             hidden: false,
@@ -180,6 +190,7 @@ mod tests {
             file_ext: Some("jpg,mp4,txt".to_owned()),
             media: CliMediaMode::Video,
             sort: None,
+            view: CliViewMode::Auto,
             locale: None,
             dry_run_delete: false,
             hidden: false,
@@ -200,6 +211,14 @@ mod tests {
         let cli = Cli::parse_from(["cullr", "--auto-next", "/tmp/media"]);
 
         assert!(cli.auto_next);
+        assert_eq!(cli.paths, vec![PathBuf::from("/tmp/media")]);
+    }
+
+    #[test]
+    fn browser_view_flag_parses() {
+        let cli = Cli::parse_from(["cullr", "--view", "browser", "/tmp/media"]);
+
+        assert_eq!(cli.view, CliViewMode::Browser);
         assert_eq!(cli.paths, vec![PathBuf::from("/tmp/media")]);
     }
 
