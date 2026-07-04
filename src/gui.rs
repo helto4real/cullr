@@ -1841,6 +1841,14 @@ q / esc         quit / close";
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_impl(ctx);
+    }
+}
+
+impl GuiApp {
+    /// The whole per-frame flow, separated from `eframe::App` so tests can
+    /// drive full frames through `egui::Context::run`.
+    fn update_impl(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|input| input.focused);
         self.handle_focus_change(focused);
         self.handle_input(ctx);
@@ -2635,6 +2643,57 @@ mod tests {
                 .is_none()
         );
         assert_eq!(initial_view_mode_for_launch(&launch), ViewMode::Grid);
+    }
+
+    fn run_frame(app: &mut GuiApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        ));
+        raw.events = events;
+        let _ = ctx.run(raw, |ctx| app.update_impl(ctx));
+    }
+
+    fn key_press(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn e_key_opens_browser_after_folder_launch() {
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        touch(&folder.join("image.jpg"));
+        let launch = resolve_launch(std::slice::from_ref(&folder), None).unwrap();
+        let entries = scan_launch_entries(&launch, false, false, &["jpg".to_owned()]).unwrap();
+        let mut state = AppState::new(
+            launch.directory().to_path_buf(),
+            false,
+            false,
+            MediaMode::Image,
+            vec!["jpg".to_owned()],
+            SortMode::Discovered,
+            entries,
+        );
+        state.mode = initial_view_mode_for_launch(&launch);
+        let mut app = GuiApp::new(state, None, true, false, folder.clone());
+
+        let ctx = egui::Context::default();
+        run_frame(&mut app, &ctx, Vec::new());
+        run_frame(&mut app, &ctx, vec![key_press(egui::Key::E)]);
+
+        assert!(
+            app.state.browser.is_some(),
+            "e should open the browser after a folder launch; status: {}",
+            app.status
+        );
     }
 
     #[test]
