@@ -101,13 +101,13 @@ pub fn decode_first_frame_rgba(path: &Path, cap: u32) -> Result<RgbaImage> {
             continue;
         }
         setup.decoder.send_packet(&packet)?;
-        while let Some(frame) = receive_scaled_video_frame(&mut setup)? {
+        if let Some(frame) = receive_scaled_video_frame(&mut setup)? {
             return Ok(frame.image);
         }
     }
 
     setup.decoder.send_eof()?;
-    while let Some(frame) = receive_scaled_video_frame(&mut setup)? {
+    if let Some(frame) = receive_scaled_video_frame(&mut setup)? {
         return Ok(frame.image);
     }
 
