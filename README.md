@@ -122,7 +122,9 @@ mp4, m4v, mov, mkv, webm, avi, mpg, mpeg, m2v, ts, m2ts, mts, wmv, flv, 3gp, 3g2
 
 Use `--media image` or `--media video` to restrict the scan by media type. Use
 `--file_ext` to choose a different comma-separated extension set; the selected
-`--media` mode still filters that explicit list.
+`--media` mode still filters that explicit list. Plain `.ts` files are accepted
+only when their first packets look like MPEG transport stream data, so TypeScript
+source files are ignored.
 
 Video support requires FFmpeg shared libraries available to the system linker.
 

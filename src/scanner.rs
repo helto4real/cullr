@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -9,6 +10,11 @@ use anyhow::{Context, Result};
 use jwalk::{Parallelism, WalkDir};
 
 use crate::state::{MediaEntry, MediaKind};
+
+const MPEG_TS_PACKET_SIZE: usize = 188;
+const MPEG_TS_PROBE_PACKETS: usize = 3;
+const MPEG_TS_PROBE_BYTES: usize = MPEG_TS_PACKET_SIZE * MPEG_TS_PROBE_PACKETS;
+const MPEG_TS_SYNC_BYTE: u8 = 0x47;
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -138,6 +144,10 @@ fn build_entry(
         return Ok(None);
     };
 
+    if extension.as_deref() == Some("ts") && !looks_like_plain_mpeg_ts(&path) {
+        return Ok(None);
+    }
+
     Ok(Some(MediaEntry {
         path,
         file_name,
@@ -164,6 +174,34 @@ fn extension_set(extensions: &[String]) -> HashSet<String> {
         .collect()
 }
 
+fn looks_like_plain_mpeg_ts(path: &Path) -> bool {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "skipping unreadable transport stream probe");
+            return false;
+        }
+    };
+
+    let mut bytes = Vec::with_capacity(MPEG_TS_PROBE_BYTES);
+    if let Err(error) = file
+        .by_ref()
+        .take(MPEG_TS_PROBE_BYTES as u64)
+        .read_to_end(&mut bytes)
+    {
+        tracing::warn!(path = %path.display(), %error, "skipping failed transport stream probe");
+        return false;
+    }
+
+    has_mpeg_ts_sync_pattern(&bytes)
+}
+
+fn has_mpeg_ts_sync_pattern(bytes: &[u8]) -> bool {
+    bytes.len() >= MPEG_TS_PROBE_BYTES
+        && (0..MPEG_TS_PROBE_PACKETS)
+            .all(|packet| bytes[packet * MPEG_TS_PACKET_SIZE] == MPEG_TS_SYNC_BYTE)
+}
+
 fn is_hidden_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -178,6 +216,18 @@ mod tests {
 
     fn touch(path: &Path) {
         fs::write(path, b"not actually decoded").unwrap();
+    }
+
+    fn write_typescript(path: &Path) {
+        fs::write(path, "export const value = 42;\n".repeat(40)).unwrap();
+    }
+
+    fn write_mpeg_ts(path: &Path) {
+        let mut bytes = vec![0; MPEG_TS_PROBE_BYTES];
+        for offset in (0..bytes.len()).step_by(MPEG_TS_PACKET_SIZE) {
+            bytes[offset] = MPEG_TS_SYNC_BYTE;
+        }
+        fs::write(path, bytes).unwrap();
     }
 
     #[test]
@@ -257,6 +307,27 @@ mod tests {
     }
 
     #[test]
+    fn scan_directory_skips_typescript_files_but_accepts_mpeg_ts() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("code.ts");
+        let video = temp.path().join("clip.ts");
+        write_typescript(&source);
+        write_mpeg_ts(&video);
+
+        let entries = scan_directory(ScanOptions {
+            root: temp.path().to_path_buf(),
+            recursive: false,
+            include_hidden: false,
+            extensions: vec!["ts".to_owned()],
+        })
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, video);
+        assert!(entries[0].media_kind.is_video());
+    }
+
+    #[test]
     fn explicit_extensions_still_require_known_media_kind() {
         let temp = tempdir().unwrap();
         touch(&temp.path().join("unknown.custom"));
@@ -316,5 +387,20 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, image);
+    }
+
+    #[test]
+    fn scan_files_skips_typescript_files_but_accepts_mpeg_ts() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("code.ts");
+        let video = temp.path().join("clip.ts");
+        write_typescript(&source);
+        write_mpeg_ts(&video);
+
+        let entries = scan_files(&[source, video.clone()], &["ts".to_owned()]).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, video);
+        assert!(entries[0].media_kind.is_video());
     }
 }
