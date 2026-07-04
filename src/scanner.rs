@@ -174,7 +174,7 @@ fn extension_set(extensions: &[String]) -> HashSet<String> {
         .collect()
 }
 
-fn looks_like_plain_mpeg_ts(path: &Path) -> bool {
+pub(crate) fn looks_like_plain_mpeg_ts(path: &Path) -> bool {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) => {

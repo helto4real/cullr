@@ -93,6 +93,7 @@ Multiple explicit files still open as the focused grid review set.
 | `j` / `k` | Move down or up in the browser pane. |
 | `ctrl+d` / `ctrl+u` | Move half a page down or up in the browser pane. |
 | `l` / `h` | Enter the selected browser folder or go to its parent. |
+| `enter` | Open the selected browser folder, or focus the preview for a file. |
 | `.` | Show or hide hidden files and folders. |
 | `home` / `end` | Jump to the first or last file. |
 | `space` | Play or pause the current video. |
