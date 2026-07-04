@@ -3,9 +3,11 @@
 //! routing; everything browser-specific that doesn't need `GuiApp` lives here.
 
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result};
@@ -13,7 +15,10 @@ use eframe::egui;
 
 use crate::{
     scanner,
-    state::{AppState, BrowserEntry, BrowserEntryKind, BrowserPaneFocus, BrowserState, MediaKind, ViewMode},
+    state::{
+        AppState, BrowserEntry, BrowserEntryKind, BrowserPaneFocus, BrowserState, MediaKind,
+        SortMode, ViewMode,
+    },
 };
 
 pub(crate) const BROWSER_DEFAULT_WIDTH: f32 = 320.0;
@@ -23,11 +28,34 @@ impl BrowserState {
     pub(crate) fn for_directory(
         listed_directory: PathBuf,
         preferred_selection: Option<PathBuf>,
-        mut remembered_selection: HashMap<PathBuf, PathBuf>,
+        remembered_selection: HashMap<PathBuf, PathBuf>,
         include_hidden: bool,
         extensions: &[String],
     ) -> Result<Self> {
-        let entries = read_browser_entries(&listed_directory, include_hidden, extensions)?;
+        Self::for_directory_with_sort(
+            listed_directory,
+            preferred_selection,
+            remembered_selection,
+            include_hidden,
+            extensions,
+            SortMode::NameAsc,
+        )
+    }
+
+    pub(crate) fn for_directory_with_sort(
+        listed_directory: PathBuf,
+        preferred_selection: Option<PathBuf>,
+        mut remembered_selection: HashMap<PathBuf, PathBuf>,
+        include_hidden: bool,
+        extensions: &[String],
+        sort_mode: SortMode,
+    ) -> Result<Self> {
+        let entries = read_browser_entries_with_sort(
+            &listed_directory,
+            include_hidden,
+            extensions,
+            sort_mode,
+        )?;
         let remembered = remembered_selection.get(&listed_directory).cloned();
         let selected_index = preferred_browser_index(
             &entries,
@@ -42,6 +70,7 @@ impl BrowserState {
             entries,
             selected_index,
             focus: BrowserPaneFocus::Browser,
+            sort_mode,
             remembered_selection,
             scroll_to_selection: true,
         })
@@ -79,6 +108,16 @@ impl BrowserState {
                 .insert(self.listed_directory.clone(), path);
         }
     }
+
+    pub(crate) fn set_sort_mode_preserving_selection(&mut self, sort_mode: SortMode) {
+        let previous = self.selected_path();
+        self.sort_mode = sort_mode;
+        sort_browser_entries(&mut self.entries, sort_mode);
+        self.selected_index =
+            preferred_browser_index(&self.entries, previous.as_ref(), self.selected_index);
+        self.scroll_to_selection = true;
+        self.remember_current_selection();
+    }
 }
 
 pub(crate) fn listed_directory_for_target(target: &Path) -> PathBuf {
@@ -88,14 +127,16 @@ pub(crate) fn listed_directory_for_target(target: &Path) -> PathBuf {
         .unwrap_or_else(|| target.to_path_buf())
 }
 
-pub(crate) fn read_browser_entries(
+pub(crate) fn read_browser_entries_with_sort(
     directory: &Path,
     include_hidden: bool,
     extensions: &[String],
+    sort_mode: SortMode,
 ) -> Result<Vec<BrowserEntry>> {
     let mut entries = Vec::new();
-    for dir_entry in fs::read_dir(directory)
+    for (discovered_order, dir_entry) in fs::read_dir(directory)
         .with_context(|| format!("failed to read {}", directory.display()))?
+        .enumerate()
     {
         let dir_entry = match dir_entry {
             Ok(value) => value,
@@ -134,9 +175,12 @@ pub(crate) fn read_browser_entries(
             path,
             display_name,
             kind,
+            created: metadata.created().ok(),
+            modified: metadata.modified().ok(),
+            discovered_order,
         });
     }
-    sort_browser_entries(&mut entries);
+    sort_browser_entries(&mut entries, sort_mode);
     Ok(entries)
 }
 
@@ -160,25 +204,54 @@ fn browser_file_kind(path: &Path, extensions: &[String]) -> BrowserEntryKind {
     }
 }
 
-fn sort_browser_entries(entries: &mut [BrowserEntry]) {
+fn sort_browser_entries(entries: &mut [BrowserEntry], sort_mode: SortMode) {
     entries.sort_by(|a, b| {
         browser_kind_rank(&a.kind)
             .cmp(&browser_kind_rank(&b.kind))
-            .then_with(|| {
-                a.display_name
-                    .to_ascii_lowercase()
-                    .cmp(&b.display_name.to_ascii_lowercase())
-            })
-            .then_with(|| a.display_name.cmp(&b.display_name))
+            .then_with(|| compare_browser_entries(a, b, sort_mode))
     });
 }
 
 fn browser_kind_rank(kind: &BrowserEntryKind) -> u8 {
     match kind {
         BrowserEntryKind::Directory => 0,
-        BrowserEntryKind::Media(_) => 1,
-        BrowserEntryKind::UnsupportedFile => 2,
+        BrowserEntryKind::Media(_) | BrowserEntryKind::UnsupportedFile => 1,
     }
+}
+
+fn compare_browser_entries(a: &BrowserEntry, b: &BrowserEntry, sort_mode: SortMode) -> Ordering {
+    match sort_mode {
+        SortMode::Newest | SortMode::Oldest => compare_browser_time(a, b, sort_mode),
+        SortMode::NameDesc => compare_browser_name(a, b).reverse(),
+        SortMode::Discovered => a.discovered_order.cmp(&b.discovered_order),
+        SortMode::NameAsc => compare_browser_name(a, b),
+    }
+}
+
+fn compare_browser_name(a: &BrowserEntry, b: &BrowserEntry) -> Ordering {
+    a.display_name
+        .to_ascii_lowercase()
+        .cmp(&b.display_name.to_ascii_lowercase())
+        .then_with(|| a.display_name.cmp(&b.display_name))
+        .then_with(|| a.discovered_order.cmp(&b.discovered_order))
+}
+
+fn compare_browser_time(a: &BrowserEntry, b: &BrowserEntry, sort_mode: SortMode) -> Ordering {
+    let ordering = match (browser_entry_time(a), browser_entry_time(b)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => a.discovered_order.cmp(&b.discovered_order),
+    };
+    match sort_mode {
+        SortMode::Newest => ordering.reverse().then_with(|| compare_browser_name(a, b)),
+        SortMode::Oldest => ordering.then_with(|| compare_browser_name(a, b)),
+        _ => Ordering::Equal,
+    }
+}
+
+fn browser_entry_time(entry: &BrowserEntry) -> Option<SystemTime> {
+    entry.modified.or(entry.created)
 }
 
 pub(crate) fn preferred_browser_index(
@@ -332,6 +405,8 @@ pub(crate) fn draw_unsupported_file_message(ui: &mut egui::Ui, target: &Path) {
 mod tests {
     use super::*;
 
+    use std::time::{Duration, SystemTime};
+
     use tempfile::tempdir;
 
     fn touch(path: &Path) {
@@ -347,6 +422,22 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn entry(
+        name: &str,
+        kind: BrowserEntryKind,
+        discovered_order: usize,
+        modified_secs: Option<u64>,
+    ) -> BrowserEntry {
+        BrowserEntry {
+            path: PathBuf::from(name),
+            display_name: name.to_owned(),
+            kind,
+            created: None,
+            modified: modified_secs.map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+            discovered_order,
+        }
+    }
+
     #[test]
     fn browser_listing_sorts_folders_media_and_unsupported_files() {
         let temp = tempdir().unwrap();
@@ -355,9 +446,13 @@ mod tests {
         touch(&temp.path().join("clip.mp4"));
         touch(&temp.path().join("note.txt"));
 
-        let entries =
-            read_browser_entries(temp.path(), false, &["jpg".to_owned(), "mp4".to_owned()])
-                .unwrap();
+        let entries = read_browser_entries_with_sort(
+            temp.path(),
+            false,
+            &["jpg".to_owned(), "mp4".to_owned()],
+            SortMode::NameAsc,
+        )
+        .unwrap();
 
         assert_eq!(
             entries
@@ -372,13 +467,88 @@ mod tests {
     }
 
     #[test]
+    fn browser_name_sort_keeps_directories_first_and_cycles_direction() {
+        let image = MediaKind::from_extension(Some("jpg")).unwrap();
+        let mut entries = vec![
+            entry("b.jpg", BrowserEntryKind::Media(image.clone()), 0, None),
+            entry("z_dir", BrowserEntryKind::Directory, 1, None),
+            entry("a.txt", BrowserEntryKind::UnsupportedFile, 2, None),
+            entry("a_dir", BrowserEntryKind::Directory, 3, None),
+        ];
+
+        sort_browser_entries(&mut entries, SortMode::NameAsc);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a_dir", "z_dir", "a.txt", "b.jpg"]
+        );
+
+        sort_browser_entries(&mut entries, SortMode::NameDesc);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z_dir", "a_dir", "b.jpg", "a.txt"]
+        );
+    }
+
+    #[test]
+    fn browser_time_sort_keeps_directories_first_and_cycles_direction() {
+        let image = MediaKind::from_extension(Some("jpg")).unwrap();
+        let mut entries = vec![
+            entry(
+                "old.jpg",
+                BrowserEntryKind::Media(image.clone()),
+                0,
+                Some(10),
+            ),
+            entry("new_dir", BrowserEntryKind::Directory, 1, Some(40)),
+            entry("new.txt", BrowserEntryKind::UnsupportedFile, 2, Some(30)),
+            entry("old_dir", BrowserEntryKind::Directory, 3, Some(20)),
+        ];
+
+        sort_browser_entries(&mut entries, SortMode::Newest);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new_dir", "old_dir", "new.txt", "old.jpg"]
+        );
+
+        sort_browser_entries(&mut entries, SortMode::Oldest);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old_dir", "new_dir", "old.jpg", "new.txt"]
+        );
+    }
+
+    #[test]
     fn browser_listing_respects_hidden_toggle() {
         let temp = tempdir().unwrap();
         touch(&temp.path().join(".hidden.jpg"));
         touch(&temp.path().join("visible.jpg"));
 
-        let hidden_off = read_browser_entries(temp.path(), false, &["jpg".to_owned()]).unwrap();
-        let hidden_on = read_browser_entries(temp.path(), true, &["jpg".to_owned()]).unwrap();
+        let hidden_off = read_browser_entries_with_sort(
+            temp.path(),
+            false,
+            &["jpg".to_owned()],
+            SortMode::NameAsc,
+        )
+        .unwrap();
+        let hidden_on = read_browser_entries_with_sort(
+            temp.path(),
+            true,
+            &["jpg".to_owned()],
+            SortMode::NameAsc,
+        )
+        .unwrap();
 
         assert_eq!(hidden_off.len(), 1);
         assert_eq!(hidden_off[0].display_name, "visible.jpg");
@@ -397,7 +567,13 @@ mod tests {
         fs::write(&source, "export const value = 42;\n".repeat(40)).unwrap();
         write_mpeg_ts(&video);
 
-        let entries = read_browser_entries(temp.path(), false, &["ts".to_owned()]).unwrap();
+        let entries = read_browser_entries_with_sort(
+            temp.path(),
+            false,
+            &["ts".to_owned()],
+            SortMode::NameAsc,
+        )
+        .unwrap();
 
         let kind_of = |name: &str| {
             entries
@@ -438,5 +614,30 @@ mod tests {
             browser.selected_path(),
             Some(second.canonicalize().unwrap())
         );
+    }
+
+    #[test]
+    fn browser_sort_preserves_selected_path() {
+        let image = MediaKind::from_extension(Some("jpg")).unwrap();
+        let selected = PathBuf::from("b.jpg");
+        let mut browser = BrowserState {
+            listed_directory: PathBuf::from("."),
+            entries: vec![
+                entry("a.jpg", BrowserEntryKind::Media(image.clone()), 0, None),
+                entry("b.jpg", BrowserEntryKind::Media(image), 1, None),
+            ],
+            selected_index: 1,
+            focus: BrowserPaneFocus::Browser,
+            sort_mode: SortMode::NameAsc,
+            remembered_selection: HashMap::new(),
+            scroll_to_selection: false,
+        };
+
+        browser.set_sort_mode_preserving_selection(SortMode::NameDesc);
+
+        assert_eq!(browser.sort_mode, SortMode::NameDesc);
+        assert_eq!(browser.selected_path(), Some(selected));
+        assert_eq!(browser.selected_index, 0);
+        assert!(browser.scroll_to_selection);
     }
 }

@@ -94,6 +94,7 @@ Multiple explicit files still open as the focused grid review set.
 | `ctrl+d` / `ctrl+u` | Move half a page down or up in the browser pane. |
 | `l` / `h` | Enter the selected browser folder or go to its parent. |
 | `enter` | Open the selected browser folder, or focus the preview for a file. |
+| `t` / `n` | Cycle time or name sorting in the browser pane. |
 | `.` | Show or hide hidden files and folders. |
 | `home` / `end` | Jump to the first or last file. |
 | `space` | Play or pause the current video. |
@@ -109,8 +110,8 @@ Multiple explicit files still open as the focused grid review set.
 | `m` | Mute or unmute video audio. Videos start muted. |
 | `a` | Toggle automatically advancing to the next video when playback ends. |
 | `b` | Show or hide gallery media-type badges. |
-| `t` | Cycle time sorting. |
-| `n` | Cycle name sorting. |
+| `t` | Cycle time sorting in the focused pane. |
+| `n` | Cycle name sorting in the focused pane. |
 | `r` | Toggle recursive scanning and rescan. |
 | `shift+R` | Rescan the current directory. |
 | `i` | Toggle the info overlay. |

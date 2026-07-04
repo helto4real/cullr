@@ -24,7 +24,7 @@ use crate::{
     browser::{
         BROWSER_DEFAULT_WIDTH, BROWSER_ROW_HEIGHT, browser_move_index, draw_browser_icon,
         draw_unsupported_file_message, left_elided_text, listed_directory_for_target,
-        preferred_browser_index, read_browser_entries,
+        preferred_browser_index, read_browser_entries_with_sort,
     },
     cli::{Cli, CliViewMode},
     decode::decode_rgba_capped,
@@ -33,7 +33,7 @@ use crate::{
     sorter,
     state::{
         AppState, BrowserEntry, BrowserEntryKind, BrowserPaneFocus, BrowserState, MediaEntry,
-        MediaKind, MediaMode, ViewMode, ZoomMode,
+        MediaKind, MediaMode, SortMode, ViewMode, ZoomMode,
     },
     video,
 };
@@ -330,10 +330,11 @@ impl GuiApp {
             .remembered_selection
             .get(&browser.listed_directory)
             .cloned();
-        let entries = read_browser_entries(
+        let entries = read_browser_entries_with_sort(
             &browser.listed_directory,
             self.state.include_hidden,
             &self.state.extensions,
+            browser.sort_mode,
         )?;
         browser.entries = entries;
         browser.selected_index = preferred_browser_index(
@@ -400,6 +401,14 @@ impl GuiApp {
         self.select_browser_index(target);
     }
 
+    fn resort_browser(&mut self, sort_mode: SortMode) {
+        let Some(browser) = self.state.browser.as_mut() else {
+            return;
+        };
+        browser.set_sort_mode_preserving_selection(sort_mode);
+        self.status = format!("browser sort: {:?}", sort_mode);
+    }
+
     fn enter_selected_browser_directory(&mut self) {
         let Some(entry) = self.browser_selected_entry_cloned() else {
             return;
@@ -438,18 +447,17 @@ impl GuiApp {
     }
 
     fn open_browser_directory(&mut self, directory: PathBuf, preferred_selection: Option<PathBuf>) {
-        let remembered = self
-            .state
-            .browser
-            .as_ref()
-            .map(|browser| browser.remembered_selection.clone())
-            .unwrap_or_default();
-        match BrowserState::for_directory(
+        let (remembered, sort_mode) = match self.state.browser.as_ref() {
+            Some(browser) => (browser.remembered_selection.clone(), browser.sort_mode),
+            None => (HashMap::new(), SortMode::NameAsc),
+        };
+        match BrowserState::for_directory_with_sort(
             directory,
             preferred_selection,
             remembered,
             self.state.include_hidden,
             &self.state.extensions,
+            sort_mode,
         ) {
             Ok(browser) => {
                 self.state.browser = Some(browser);
@@ -1243,6 +1251,16 @@ impl GuiApp {
                 {
                     self.select_browser_index(browser.entries.len().saturating_sub(1));
                 }
+                if i.key_pressed(Key::T)
+                    && let Some(browser) = self.state.browser.as_ref()
+                {
+                    self.resort_browser(sorter::next_time_sort(browser.sort_mode));
+                }
+                if i.key_pressed(Key::N)
+                    && let Some(browser) = self.state.browser.as_ref()
+                {
+                    self.resort_browser(sorter::next_name_sort(browser.sort_mode));
+                }
             } else if right_pane_active {
                 if in_grid {
                     // Vim-style spatial navigation in the library grid:
@@ -1818,6 +1836,7 @@ browser mode:
   l / h           enter folder / parent folder
   enter           open folder / focus preview
   .               show / hide hidden files
+  t / n           browser time / name sort
 home / end      first / last
 g               toggle grid
 space           play / pause videos
@@ -1832,7 +1851,7 @@ f               toggle fullscreen window
 m               mute / unmute video audio
 a               toggle auto-next video advance
 b               show / hide media badges
-t / n           cycle time / name sort
+t / n           cycle right-pane time / name sort
 r               toggle recursive scan
 shift+R         rescan directory
 i               info overlay
@@ -2050,10 +2069,8 @@ fn draw_pane_focus_line(ui: &mut egui::Ui, focused: bool) {
     } else {
         ui.visuals().widgets.noninteractive.bg_stroke.color
     };
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 2.0),
-        egui::Sense::hover(),
-    );
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 2.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 1.0, color);
     ui.add_space(2.0);
 }
@@ -2807,6 +2824,65 @@ mod tests {
 
         assert!(app.browser_is_focused());
         assert!(app.current_is_video());
+    }
+
+    #[test]
+    fn browser_focused_name_sort_changes_browser_not_right_pane() {
+        let temp = tempdir().unwrap();
+        touch(&temp.path().join("a.jpg"));
+        touch(&temp.path().join("b.jpg"));
+        let mut app = app_for_browser_tests(temp.path());
+        app.state.browser = Some(
+            BrowserState::for_directory(
+                temp.path().canonicalize().unwrap(),
+                None,
+                HashMap::new(),
+                false,
+                &["jpg".to_owned()],
+            )
+            .unwrap(),
+        );
+
+        let ctx = egui::Context::default();
+        run_frame(&mut app, &ctx, vec![key_press(egui::Key::N)]);
+
+        let browser = app.state.browser.as_ref().unwrap();
+        assert_eq!(browser.sort_mode, SortMode::NameDesc);
+        assert_eq!(app.state.sort_mode, SortMode::Discovered);
+        assert_eq!(
+            browser
+                .entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b.jpg", "a.jpg"]
+        );
+    }
+
+    #[test]
+    fn right_pane_focused_name_sort_changes_media_not_browser() {
+        let temp = tempdir().unwrap();
+        touch(&temp.path().join("a.jpg"));
+        touch(&temp.path().join("b.jpg"));
+        let mut app = app_for_browser_tests(temp.path());
+        app.state.browser = Some(
+            BrowserState::for_directory(
+                temp.path().canonicalize().unwrap(),
+                None,
+                HashMap::new(),
+                false,
+                &["jpg".to_owned()],
+            )
+            .unwrap(),
+        );
+        app.state.browser.as_mut().unwrap().focus = BrowserPaneFocus::Preview;
+
+        let ctx = egui::Context::default();
+        run_frame(&mut app, &ctx, vec![key_press(egui::Key::N)]);
+
+        let browser = app.state.browser.as_ref().unwrap();
+        assert_eq!(browser.sort_mode, SortMode::NameAsc);
+        assert_eq!(app.state.sort_mode, SortMode::NameAsc);
     }
 
     #[test]

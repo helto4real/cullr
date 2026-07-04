@@ -88,6 +88,9 @@ pub struct BrowserEntry {
     pub path: PathBuf,
     pub display_name: String,
     pub kind: BrowserEntryKind,
+    pub created: Option<SystemTime>,
+    pub modified: Option<SystemTime>,
+    pub discovered_order: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +99,7 @@ pub struct BrowserState {
     pub entries: Vec<BrowserEntry>,
     pub selected_index: usize,
     pub focus: BrowserPaneFocus,
+    pub sort_mode: SortMode,
     pub remembered_selection: HashMap<PathBuf, PathBuf>,
     pub scroll_to_selection: bool,
 }
