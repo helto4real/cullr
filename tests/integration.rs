@@ -85,7 +85,7 @@ fn real_delete_removes_queued_video_file() {
 fn ffmpeg_video_decode_reads_first_frame_when_available() {
     let temp = tempdir().unwrap();
     let video_path = temp.path().join("tiny.mp4");
-    let Ok(status) = Command::new("ffmpeg")
+    let status = Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
@@ -102,16 +102,46 @@ fn ffmpeg_video_decode_reads_first_frame_when_available() {
         ])
         .arg(&video_path)
         .status()
-    else {
-        return;
-    };
-    if !status.success() {
-        return;
-    }
+        .expect("FFmpeg is required for the video integration tests");
+    assert!(status.success(), "FFmpeg failed to generate the test video");
 
     let rgba = decode_first_frame_rgba(&video_path, 32).unwrap();
 
     assert_eq!((rgba.width(), rgba.height()), (16, 8));
+}
+
+#[test]
+fn ffmpeg_video_decode_applies_sample_aspect_ratio() {
+    let temp = tempdir().unwrap();
+    let video_path = temp.path().join("anamorphic.mp4");
+    let generate = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=16x8:d=0.2",
+            "-vf",
+            "setsar=2/1",
+            "-frames:v",
+            "2",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+        ])
+        .arg(&video_path)
+        .status()
+        .expect("FFmpeg is required for the video integration tests");
+    assert!(
+        generate.success(),
+        "FFmpeg failed to generate the test video"
+    );
+
+    let rgba = decode_first_frame_rgba(&video_path, 32).unwrap();
+
+    assert_eq!((rgba.width(), rgba.height()), (32, 8));
 }
 
 fn state_for(path: &Path) -> AppState {

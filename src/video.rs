@@ -12,7 +12,9 @@ use std::{
 
 use anyhow::{Context as AnyhowContext, Result, anyhow};
 use ffmpeg::{
-    ChannelLayout, Rational, codec, format, frame, media,
+    ChannelLayout, Rational, codec,
+    codec::packet::side_data::Type as PacketSideDataType,
+    format, frame, media,
     software::{
         resampling::context::Context as ResampleContext,
         scaling::{context::Context as ScaleContext, flag::Flags as ScaleFlags},
@@ -27,6 +29,7 @@ use image::RgbaImage;
 use rodio::buffer::SamplesBuffer;
 
 static NEXT_PLAYBACK_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_RGBA_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 pub struct PlaybackEvent {
     pub playback_id: u64,
@@ -88,6 +91,26 @@ struct VideoSetup {
     frame_duration: Duration,
     decoder: codec::decoder::Video,
     scaler: ScaleContext,
+    rotation: VideoRotation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoRotation {
+    None,
+    Clockwise90,
+    HalfTurn,
+    CounterClockwise90,
+}
+
+struct PlaybackTimeline {
+    start_at: Duration,
+    playback_start: Instant,
+    paused_total: Duration,
+    first_pts: Option<Duration>,
+    fallback_index: u64,
+    sent_frames: u64,
+    frame_duration: Duration,
+    duration: Option<Duration>,
 }
 
 pub fn decode_first_frame_rgba(path: &Path, cap: u32) -> Result<RgbaImage> {
@@ -181,11 +204,16 @@ fn run_video_playback(
     setup.decoder.flush();
     spawn_audio_playback(path.clone(), controls.clone(), start_at);
 
-    let playback_start = Instant::now();
-    let mut paused_total = Duration::ZERO;
-    let mut first_pts = None;
-    let mut fallback_index = 0u64;
-    let mut sent_frames = 0u64;
+    let mut timeline = PlaybackTimeline {
+        start_at,
+        playback_start: Instant::now(),
+        paused_total: Duration::ZERO,
+        first_pts: None,
+        fallback_index: 0,
+        sent_frames: 0,
+        frame_duration: setup.frame_duration,
+        duration,
+    };
 
     for (stream, packet) in input.packets() {
         if controls.stop.load(Ordering::SeqCst) {
@@ -202,14 +230,7 @@ fn run_video_playback(
                 frame,
                 &controls,
                 &frame_tx,
-                start_at,
-                playback_start,
-                &mut paused_total,
-                &mut first_pts,
-                &mut fallback_index,
-                &mut sent_frames,
-                setup.frame_duration,
-                duration,
+                &mut timeline,
             ) {
                 return Ok(());
             }
@@ -224,14 +245,7 @@ fn run_video_playback(
             frame,
             &controls,
             &frame_tx,
-            start_at,
-            playback_start,
-            &mut paused_total,
-            &mut first_pts,
-            &mut fallback_index,
-            &mut sent_frames,
-            setup.frame_duration,
-            duration,
+            &mut timeline,
         ) {
             return Ok(());
         }
@@ -256,44 +270,46 @@ fn send_playback_frame(
     frame: VideoFrame,
     controls: &Arc<PlaybackControls>,
     frame_tx: &flume::Sender<PlaybackEvent>,
-    start_at: Duration,
-    playback_start: Instant,
-    paused_total: &mut Duration,
-    first_pts: &mut Option<Duration>,
-    fallback_index: &mut u64,
-    sent_frames: &mut u64,
-    frame_duration: Duration,
-    duration: Option<Duration>,
+    timeline: &mut PlaybackTimeline,
 ) -> bool {
-    let fallback_time = start_at + mul_duration(frame_duration, *fallback_index);
-    *fallback_index += 1;
+    let fallback_time =
+        timeline.start_at + mul_duration(timeline.frame_duration, timeline.fallback_index);
+    timeline.fallback_index += 1;
     let pts = frame.timestamp.unwrap_or(fallback_time);
-    if should_discard_seek_preroll(frame.timestamp, start_at) {
+    if should_discard_seek_preroll(frame.timestamp, timeline.start_at) {
         return true;
     }
-    let base = *first_pts.get_or_insert(pts);
+    let base = *timeline.first_pts.get_or_insert(pts);
     let relative = pts.saturating_sub(base);
 
-    let show_initial_paused_frame = *sent_frames == 0 && controls.paused.load(Ordering::SeqCst);
-    if !show_initial_paused_frame && !wait_until(playback_start, relative, controls, paused_total) {
+    let show_initial_paused_frame =
+        timeline.sent_frames == 0 && controls.paused.load(Ordering::SeqCst);
+    if !show_initial_paused_frame
+        && !wait_until(
+            timeline.playback_start,
+            relative,
+            controls,
+            &mut timeline.paused_total,
+        )
+    {
         return false;
     }
 
-    let sent = frame_tx
-        .send(PlaybackEvent {
-            playback_id,
-            path: path.to_path_buf(),
-            frame: Some(frame.image),
-            position: Some(pts),
-            duration,
-            ended: false,
-            error: None,
-        })
-        .is_ok();
-    if sent {
-        *sent_frames += 1;
+    let event = PlaybackEvent {
+        playback_id,
+        path: path.to_path_buf(),
+        frame: Some(frame.image),
+        position: Some(pts),
+        duration: timeline.duration,
+        ended: false,
+        error: None,
+    };
+    match frame_tx.try_send(event) {
+        Ok(()) => timeline.sent_frames += 1,
+        Err(flume::TrySendError::Full(_)) => {}
+        Err(flume::TrySendError::Disconnected(_)) => return false,
     }
-    sent
+    true
 }
 
 fn wait_until(
@@ -338,9 +354,16 @@ fn open_video_setup(input: &mut format::context::Input, cap: u32) -> Result<Vide
         .filter(|rate| *rate > 0.0)
         .map(|rate| Duration::from_secs_f64(1.0 / rate))
         .unwrap_or_else(|| Duration::from_secs_f64(1.0 / 30.0));
+    let rotation = stream_rotation(&stream);
     let decoder_context = codec::context::Context::from_parameters(stream.parameters())?;
     let decoder = decoder_context.decoder().video()?;
-    let (width, height) = capped_dimensions(decoder.width(), decoder.height(), cap);
+    let (width, height) = capped_dimensions_with_aspect(
+        decoder.width(),
+        decoder.height(),
+        cap,
+        decoder.aspect_ratio(),
+    );
+    checked_rgba_buffer_len(width as usize, height as usize)?;
     let scaler = ScaleContext::get(
         decoder.format(),
         decoder.width(),
@@ -357,6 +380,7 @@ fn open_video_setup(input: &mut format::context::Input, cap: u32) -> Result<Vide
         frame_duration,
         decoder,
         scaler,
+        rotation,
     })
 }
 
@@ -375,11 +399,49 @@ fn receive_scaled_video_frame(setup: &mut VideoSetup) -> Result<Option<VideoFram
             let mut rgba_frame = frame::Video::empty();
             setup.scaler.run(&decoded, &mut rgba_frame)?;
             Ok(Some(VideoFrame {
-                image: rgba_image_from_frame(&rgba_frame)?,
+                image: apply_video_rotation(rgba_image_from_frame(&rgba_frame)?, setup.rotation),
                 timestamp,
             }))
         }
-        Err(_) => Ok(None),
+        Err(error) if decoder_needs_more_input(error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn stream_rotation(stream: &format::stream::Stream<'_>) -> VideoRotation {
+    let Some(side_data) = stream
+        .side_data()
+        .find(|side_data| side_data.kind() == PacketSideDataType::DisplayMatrix)
+    else {
+        return VideoRotation::None;
+    };
+    let data = side_data.data();
+    if data.len() < 9 * std::mem::size_of::<i32>() {
+        return VideoRotation::None;
+    }
+    let counter_clockwise_degrees =
+        unsafe { ffmpeg::ffi::av_display_rotation_get(data.as_ptr().cast::<i32>()) };
+    video_rotation_from_counter_clockwise_degrees(counter_clockwise_degrees)
+}
+
+fn video_rotation_from_counter_clockwise_degrees(degrees: f64) -> VideoRotation {
+    if !degrees.is_finite() {
+        return VideoRotation::None;
+    }
+    match (degrees.round() as i32).rem_euclid(360) {
+        45..=134 => VideoRotation::CounterClockwise90,
+        135..=224 => VideoRotation::HalfTurn,
+        225..=314 => VideoRotation::Clockwise90,
+        _ => VideoRotation::None,
+    }
+}
+
+fn apply_video_rotation(image: RgbaImage, rotation: VideoRotation) -> RgbaImage {
+    match rotation {
+        VideoRotation::None => image,
+        VideoRotation::Clockwise90 => image::imageops::rotate90(&image),
+        VideoRotation::HalfTurn => image::imageops::rotate180(&image),
+        VideoRotation::CounterClockwise90 => image::imageops::rotate270(&image),
     }
 }
 
@@ -391,7 +453,8 @@ fn rgba_image_from_frame(frame: &frame::Video) -> Result<RgbaImage> {
         .checked_mul(4)
         .ok_or_else(|| anyhow!("video frame row is too wide"))?;
     let data = frame.data(0);
-    let mut pixels = vec![0u8; row_len * height];
+    let buffer_len = checked_rgba_buffer_len(width, height)?;
+    let mut pixels = vec![0u8; buffer_len];
     for row in 0..height {
         let src_start = row * stride;
         let dst_start = row * row_len;
@@ -402,23 +465,58 @@ fn rgba_image_from_frame(frame: &frame::Video) -> Result<RgbaImage> {
         .ok_or_else(|| anyhow!("FFmpeg produced an unexpected RGBA buffer"))
 }
 
+fn checked_rgba_buffer_len(width: usize, height: usize) -> Result<usize> {
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|bytes| *bytes <= MAX_RGBA_FRAME_BYTES)
+        .ok_or_else(|| anyhow!("decoded video frame exceeds the 512 MiB safety limit"))
+}
+
+#[cfg(test)]
 fn capped_dimensions(width: u32, height: u32, cap: u32) -> (u32, u32) {
+    capped_dimensions_with_aspect(width, height, cap, Rational(1, 1))
+}
+
+fn capped_dimensions_with_aspect(
+    width: u32,
+    height: u32,
+    cap: u32,
+    sample_aspect_ratio: Rational,
+) -> (u32, u32) {
     let width = width.max(1);
     let height = height.max(1);
-    let long_edge = width.max(height);
-    if cap == u32::MAX || long_edge <= cap {
-        return (width, height);
-    }
-    let scale = cap as f64 / long_edge as f64;
+    let Rational(numerator, denominator) = sample_aspect_ratio;
+    let pixel_aspect = if numerator > 0 && denominator > 0 {
+        numerator as f64 / denominator as f64
+    } else {
+        1.0
+    };
+    let display_width = width as f64 * pixel_aspect;
+    let display_height = height as f64;
+    let scale = if cap == u32::MAX {
+        1.0
+    } else {
+        (cap as f64 / display_width.max(display_height)).min(1.0)
+    };
     (
-        ((width as f64 * scale).round() as u32).max(1),
-        ((height as f64 * scale).round() as u32).max(1),
+        ((display_width * scale).round() as u32).max(1),
+        ((display_height * scale).round() as u32).max(1),
     )
 }
 
 fn rational_to_f64(value: Rational) -> Option<f64> {
     let Rational(num, den) = value;
     (num > 0 && den > 0).then_some(num as f64 / den as f64)
+}
+
+fn decoder_needs_more_input(error: ffmpeg::Error) -> bool {
+    matches!(
+        error,
+        ffmpeg::Error::Other {
+            errno: ffmpeg::error::EAGAIN
+        } | ffmpeg::Error::Eof
+    )
 }
 
 fn timestamp_to_duration(value: i64, time_base: Rational) -> Option<Duration> {
@@ -499,6 +597,14 @@ fn run_audio_playback(
         dst_layout,
         dst_rate,
     )?;
+    let output = AudioOutput {
+        player: &player,
+        controls: &controls,
+        channels: dst_channels,
+        rate: dst_rate,
+        time_base,
+        start_at,
+    };
 
     for (stream, packet) in input.packets() {
         if controls.stop.load(Ordering::SeqCst) {
@@ -509,29 +615,11 @@ fn run_audio_playback(
             continue;
         }
         decoder.send_packet(&packet)?;
-        receive_and_append_audio(
-            &mut decoder,
-            &mut resampler,
-            &player,
-            &controls,
-            dst_channels,
-            dst_rate,
-            time_base,
-            start_at,
-        )?;
+        receive_and_append_audio(&mut decoder, &mut resampler, &output)?;
     }
 
     decoder.send_eof()?;
-    receive_and_append_audio(
-        &mut decoder,
-        &mut resampler,
-        &player,
-        &controls,
-        dst_channels,
-        dst_rate,
-        time_base,
-        start_at,
-    )?;
+    receive_and_append_audio(&mut decoder, &mut resampler, &output)?;
     while !controls.stop.load(Ordering::SeqCst) && !player.empty() {
         apply_audio_controls(&player, &controls);
         thread::sleep(Duration::from_millis(20));
@@ -540,29 +628,44 @@ fn run_audio_playback(
     Ok(())
 }
 
-fn receive_and_append_audio(
-    decoder: &mut codec::decoder::Audio,
-    resampler: &mut ResampleContext,
-    player: &rodio::Player,
-    controls: &Arc<PlaybackControls>,
+struct AudioOutput<'a> {
+    player: &'a rodio::Player,
+    controls: &'a Arc<PlaybackControls>,
     channels: u16,
     rate: u32,
     time_base: Rational,
     start_at: Duration,
+}
+
+fn receive_and_append_audio(
+    decoder: &mut codec::decoder::Audio,
+    resampler: &mut ResampleContext,
+    output: &AudioOutput<'_>,
 ) -> Result<()> {
     let mut decoded = frame::Audio::empty();
-    while decoder.receive_frame(&mut decoded).is_ok() {
+    loop {
+        match decoder.receive_frame(&mut decoded) {
+            Ok(()) => {}
+            Err(error) if decoder_needs_more_input(error) => break,
+            Err(error) => return Err(error.into()),
+        }
         let timestamp = decoded
             .timestamp()
-            .and_then(|value| timestamp_to_duration(value, time_base));
-        if should_discard_seek_preroll(timestamp, start_at) {
+            .and_then(|value| timestamp_to_duration(value, output.time_base));
+        if should_discard_seek_preroll(timestamp, output.start_at) {
             continue;
         }
-        let mut output = frame::Audio::empty();
-        resampler.run(&decoded, &mut output)?;
-        append_audio_frame(player, controls, &output, channels, rate)?;
-        while player.len() > 32 && !controls.stop.load(Ordering::SeqCst) {
-            apply_audio_controls(player, controls);
+        let mut audio_frame = frame::Audio::empty();
+        resampler.run(&decoded, &mut audio_frame)?;
+        append_audio_frame(
+            output.player,
+            output.controls,
+            &audio_frame,
+            output.channels,
+            output.rate,
+        )?;
+        while output.player.len() > 32 && !output.controls.stop.load(Ordering::SeqCst) {
+            apply_audio_controls(output.player, output.controls);
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -632,6 +735,59 @@ mod tests {
     fn caps_video_dimensions_on_long_edge() {
         assert_eq!(capped_dimensions(4000, 2000, 1000), (1000, 500));
         assert_eq!(capped_dimensions(320, 240, 1000), (320, 240));
+        assert!(checked_rgba_buffer_len(100_000, 100_000).is_err());
+    }
+
+    #[test]
+    fn applies_sample_aspect_ratio_before_capping() {
+        assert_eq!(
+            capped_dimensions_with_aspect(720, 576, u32::MAX, Rational(16, 15)),
+            (768, 576)
+        );
+        assert_eq!(
+            capped_dimensions_with_aspect(720, 576, 400, Rational(16, 15)),
+            (400, 300)
+        );
+    }
+
+    #[test]
+    fn display_matrix_degrees_map_to_image_rotations() {
+        assert_eq!(
+            video_rotation_from_counter_clockwise_degrees(90.0),
+            VideoRotation::CounterClockwise90
+        );
+        assert_eq!(
+            video_rotation_from_counter_clockwise_degrees(-90.0),
+            VideoRotation::Clockwise90
+        );
+        assert_eq!(
+            video_rotation_from_counter_clockwise_degrees(180.0),
+            VideoRotation::HalfTurn
+        );
+        let image = RgbaImage::new(4, 2);
+        assert_eq!(
+            apply_video_rotation(image, VideoRotation::Clockwise90).dimensions(),
+            (2, 4)
+        );
+        let mut clockwise_matrix = [0_i32; 9];
+        unsafe {
+            ffmpeg::ffi::av_display_rotation_set(clockwise_matrix.as_mut_ptr(), 90.0);
+        }
+        let detected_degrees =
+            unsafe { ffmpeg::ffi::av_display_rotation_get(clockwise_matrix.as_ptr()) };
+        assert_eq!(
+            video_rotation_from_counter_clockwise_degrees(detected_degrees),
+            VideoRotation::Clockwise90
+        );
+    }
+
+    #[test]
+    fn decoder_only_swallows_retry_and_eof_errors() {
+        assert!(decoder_needs_more_input(ffmpeg::Error::Other {
+            errno: ffmpeg::error::EAGAIN,
+        }));
+        assert!(decoder_needs_more_input(ffmpeg::Error::Eof));
+        assert!(!decoder_needs_more_input(ffmpeg::Error::InvalidData));
     }
 
     #[test]

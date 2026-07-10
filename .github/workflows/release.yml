@@ -205,7 +205,12 @@ jobs:
           install -m 644 packaging/linux/cullr.desktop "$appdir/usr/share/applications/cullr.desktop"
           install -m 644 packaging/linux/cullr.svg "$appdir/usr/share/icons/hicolor/scalable/apps/cullr.svg"
 
-          curl -L https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -o target/linuxdeploy-x86_64.AppImage
+          linuxdeploy_version="1-alpha-20251107-1"
+          linuxdeploy_sha256="c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"
+          curl --fail --location --retry 3 \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/${linuxdeploy_version}/linuxdeploy-x86_64.AppImage" \
+            --output target/linuxdeploy-x86_64.AppImage
+          echo "${linuxdeploy_sha256}  target/linuxdeploy-x86_64.AppImage" | sha256sum --check --strict
           chmod +x target/linuxdeploy-x86_64.AppImage
           APPIMAGE_EXTRACT_AND_RUN=1 target/linuxdeploy-x86_64.AppImage \
             --appdir "$appdir" \
@@ -337,6 +342,11 @@ jobs:
           "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKG_DEFAULT_TRIPLET=x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKGRS_DYNAMIC=0" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $ffmpegTools = Join-Path $vcpkgRoot "installed\x64-windows-static\tools\ffmpeg"
+          if (-not (Test-Path $ffmpegTools)) {
+            throw "Could not find FFmpeg command-line tools at $ffmpegTools"
+          }
+          $ffmpegTools | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Install cargo-wix
         run: cargo install --locked cargo-wix

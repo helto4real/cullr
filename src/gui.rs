@@ -8,8 +8,13 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -27,7 +32,7 @@ use crate::{
         preferred_browser_index, read_browser_entries_with_sort,
     },
     cli::{Cli, CliViewMode},
-    decode::decode_rgba_capped,
+    decode::{decode_rgba_capped, estimated_image_decode_bytes},
     delete, metadata,
     scanner::{ScanOptions, scan_directory, scan_files},
     sorter,
@@ -45,9 +50,15 @@ const FIT_CAP: u32 = 3840;
 const THUMB_CAP: u32 = 320;
 /// How many media files on each side of the current one to decode ahead in preview.
 const PREFETCH_RADIUS: usize = 4;
-/// Resident texture budgets (previews are large, thumbnails small).
-const PREVIEW_CACHE: usize = 32;
-const THUMB_CACHE: usize = 512;
+/// Resident texture budgets. Entry caps guard bookkeeping while byte caps bound
+/// the actual CPU/GPU footprint for unusually large media.
+const PREVIEW_CACHE_ENTRIES: usize = 64;
+const THUMB_CACHE_ENTRIES: usize = 1024;
+const PREVIEW_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const THUMB_CACHE_BYTES: usize = 192 * 1024 * 1024;
+const DECODE_QUEUE_CAPACITY: usize = 48;
+const DECODE_RESULT_CAPACITY: usize = 8;
+const DECODE_MEMORY_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Grid cell edge in points.
 const CELL: f32 = 168.0;
 /// Extra grid rows to decode above/below the viewport for smooth scrolling.
@@ -81,6 +92,7 @@ struct TexKey {
     path: PathBuf,
     variant: Variant,
     media_kind: MediaKind,
+    generation: u64,
 }
 
 struct DecodeRequest {
@@ -90,26 +102,131 @@ struct DecodeRequest {
 struct DecodeResult {
     key: TexKey,
     image: std::result::Result<image::RgbaImage, String>,
+    _memory_permit: Option<DecodeMemoryPermit>,
+}
+
+struct DecodeMemoryBudget {
+    capacity: usize,
+    available: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl DecodeMemoryBudget {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            available: Mutex::new(capacity),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        requested: usize,
+    ) -> std::result::Result<DecodeMemoryPermit, DecodeMemoryBudgetExceeded> {
+        if requested == 0 || requested > self.capacity {
+            return Err(DecodeMemoryBudgetExceeded {
+                requested,
+                capacity: self.capacity,
+            });
+        }
+        let bytes = requested;
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *available < bytes {
+            available = self
+                .ready
+                .wait(available)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *available -= bytes;
+        Ok(DecodeMemoryPermit {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("decode needs {requested} bytes but the shared budget is {capacity} bytes")]
+struct DecodeMemoryBudgetExceeded {
+    requested: usize,
+    capacity: usize,
+}
+
+struct DecodeMemoryPermit {
+    budget: Arc<DecodeMemoryBudget>,
+    bytes: usize,
+}
+
+impl Drop for DecodeMemoryPermit {
+    fn drop(&mut self) {
+        let mut available = self
+            .budget
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available = (*available)
+            .saturating_add(self.bytes)
+            .min(self.budget.capacity);
+        self.budget.ready.notify_all();
+    }
 }
 
 /// A small worker pool that turns paths into oriented RGBA buffers.
 struct DecodeService {
     job_tx: Sender<DecodeRequest>,
     result_rx: Receiver<DecodeResult>,
+    generation: Arc<AtomicU64>,
+    _memory_budget: Arc<DecodeMemoryBudget>,
 }
 
 impl DecodeService {
     fn new() -> Self {
-        let (job_tx, job_rx) = flume::unbounded::<DecodeRequest>();
-        let (result_tx, result_rx) = flume::unbounded::<DecodeResult>();
+        let (job_tx, job_rx) = flume::bounded::<DecodeRequest>(DECODE_QUEUE_CAPACITY);
+        let (result_tx, result_rx) = flume::bounded::<DecodeResult>(DECODE_RESULT_CAPACITY);
+        let generation = Arc::new(AtomicU64::new(0));
+        let memory_budget = DecodeMemoryBudget::new(DECODE_MEMORY_BUDGET_BYTES);
         let workers = thread::available_parallelism()
             .map(|count| count.get().clamp(2, 6))
             .unwrap_or(2);
         for _ in 0..workers {
             let job_rx = job_rx.clone();
             let result_tx = result_tx.clone();
+            let generation = generation.clone();
+            let memory_budget = Arc::clone(&memory_budget);
             thread::spawn(move || {
                 for job in job_rx.iter() {
+                    if job.key.generation != generation.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let reservation = match decode_memory_reservation(&job.key) {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            let _ = result_tx.send(DecodeResult {
+                                key: job.key,
+                                image: Err(error),
+                                _memory_permit: None,
+                            });
+                            continue;
+                        }
+                    };
+                    let memory_permit = match memory_budget.acquire(reservation) {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            let _ = result_tx.send(DecodeResult {
+                                key: job.key,
+                                image: Err(error.to_string()),
+                                _memory_permit: None,
+                            });
+                            continue;
+                        }
+                    };
+                    if job.key.generation != generation.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let image = match &job.key.media_kind {
                         MediaKind::Image(_) => {
                             decode_rgba_capped(&job.key.path, job.key.variant.cap())
@@ -119,20 +236,97 @@ impl DecodeService {
                         }
                     }
                     .map_err(|e| format!("{e:#}"));
+                    if job.key.generation != generation.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     tracing::debug!(path = %job.key.path.display(), ok = image.is_ok(), "decoded");
+                    let memory_permit = image.is_ok().then_some(memory_permit);
                     let _ = result_tx.send(DecodeResult {
                         key: job.key,
                         image,
+                        _memory_permit: memory_permit,
                     });
                 }
             });
         }
-        Self { job_tx, result_rx }
+        Self {
+            job_tx,
+            result_rx,
+            generation,
+            _memory_budget: memory_budget,
+        }
     }
 
-    fn request(&self, key: TexKey) {
-        let _ = self.job_tx.send(DecodeRequest { key });
+    fn request(&self, key: TexKey) -> bool {
+        self.job_tx.try_send(DecodeRequest { key }).is_ok()
     }
+
+    fn set_generation(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Relaxed);
+    }
+}
+
+fn decode_memory_reservation(key: &TexKey) -> std::result::Result<usize, String> {
+    match &key.media_kind {
+        MediaKind::Image(_) => estimated_image_decode_bytes(&key.path, key.variant.cap())
+            .map_err(|error| format!("{error:#}")),
+        // FFmpeg may retain a native-resolution source frame while producing
+        // the scaled RGBA frame, so video decode is serialized at full budget.
+        MediaKind::Video(_) => Ok(DECODE_MEMORY_BUDGET_BYTES),
+    }
+}
+
+struct TextureCache {
+    entries: LruCache<TexKey, egui::TextureHandle>,
+    resident_bytes: usize,
+    max_bytes: usize,
+}
+
+impl TextureCache {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(max_entries).expect("cache size is nonzero")),
+            resident_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn contains(&self, key: &TexKey) -> bool {
+        self.entries.contains(key)
+    }
+
+    fn get(&mut self, key: &TexKey) -> Option<&egui::TextureHandle> {
+        self.entries.get(key)
+    }
+
+    fn put(&mut self, key: TexKey, handle: egui::TextureHandle) {
+        self.resident_bytes = self
+            .resident_bytes
+            .saturating_add(texture_byte_len(&handle));
+        if let Some((_key, replaced)) = self.entries.push(key, handle) {
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(texture_byte_len(&replaced));
+        }
+        while self.resident_bytes > self.max_bytes && self.entries.len() > 1 {
+            let Some((_key, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(texture_byte_len(&evicted));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.resident_bytes = 0;
+    }
+}
+
+fn texture_byte_len(handle: &egui::TextureHandle) -> usize {
+    let [width, height] = handle.size();
+    width.saturating_mul(height).saturating_mul(4)
 }
 
 struct GuiApp {
@@ -140,13 +334,16 @@ struct GuiApp {
     decoder: DecodeService,
     video_tx: Sender<video::PlaybackEvent>,
     video_rx: Receiver<video::PlaybackEvent>,
-    previews: LruCache<TexKey, egui::TextureHandle>,
-    thumbs: LruCache<TexKey, egui::TextureHandle>,
+    previews: TextureCache,
+    thumbs: TextureCache,
     inflight: HashSet<TexKey>,
     failed: HashMap<TexKey, String>,
+    decode_generation: u64,
+    decode_retry_pending: bool,
     locale: Option<String>,
     dry_run: bool,
     status: String,
+    right_pane_error: Option<String>,
     grid_cols: usize,
     grid_rows: usize,
     browser_rows: usize,
@@ -186,7 +383,9 @@ impl GuiApp {
         auto_next: bool,
         empty_media_target: PathBuf,
     ) -> Self {
-        let (video_tx, video_rx) = flume::unbounded();
+        // At most one metadata event and one frame may be pending. Playback
+        // drops superseded frames instead of accumulating full RGBA buffers.
+        let (video_tx, video_rx) = flume::bounded(2);
         let status = if state.entries.is_empty() {
             empty_media_status(&empty_media_target)
         } else {
@@ -197,13 +396,16 @@ impl GuiApp {
             decoder: DecodeService::new(),
             video_tx,
             video_rx,
-            previews: LruCache::new(NonZeroUsize::new(PREVIEW_CACHE).unwrap()),
-            thumbs: LruCache::new(NonZeroUsize::new(THUMB_CACHE).unwrap()),
+            previews: TextureCache::new(PREVIEW_CACHE_ENTRIES, PREVIEW_CACHE_BYTES),
+            thumbs: TextureCache::new(THUMB_CACHE_ENTRIES, THUMB_CACHE_BYTES),
             inflight: HashSet::new(),
             failed: HashMap::new(),
+            decode_generation: 0,
+            decode_retry_pending: false,
             locale,
             dry_run,
             status,
+            right_pane_error: None,
             grid_cols: 1,
             grid_rows: 1,
             browser_rows: 1,
@@ -243,14 +445,32 @@ impl GuiApp {
         if cached || self.inflight.contains(&key) || self.failed.contains_key(&key) {
             return;
         }
-        self.inflight.insert(key.clone());
-        self.decoder.request(key);
+        if self.decoder.request(key.clone()) {
+            self.inflight.insert(key);
+        } else {
+            self.decode_retry_pending = true;
+        }
+    }
+
+    fn invalidate_decodes(&mut self) {
+        self.decode_generation = self.decode_generation.wrapping_add(1);
+        self.decoder.set_generation(self.decode_generation);
+        self.previews.clear();
+        self.thumbs.clear();
+        self.inflight.clear();
+        self.failed.clear();
     }
 
     /// Move the selection by `delta` entries, clamped to the list bounds.
     fn move_by(&mut self, delta: isize) {
         let len = self.state.entries.len();
         if len == 0 {
+            return;
+        }
+        if self.state.mode == ViewMode::DeleteQueueGrid {
+            let previous = self.state.current_index;
+            self.state.move_in_queue_by(delta);
+            self.finish_selection_change(previous);
             return;
         }
         let current = self.state.current_index as isize;
@@ -299,6 +519,7 @@ impl GuiApp {
     fn toggle_browser_view(&mut self) {
         if self.state.browser.is_some() {
             self.state.browser = None;
+            self.right_pane_error = None;
             self.pending_browser_apply = false;
             self.browser_apply_deadline = None;
             self.status = "browser closed".to_owned();
@@ -353,7 +574,7 @@ impl GuiApp {
         if self.state.browser.is_some() {
             match self.refresh_browser_listing_preserving_selection() {
                 Ok(()) => {
-                    self.apply_browser_selection();
+                    self.apply_browser_selection_with_force(true);
                     self.status = if hidden {
                         "hidden files shown".to_owned()
                     } else {
@@ -387,6 +608,7 @@ impl GuiApp {
         browser.scroll_to_selection = true;
         browser.remember_current_selection();
         if changed {
+            self.right_pane_error = None;
             // Defer the right-pane load; update() applies it once the
             // selection has rested for BROWSER_APPLY_DEBOUNCE_SECONDS.
             self.pending_browser_apply = true;
@@ -470,6 +692,10 @@ impl GuiApp {
     }
 
     fn apply_browser_selection(&mut self) {
+        self.apply_browser_selection_with_force(false);
+    }
+
+    fn apply_browser_selection_with_force(&mut self, force_reload: bool) {
         let Some(entry) = self.browser_selected_entry_cloned() else {
             if let Some(directory) = self
                 .state
@@ -487,10 +713,11 @@ impl GuiApp {
                 self.load_right_pane_directory(entry.path);
             }
             BrowserEntryKind::Media(_) => {
-                self.load_right_pane_file(entry.path);
+                self.load_right_pane_file(entry.path, force_reload);
             }
             BrowserEntryKind::UnsupportedFile => {
                 self.stop_active_video();
+                self.right_pane_error = None;
                 self.state.mode = ViewMode::Preview;
                 self.empty_media_target = entry.path.clone();
                 self.status = format!("unsupported file: {}", entry.display_name);
@@ -500,16 +727,11 @@ impl GuiApp {
 
     fn load_right_pane_directory(&mut self, directory: PathBuf) {
         self.stop_active_video();
-        self.failed.clear();
         let previous = if self.state.directory == directory {
             self.state.current_path()
         } else {
             None
         };
-        self.state.selected_files = None;
-        self.state.directory = directory.clone();
-        self.state.mode = ViewMode::Grid;
-        self.empty_media_target = directory.clone();
         match scan_directory(ScanOptions {
             root: directory.clone(),
             recursive: self.state.recursive,
@@ -517,8 +739,15 @@ impl GuiApp {
             extensions: self.state.extensions.clone(),
         }) {
             Ok(mut entries) => {
+                self.invalidate_decodes();
                 sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
+                self.state.delete_queue.clear();
+                self.state.selected_files = None;
+                self.state.directory = directory.clone();
+                self.state.mode = ViewMode::Grid;
+                self.empty_media_target = directory;
                 self.state.set_entries_preserving_current(entries, previous);
+                self.right_pane_error = None;
                 self.status = format!(
                     "scanned {} media files{}",
                     self.state.entries.len(),
@@ -531,12 +760,14 @@ impl GuiApp {
                 self.scroll_to_current = true;
             }
             Err(error) => {
+                self.right_pane_error =
+                    Some(format!("Failed to scan {}\n{error:#}", directory.display()));
                 self.status = format!("scan failed: {error}");
             }
         }
     }
 
-    fn load_right_pane_file(&mut self, path: PathBuf) {
+    fn load_right_pane_file(&mut self, path: PathBuf, force_reload: bool) {
         self.stop_active_video();
         let Some(directory) = path.parent().map(Path::to_path_buf) else {
             self.status = format!("file has no parent: {}", path.display());
@@ -544,7 +775,8 @@ impl GuiApp {
         };
         // Fast path: stepping between files of the already-scanned directory
         // only repositions the selection — no rescan.
-        if self.state.selected_files.is_none()
+        if !force_reload
+            && self.state.selected_files.is_none()
             && self.state.directory == directory
             && let Some(index) = self
                 .state
@@ -555,37 +787,43 @@ impl GuiApp {
             self.state.mode = ViewMode::Preview;
             self.empty_media_target = path.clone();
             self.state.current_index = index;
+            self.right_pane_error = None;
             self.status = format!("preview: {}", path.display());
             self.scroll_to_current = true;
             return;
         }
-        self.failed.clear();
-        self.state.selected_files = None;
-        self.state.directory = directory.clone();
-        self.state.mode = ViewMode::Preview;
-        self.empty_media_target = path.clone();
         match scan_directory(ScanOptions {
-            root: directory,
+            root: directory.clone(),
             recursive: self.state.recursive,
             include_hidden: self.state.include_hidden,
             extensions: self.state.extensions.clone(),
         }) {
             Ok(mut entries) => {
                 sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
+                let Some(index) = entries.iter().position(|entry| entry.path == path) else {
+                    self.right_pane_error = Some(format!(
+                        "Selected file is no longer available after rescanning {}",
+                        directory.display()
+                    ));
+                    self.status = format!("selected file disappeared: {}", path.display());
+                    return;
+                };
+                self.invalidate_decodes();
+                self.state.delete_queue.clear();
+                self.state.selected_files = None;
+                self.state.directory = directory;
+                self.state.mode = ViewMode::Preview;
+                self.empty_media_target = path.clone();
                 self.state
                     .set_entries_preserving_current(entries, Some(path.clone()));
-                if let Some(index) = self
-                    .state
-                    .entries
-                    .iter()
-                    .position(|entry| entry.path == path)
-                {
-                    self.state.current_index = index;
-                }
+                self.state.current_index = index;
+                self.right_pane_error = None;
                 self.status = format!("preview: {}", path.display());
                 self.scroll_to_current = true;
             }
             Err(error) => {
+                self.right_pane_error =
+                    Some(format!("Failed to scan {}\n{error:#}", directory.display()));
                 self.status = format!("scan failed: {error}");
             }
         }
@@ -610,7 +848,8 @@ impl GuiApp {
     }
 
     fn ensure_requested(&mut self) {
-        if self.browser_selected_is_unsupported() {
+        self.decode_retry_pending = false;
+        if self.browser_selected_is_unsupported() || self.right_pane_error.is_some() {
             return;
         }
         let len = self.state.entries.len();
@@ -622,9 +861,11 @@ impl GuiApp {
                 let variant = self.preview_variant();
                 let current = self.state.current_index;
                 let mut wanted = vec![current];
-                for distance in 1..=PREFETCH_RADIUS {
-                    wanted.push((current + distance) % len);
-                    wanted.push((current + len - (distance % len)) % len);
+                if variant != Variant::Original {
+                    for distance in 1..=PREFETCH_RADIUS {
+                        wanted.push((current + distance) % len);
+                        wanted.push((current + len - (distance % len)) % len);
+                    }
                 }
                 for index in wanted {
                     if let Some(entry) = self.state.entries.get(index) {
@@ -633,6 +874,7 @@ impl GuiApp {
                             path,
                             variant,
                             media_kind: entry.media_kind.clone(),
+                            generation: self.decode_generation,
                         });
                     }
                 }
@@ -658,6 +900,7 @@ impl GuiApp {
                             path,
                             variant: Variant::Thumb,
                             media_kind: entry.media_kind.clone(),
+                            generation: self.decode_generation,
                         });
                     }
                 }
@@ -675,6 +918,9 @@ impl GuiApp {
     fn drain_results(&mut self, ctx: &egui::Context) {
         while let Ok(result) = self.decoder.result_rx.try_recv() {
             self.inflight.remove(&result.key);
+            if result.key.generation != self.decode_generation {
+                continue;
+            }
             match result.image {
                 Ok(image) => {
                     let size = [image.width() as usize, image.height() as usize];
@@ -714,10 +960,10 @@ impl GuiApp {
             if let Some(duration) = event.duration {
                 active.duration = Some(duration);
             }
+            let terminal_status = playback_terminal_status(event.ended, event.error.as_deref());
             let failed = event.error.is_some();
-            if let Some(error) = event.error {
+            if event.error.is_some() {
                 active.ended = true;
-                self.status = format!("video failed: {error}");
             }
             if let Some(image) = event.frame {
                 let size = [image.width() as usize, image.height() as usize];
@@ -736,7 +982,9 @@ impl GuiApp {
             if event.ended {
                 active.ended = true;
                 active.handle.set_paused(true);
-                self.status = "video ended".to_owned();
+            }
+            if let Some(status) = terminal_status {
+                self.status = status;
             }
             if event.ended && self.auto_next && !failed {
                 self.play_next_video_after_current();
@@ -745,7 +993,7 @@ impl GuiApp {
     }
 
     fn current_is_video(&self) -> bool {
-        if self.browser_selected_is_unsupported() {
+        if self.browser_selected_is_unsupported() || self.right_pane_error.is_some() {
             return false;
         }
         if self.browser_is_focused() && !self.browser_selected_is_previewed_media() {
@@ -780,7 +1028,7 @@ impl GuiApp {
     }
 
     fn active_current_video_can_seek(&self) -> bool {
-        if self.browser_selected_is_unsupported() {
+        if self.browser_selected_is_unsupported() || self.right_pane_error.is_some() {
             return false;
         }
         if self.browser_is_focused() && !self.browser_selected_is_previewed_media() {
@@ -1027,7 +1275,7 @@ impl GuiApp {
     fn rescan(&mut self) {
         if self.state.browser.is_some() {
             match self.refresh_browser_listing_preserving_selection() {
-                Ok(()) => self.apply_browser_selection(),
+                Ok(()) => self.apply_browser_selection_with_force(true),
                 Err(error) => {
                     self.status = format!("browser refresh failed: {error}");
                 }
@@ -1036,14 +1284,14 @@ impl GuiApp {
         }
 
         self.stop_active_video();
-        // Drop remembered decode failures so files that have since been fixed,
-        // replaced, or were only transiently unreadable get another attempt.
-        self.failed.clear();
         let previous = self.state.current_path();
+        let queued_before_rescan = self.state.queue_count();
         let result = scan_state_entries(&self.state);
         match result {
             Ok(mut entries) => {
                 sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
+                self.invalidate_decodes();
+                self.state.delete_queue.clear();
                 self.state.set_entries_preserving_current(entries, previous);
                 if self.state.entries.is_empty() {
                     self.status = empty_media_status(&self.empty_media_target);
@@ -1059,6 +1307,11 @@ impl GuiApp {
                             ""
                         }
                     );
+                }
+                if queued_before_rescan > 0 {
+                    self.status.push_str(&format!(
+                        "; cleared {queued_before_rescan} queued deletion(s)"
+                    ));
                 }
                 self.scroll_to_current = true;
             }
@@ -1157,7 +1410,8 @@ impl GuiApp {
             // until the selection changes.
             let browser_focused = self.browser_is_focused();
             let unsupported_selected = self.browser_selected_is_unsupported();
-            let right_pane_active = !browser_focused && !unsupported_selected;
+            let right_pane_active =
+                !browser_focused && !unsupported_selected && self.right_pane_error.is_none();
 
             // Keys that follow the active video rather than a pane.
             if i.key_pressed(Key::Space) && self.current_is_video() {
@@ -1308,11 +1562,14 @@ impl GuiApp {
                     }
                 }
                 if i.key_pressed(Key::Home) {
-                    self.set_current_index(0);
+                    let previous = self.state.current_index;
+                    self.state.first();
+                    self.finish_selection_change(previous);
                 }
                 if i.key_pressed(Key::End) {
-                    let last = self.state.entries.len().saturating_sub(1);
-                    self.set_current_index(last);
+                    let previous = self.state.current_index;
+                    self.state.last();
+                    self.finish_selection_change(previous);
                 }
 
                 // Delete queue.
@@ -1503,6 +1760,12 @@ impl GuiApp {
             .as_ref()
             .is_some_and(|browser| browser.focus == BrowserPaneFocus::Preview);
         draw_pane_focus_line(ui, focused);
+        if let Some(error) = &self.right_pane_error {
+            ui.centered_and_justified(|ui| {
+                ui.label(error);
+            });
+            return;
+        }
         if let Some(entry) = self.browser_selected_entry()
             && entry.kind == BrowserEntryKind::UnsupportedFile
         {
@@ -1525,6 +1788,7 @@ impl GuiApp {
             path: entry.path.clone(),
             variant,
             media_kind: entry.media_kind.clone(),
+            generation: self.decode_generation,
         };
         let name = entry.display_name.clone();
         let progress = self.active_video_progress_for(&entry.path);
@@ -1714,6 +1978,7 @@ impl GuiApp {
             path: path.clone(),
             variant: Variant::Thumb,
             media_kind: media_kind.clone(),
+            generation: self.decode_generation,
         };
 
         let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL, CELL), egui::Sense::click());
@@ -1783,6 +2048,7 @@ impl GuiApp {
         }
         if self.state.show_info_overlay
             && !self.browser_selected_is_unsupported()
+            && self.right_pane_error.is_none()
             && let Some(entry) = self.state.current_entry()
         {
             let dims = entry
@@ -1909,7 +2175,9 @@ impl GuiApp {
             ZoomMode::Fit => "fit",
             ZoomMode::OriginalPixels => "original",
         };
-        let position = if self.browser_selected_is_unsupported() {
+        let position = if self.right_pane_error.is_some() {
+            "error".to_owned()
+        } else if self.browser_selected_is_unsupported() {
             "unsupported".to_owned()
         } else if self.state.entries.is_empty() {
             "0 / 0".to_owned()
@@ -1984,6 +2252,7 @@ impl GuiApp {
             ctx.request_repaint_after(Duration::from_secs_f64(remaining));
         }
         if !self.inflight.is_empty()
+            || self.decode_retry_pending
             || progress_overlay_visible
             || self
                 .active_video
@@ -2445,6 +2714,16 @@ fn next_video_index_after(entries: &[MediaEntry], current_index: usize) -> Optio
         .find_map(|(index, entry)| entry.media_kind.is_video().then_some(index))
 }
 
+fn playback_terminal_status(ended: bool, error: Option<&str>) -> Option<String> {
+    if let Some(error) = error {
+        Some(format!("video failed: {error}"))
+    } else if ended {
+        Some("video ended".to_owned())
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FocusPlaybackEffect {
     pause_video: bool,
@@ -2519,6 +2798,79 @@ mod tests {
     }
 
     #[test]
+    fn texture_cache_evicts_by_resident_bytes() {
+        let ctx = egui::Context::default();
+        let mut cache = TextureCache::new(8, 16);
+        let key = |name: &str| TexKey {
+            path: PathBuf::from(name),
+            variant: Variant::Thumb,
+            media_kind: MediaKind::Image(ImageKind::Png),
+            generation: 0,
+        };
+        let texture = |name: &str| {
+            ctx.load_texture(
+                name,
+                egui::ColorImage::new([2, 2], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            )
+        };
+
+        cache.put(key("first.png"), texture("first"));
+        cache.put(key("second.png"), texture("second"));
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.resident_bytes, 16);
+        assert!(!cache.contains(&key("first.png")));
+        assert!(cache.contains(&key("second.png")));
+    }
+
+    #[test]
+    fn texture_cache_accounts_for_entry_capacity_evictions() {
+        let ctx = egui::Context::default();
+        let mut cache = TextureCache::new(1, 1024);
+        let key = |name: &str| TexKey {
+            path: PathBuf::from(name),
+            variant: Variant::Thumb,
+            media_kind: MediaKind::Image(ImageKind::Png),
+            generation: 0,
+        };
+        let texture = |name: &str| {
+            ctx.load_texture(
+                name,
+                egui::ColorImage::new([2, 2], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            )
+        };
+
+        cache.put(key("first.png"), texture("capacity-first"));
+        cache.put(key("second.png"), texture("capacity-second"));
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.resident_bytes, 16);
+        assert!(!cache.contains(&key("first.png")));
+        assert!(cache.contains(&key("second.png")));
+    }
+
+    #[test]
+    fn decode_memory_permits_restore_the_reserved_capacity() {
+        let budget = DecodeMemoryBudget::new(100);
+        let permit = budget.acquire(60).unwrap();
+        assert_eq!(*budget.available.lock().unwrap(), 40);
+
+        drop(permit);
+
+        assert_eq!(*budget.available.lock().unwrap(), 100);
+    }
+
+    #[test]
+    fn decode_memory_budget_rejects_oversized_reservations() {
+        let budget = DecodeMemoryBudget::new(100);
+
+        assert!(budget.acquire(101).is_err());
+        assert_eq!(*budget.available.lock().unwrap(), 100);
+    }
+
+    #[test]
     fn empty_media_status_mentions_target_recursive_search_and_quit() {
         let status = empty_media_status(Path::new("/tmp/empty-media"));
 
@@ -2582,6 +2934,23 @@ mod tests {
             }
         );
         assert_eq!(initial_view_mode_for_launch(&launch), ViewMode::Preview);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_launch_rejects_a_direct_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("target.jpg");
+        let link = temp.path().join("link.jpg");
+        touch(&target);
+        symlink(&target, &link).unwrap();
+
+        let error = resolve_launch(&[link], None).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to open symlink"));
+        assert!(target.exists());
     }
 
     #[test]
@@ -2663,12 +3032,14 @@ mod tests {
     }
 
     fn run_frame(app: &mut GuiApp, ctx: &egui::Context, events: Vec<egui::Event>) {
-        let mut raw = egui::RawInput::default();
-        raw.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(1280.0, 800.0),
-        ));
-        raw.events = events;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
         let _ = ctx.run(raw, |ctx| app.update_impl(ctx));
     }
 
@@ -2751,6 +3122,75 @@ mod tests {
         assert_eq!(app.state.directory, folder.canonicalize().unwrap());
         assert_eq!(app.state.mode, ViewMode::Grid);
         assert!(app.state.entries.is_empty());
+    }
+
+    #[test]
+    fn failed_browser_scan_does_not_commit_partial_right_pane_state() {
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        let original_directory = temp.path().canonicalize().unwrap();
+        let mut app = app_for_browser_tests(temp.path());
+        app.state.browser = Some(
+            BrowserState::for_directory(
+                original_directory.clone(),
+                Some(folder.canonicalize().unwrap()),
+                HashMap::new(),
+                false,
+                &["jpg".to_owned()],
+            )
+            .unwrap(),
+        );
+        fs::remove_dir(&folder).unwrap();
+
+        app.apply_browser_selection();
+
+        assert_eq!(app.state.directory, original_directory);
+        assert!(
+            app.right_pane_error.as_deref().is_some_and(|error| {
+                error.contains("Failed to scan") && error.contains("folder")
+            })
+        );
+    }
+
+    #[test]
+    fn disappeared_browser_file_does_not_replace_the_right_pane() {
+        let temp = tempdir().unwrap();
+        let old_folder = temp.path().join("old");
+        let new_folder = temp.path().join("new");
+        fs::create_dir(&old_folder).unwrap();
+        fs::create_dir(&new_folder).unwrap();
+        let old_image = old_folder.join("old.jpg");
+        let selected_image = new_folder.join("selected.jpg");
+        touch(&old_image);
+        touch(&selected_image);
+
+        let old_folder = old_folder.canonicalize().unwrap();
+        let new_folder = new_folder.canonicalize().unwrap();
+        let selected_image = selected_image.canonicalize().unwrap();
+        let mut app = app_for_browser_tests(&old_folder);
+        app.load_right_pane_directory(old_folder.clone());
+        app.state.browser = Some(
+            BrowserState::for_directory(
+                new_folder,
+                Some(selected_image.clone()),
+                HashMap::new(),
+                false,
+                &["jpg".to_owned()],
+            )
+            .unwrap(),
+        );
+        fs::remove_file(&selected_image).unwrap();
+
+        app.apply_browser_selection_with_force(true);
+
+        assert_eq!(app.state.directory, old_folder);
+        assert_eq!(app.state.current_path(), Some(old_image));
+        assert!(
+            app.right_pane_error
+                .as_deref()
+                .is_some_and(|error| error.contains("no longer available"))
+        );
     }
 
     #[test]
@@ -2900,6 +3340,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolve_launch_rejects_symlinks_in_selected_file_scope() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first.jpg");
+        let target = temp.path().join("target.jpg");
+        let link = temp.path().join("link.jpg");
+        touch(&first);
+        touch(&target);
+        symlink(&target, &link).unwrap();
+
+        let error = resolve_launch(&[first, link], None).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to open symlink"));
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn direct_file_launch_errors_when_the_file_is_filtered_out() {
+        let temp = tempdir().unwrap();
+        let video = temp.path().join("clip.mp4");
+        let image = temp.path().join("image.jpg");
+        touch(&video);
+        touch(&image);
+        let launch = resolve_launch(std::slice::from_ref(&video), None).unwrap();
+
+        let error = scan_launch_entries(&launch, false, false, &["jpg".to_owned()]).unwrap_err();
+
+        assert!(error.to_string().contains("excluded by the active filters"));
+        assert!(error.to_string().contains("clip.mp4"));
+    }
+
     #[test]
     fn selected_launch_entries_filter_and_follow_argument_order() {
         let temp = tempdir().unwrap();
@@ -2967,6 +3441,43 @@ mod tests {
                 first.canonicalize().unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn rescan_invalidates_decodes_and_clears_pending_deletions() {
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("image.jpg");
+        touch(&image);
+        let entries = scan_directory(ScanOptions {
+            root: temp.path().canonicalize().unwrap(),
+            recursive: false,
+            include_hidden: false,
+            extensions: vec!["jpg".to_owned()],
+        })
+        .unwrap();
+        let mut state = AppState::new(
+            temp.path().canonicalize().unwrap(),
+            false,
+            false,
+            MediaMode::Image,
+            vec!["jpg".to_owned()],
+            SortMode::Discovered,
+            entries,
+        );
+        state.delete_queue.insert(image.clone());
+        let mut app = GuiApp::new(state, None, true, false, temp.path().to_path_buf());
+        let generation = app.decode_generation;
+        fs::write(&image, b"replacement content").unwrap();
+
+        app.rescan();
+
+        assert_eq!(app.decode_generation, generation.wrapping_add(1));
+        assert!(app.state.delete_queue.is_empty());
+        assert_eq!(
+            app.state.entries[0].file_len,
+            b"replacement content".len() as u64
+        );
+        assert!(app.status.contains("cleared 1 queued deletion"));
     }
 
     #[test]
@@ -3161,6 +3672,18 @@ mod tests {
         assert_eq!(next_video_index_after(&entries, 1), Some(2));
         assert_eq!(next_video_index_after(&entries, 2), None);
         assert_eq!(next_video_index_after(&entries, usize::MAX), None);
+    }
+
+    #[test]
+    fn playback_errors_are_not_overwritten_by_the_ended_status() {
+        assert_eq!(
+            playback_terminal_status(true, Some("corrupt stream")),
+            Some("video failed: corrupt stream".to_owned())
+        );
+        assert_eq!(
+            playback_terminal_status(true, None),
+            Some("video ended".to_owned())
+        );
     }
 
     #[test]
@@ -3395,6 +3918,14 @@ fn resolve_selected_files(paths: &[PathBuf]) -> Result<LaunchTarget> {
     let mut files = Vec::new();
 
     for path in paths {
+        let input_metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if input_metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "refusing to open symlink as a selected file: {}",
+                path.display()
+            ));
+        }
         let canonical = path
             .canonicalize()
             .with_context(|| format!("failed to resolve {}", path.display()))?;
@@ -3429,7 +3960,7 @@ fn scan_launch_entries(
     include_hidden: bool,
     extensions: &[String],
 ) -> Result<Vec<MediaEntry>> {
-    match launch {
+    let entries = match launch {
         LaunchTarget::Directory { directory, .. } => scan_directory(ScanOptions {
             root: directory.clone(),
             recursive,
@@ -3437,7 +3968,19 @@ fn scan_launch_entries(
             extensions: extensions.to_vec(),
         }),
         LaunchTarget::SelectedFiles { files, .. } => scan_files(files, extensions),
+    }?;
+    if let LaunchTarget::Directory {
+        initial_file: Some(initial_file),
+        ..
+    } = launch
+        && !entries.iter().any(|entry| &entry.path == initial_file)
+    {
+        return Err(anyhow!(
+            "requested file is unsupported or excluded by the active filters: {}",
+            initial_file.display()
+        ));
     }
+    Ok(entries)
 }
 
 fn scan_state_entries(state: &AppState) -> Result<Vec<MediaEntry>> {
@@ -3468,6 +4011,8 @@ fn resolve_input(input: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>)> {
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir().context("failed to read current directory")?,
     };
+    let input_metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
     let canonical = path
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", path.display()))?;
@@ -3475,6 +4020,12 @@ fn resolve_input(input: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>)> {
     if canonical.is_dir() {
         Ok((canonical, None))
     } else if canonical.is_file() {
+        if input_metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "refusing to open symlink as a media file: {}",
+                path.display()
+            ));
+        }
         let directory = canonical
             .parent()
             .context("file has no parent directory")?

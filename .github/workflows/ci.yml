@@ -25,7 +25,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Install native dependencies
         run: |
@@ -56,6 +56,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
       - name: Run tests
         run: cargo test --locked
 
@@ -77,7 +80,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Install native dependencies
         shell: pwsh
@@ -98,9 +101,17 @@ jobs:
           "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKG_DEFAULT_TRIPLET=x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKGRS_DYNAMIC=0" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $ffmpegTools = Join-Path $vcpkgRoot "installed\x64-windows-static\tools\ffmpeg"
+          if (-not (Test-Path $ffmpegTools)) {
+            throw "Could not find FFmpeg command-line tools at $ffmpegTools"
+          }
+          $ffmpegTools | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run tests
         run: cargo test --locked

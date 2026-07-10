@@ -186,16 +186,19 @@ impl AppState {
     }
 
     pub fn toggle_queue_current(&mut self) {
-        if let Some(path) = self.current_path() {
-            if !self.delete_queue.shift_remove(&path) {
-                self.delete_queue.insert(path);
-            }
+        let Some(path) = self.current_path() else {
+            return;
+        };
+        if self.delete_queue.contains(&path) {
+            self.remove_current_from_queue(&path);
+        } else {
+            self.delete_queue.insert(path);
         }
     }
 
     pub fn unqueue_current(&mut self) {
         if let Some(path) = self.current_path() {
-            self.delete_queue.shift_remove(&path);
+            self.remove_current_from_queue(&path);
         }
     }
 
@@ -204,7 +207,7 @@ impl AppState {
             return;
         }
         if self.mode == ViewMode::DeleteQueueGrid {
-            self.move_in_queue(1);
+            self.move_in_queue_by(1);
             return;
         }
         self.current_index = (self.current_index + 1).min(self.entries.len() - 1);
@@ -215,18 +218,28 @@ impl AppState {
             return;
         }
         if self.mode == ViewMode::DeleteQueueGrid {
-            self.move_in_queue(-1);
+            self.move_in_queue_by(-1);
             return;
         }
         self.current_index = self.current_index.saturating_sub(1);
     }
 
     pub fn first(&mut self) {
-        self.current_index = 0;
+        if self.mode == ViewMode::DeleteQueueGrid {
+            if let Some(index) = self.queued_indices().first().copied() {
+                self.current_index = index;
+            }
+        } else {
+            self.current_index = 0;
+        }
     }
 
     pub fn last(&mut self) {
-        if !self.entries.is_empty() {
+        if self.mode == ViewMode::DeleteQueueGrid {
+            if let Some(index) = self.queued_indices().last().copied() {
+                self.current_index = index;
+            }
+        } else if !self.entries.is_empty() {
             self.current_index = self.entries.len() - 1;
         }
     }
@@ -263,10 +276,11 @@ impl AppState {
 
     pub fn enter_delete_queue_grid(&mut self) {
         self.mode = ViewMode::DeleteQueueGrid;
-        if !self.delete_queue.is_empty() && !self.is_queued_current() {
-            if let Some(first_index) = self.queued_indices().first().copied() {
-                self.current_index = first_index;
-            }
+        if !self.delete_queue.is_empty()
+            && !self.is_queued_current()
+            && let Some(first_index) = self.queued_indices().first().copied()
+        {
+            self.current_index = first_index;
         }
     }
 
@@ -284,7 +298,7 @@ impl AppState {
         self.browser.is_some()
     }
 
-    fn move_in_queue(&mut self, delta: isize) {
+    pub fn move_in_queue_by(&mut self, delta: isize) {
         let indices = self.queued_indices();
         if indices.is_empty() {
             return;
@@ -299,6 +313,25 @@ impl AppState {
             (current + delta as usize).min(indices.len() - 1)
         };
         self.current_index = indices[next];
+    }
+
+    fn remove_current_from_queue(&mut self, path: &PathBuf) {
+        let previous_slot = (self.mode == ViewMode::DeleteQueueGrid).then(|| {
+            self.queued_indices()
+                .iter()
+                .position(|&index| index == self.current_index)
+                .unwrap_or(0)
+        });
+        if !self.delete_queue.shift_remove(path) {
+            return;
+        }
+        let Some(previous_slot) = previous_slot else {
+            return;
+        };
+        let indices = self.queued_indices();
+        if let Some(&index) = indices.get(previous_slot.min(indices.len().saturating_sub(1))) {
+            self.current_index = index;
+        }
     }
 }
 
@@ -452,6 +485,52 @@ mod tests {
         state.set_entries_preserving_current(vec![entry("a.jpg", 0)], None);
 
         assert_eq!(state.current_index, 0);
+    }
+
+    #[test]
+    fn delete_queue_navigation_uses_only_queued_entries() {
+        let mut state = AppState::new(
+            PathBuf::from("."),
+            false,
+            false,
+            MediaMode::Image,
+            vec!["jpg".to_owned()],
+            SortMode::Discovered,
+            vec![entry("a.jpg", 0), entry("b.jpg", 1), entry("c.jpg", 2)],
+        );
+        state.delete_queue.insert(PathBuf::from("a.jpg"));
+        state.delete_queue.insert(PathBuf::from("c.jpg"));
+        state.enter_delete_queue_grid();
+
+        state.move_in_queue_by(1);
+        assert_eq!(state.current_index, 2);
+        state.move_in_queue_by(-1);
+        assert_eq!(state.current_index, 0);
+        state.last();
+        assert_eq!(state.current_index, 2);
+        state.first();
+        assert_eq!(state.current_index, 0);
+    }
+
+    #[test]
+    fn unqueue_in_delete_grid_moves_to_the_next_visible_entry() {
+        let mut state = AppState::new(
+            PathBuf::from("."),
+            false,
+            false,
+            MediaMode::Image,
+            vec!["jpg".to_owned()],
+            SortMode::Discovered,
+            vec![entry("a.jpg", 0), entry("b.jpg", 1), entry("c.jpg", 2)],
+        );
+        state.delete_queue.insert(PathBuf::from("a.jpg"));
+        state.delete_queue.insert(PathBuf::from("c.jpg"));
+        state.enter_delete_queue_grid();
+
+        state.unqueue_current();
+
+        assert_eq!(state.current_index, 2);
+        assert!(state.is_queued_current());
     }
 
     #[test]

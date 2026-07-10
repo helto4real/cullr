@@ -73,6 +73,9 @@ Usage: cullr [OPTIONS] [PATH]...
 
 If no path or directory is supplied, `cullr` opens the current working
 directory. If multiple paths are supplied, they must all be files.
+Direct file symlinks are rejected before path canonicalization. A requested
+single file that is unsupported or excluded by the active media/extension
+filters returns an error instead of opening a different file from its folder.
 With `--view browser`, a folder launch opens the browser on the parent folder
 with the launched folder highlighted; a file launch highlights that file.
 Multiple explicit files still open as the focused grid review set.
@@ -154,6 +157,8 @@ Before deleting, `cullr` checks that each queued path still belongs to the
 selected directory or explicit selected-file set, is a real file rather than a
 symlink, and has not changed size or modification time since it was scanned.
 `--dry-run-delete` keeps the same flow but leaves all files on disk.
+Every successful rescan clears the delete queue and refreshes decoded media, so
+files must be reviewed and queued again after their on-disk state is refreshed.
 
 ## Development
 
@@ -161,6 +166,15 @@ Run the test suite:
 
 ```sh
 cargo test
+```
+
+Run the complete local quality gate:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets
+cargo build --release --locked
 ```
 
 The tests cover scanning, sorting, decode sizing, video first-frame decode,

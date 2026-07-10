@@ -83,10 +83,10 @@ fn safety_check(state: &AppState, entry: &crate::state::MediaEntry) -> Result<()
     if metadata.len() != entry.file_len {
         return Err("file size changed since scan".to_owned());
     }
-    if let (Some(scanned), Ok(current)) = (entry.modified, metadata.modified()) {
-        if scanned != current {
-            return Err("modified time changed since scan".to_owned());
-        }
+    if let (Some(scanned), Ok(current)) = (entry.modified, metadata.modified())
+        && scanned != current
+    {
+        return Err("modified time changed since scan".to_owned());
     }
 
     Ok(())
