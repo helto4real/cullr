@@ -85,7 +85,7 @@ jobs:
       - name: Install native dependencies
         shell: pwsh
         run: |
-          choco install nasm --no-progress -y
+          choco install ffmpeg nasm --no-progress -y
 
           $vcpkgRoot = $env:VCPKG_ROOT
           if (-not $vcpkgRoot) {
@@ -101,11 +101,9 @@ jobs:
           "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKG_DEFAULT_TRIPLET=x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKGRS_DYNAMIC=0" | Out-File -FilePath $env:GITHUB_ENV -Append
-          $ffmpegTools = Join-Path $vcpkgRoot "installed\x64-windows-static\tools\ffmpeg"
-          if (-not (Test-Path $ffmpegTools)) {
-            throw "Could not find FFmpeg command-line tools at $ffmpegTools"
+          if (-not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) {
+            throw "Could not find the Chocolatey FFmpeg command-line tool"
           }
-          $ffmpegTools | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Check formatting
         run: cargo fmt --check

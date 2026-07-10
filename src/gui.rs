@@ -3108,7 +3108,7 @@ mod tests {
         assert_eq!(app.state.directory, folder.canonicalize().unwrap());
         assert_eq!(app.state.mode, ViewMode::Grid);
         assert_eq!(app.state.entries.len(), 1);
-        assert_eq!(app.state.entries[0].path, image);
+        assert_eq!(app.state.entries[0].path, image.canonicalize().unwrap());
     }
 
     #[test]
@@ -3185,7 +3185,10 @@ mod tests {
         app.apply_browser_selection_with_force(true);
 
         assert_eq!(app.state.directory, old_folder);
-        assert_eq!(app.state.current_path(), Some(old_image));
+        assert_eq!(
+            app.state.current_path(),
+            Some(old_image.canonicalize().unwrap())
+        );
         assert!(
             app.right_pane_error
                 .as_deref()
@@ -3213,7 +3216,10 @@ mod tests {
         app.apply_browser_selection();
 
         assert_eq!(app.state.mode, ViewMode::Preview);
-        assert_eq!(app.state.current_path(), Some(image));
+        assert_eq!(
+            app.state.current_path(),
+            Some(image.canonicalize().unwrap())
+        );
     }
 
     #[test]
