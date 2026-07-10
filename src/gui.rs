@@ -2000,11 +2000,11 @@ impl GuiApp {
         }
 
         let stroke = if is_current {
-            egui::Stroke::new(3.0, egui::Color32::from_rgb(240, 200, 0))
+            egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(240, 200, 0))
         } else if is_queued {
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(220, 60, 60))
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(220, 60, 60))
         } else {
-            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+            egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color)
         };
         ui.painter()
             .rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
@@ -2290,14 +2290,14 @@ fn draw_media_type_badge(ui: &egui::Ui, cell_rect: egui::Rect, media_kind: &Medi
     painter.rect_stroke(
         badge_rect,
         4.0,
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(170)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(170)),
         egui::StrokeKind::Inside,
     );
 
     match media_kind {
         MediaKind::Image(_) => {
             let icon = badge_rect.shrink(4.5);
-            let stroke = egui::Stroke::new(1.25, egui::Color32::WHITE);
+            let stroke = egui::Stroke::new(1.25_f32, egui::Color32::WHITE);
             painter.rect_stroke(icon, 1.0, stroke, egui::StrokeKind::Inside);
             painter.line_segment(
                 [

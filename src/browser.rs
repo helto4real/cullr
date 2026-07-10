@@ -325,7 +325,7 @@ fn text_width(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
 
 pub(crate) fn draw_browser_icon(ui: &egui::Ui, rect: egui::Rect, kind: &BrowserEntryKind) {
     let painter = ui.painter();
-    let stroke = egui::Stroke::new(1.3, ui.visuals().strong_text_color());
+    let stroke = egui::Stroke::new(1.3_f32, ui.visuals().strong_text_color());
     match kind {
         BrowserEntryKind::Directory => {
             let tab = egui::Rect::from_min_max(
