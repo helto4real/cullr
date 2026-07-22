@@ -34,6 +34,7 @@ use crate::{
     cli::{Cli, CliViewMode},
     decode::{decode_rgba_capped, estimated_image_decode_bytes},
     delete, metadata,
+    refresh::{BrowserRefreshScope, MediaRefreshScope, RefreshResult, RefreshService},
     scanner::{ScanOptions, scan_directory, scan_files},
     sorter,
     state::{
@@ -41,6 +42,7 @@ use crate::{
         MediaKind, MediaMode, SortMode, ViewMode, ZoomMode,
     },
     video,
+    watcher::{MediaWatcher, WatchMessage, WatchPath, path_is_within},
 };
 
 /// Long-edge cap for fit-to-window decodes. A fit view never needs more pixels
@@ -58,6 +60,9 @@ const PREVIEW_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const THUMB_CACHE_BYTES: usize = 192 * 1024 * 1024;
 const DECODE_QUEUE_CAPACITY: usize = 48;
 const DECODE_RESULT_CAPACITY: usize = 8;
+/// Keep image conversion and GPU texture creation from monopolizing a frame.
+/// Decoding remains parallel, but uploads are deliberately paced on the UI thread.
+const DECODE_UPLOADS_PER_FRAME: usize = 2;
 const DECODE_MEMORY_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Grid cell edge in points.
 const CELL: f32 = 168.0;
@@ -70,7 +75,7 @@ const BROWSER_APPLY_DEBOUNCE_SECONDS: f64 = 0.12;
 const VIDEO_PROGRESS_OVERLAY_SECONDS: f64 = 2.0;
 const VIDEO_PROGRESS_OVERLAY_FADE_SECONDS: f32 = 0.18;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Variant {
     Fit,
     Original,
@@ -87,12 +92,27 @@ impl Variant {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TexKey {
     path: PathBuf,
     variant: Variant,
     media_kind: MediaKind,
+    file_len: u64,
+    modified: Option<std::time::SystemTime>,
     generation: u64,
+}
+
+impl TexKey {
+    fn for_entry(entry: &MediaEntry, variant: Variant, generation: u64) -> Self {
+        Self {
+            path: entry.path.clone(),
+            variant,
+            media_kind: entry.media_kind.clone(),
+            file_len: entry.file_len,
+            modified: entry.modified,
+            generation,
+        }
+    }
 }
 
 struct DecodeRequest {
@@ -365,6 +385,11 @@ struct GuiApp {
     pending_sort: Option<crate::state::SortMode>,
     pending_enrich: bool,
     pending_rescan: bool,
+    watcher: Option<MediaWatcher>,
+    watcher_error: Option<String>,
+    refresh: Option<RefreshService>,
+    media_refresh_generation: u64,
+    browser_refresh_generation: u64,
 }
 
 struct ActiveVideo {
@@ -426,6 +451,11 @@ impl GuiApp {
             pending_sort: None,
             pending_enrich: false,
             pending_rescan: false,
+            watcher: None,
+            watcher_error: None,
+            refresh: None,
+            media_refresh_generation: 0,
+            browser_refresh_generation: 0,
         }
     }
 
@@ -543,20 +573,28 @@ impl GuiApp {
     }
 
     fn refresh_browser_listing_preserving_selection(&mut self) -> Result<()> {
-        let Some(browser) = self.state.browser.as_mut() else {
+        let Some(browser) = self.state.browser.as_ref() else {
             return Ok(());
         };
-        let previous = browser.selected_path();
-        let fallback = browser
-            .remembered_selection
-            .get(&browser.listed_directory)
-            .cloned();
         let entries = read_browser_entries_with_sort(
             &browser.listed_directory,
             self.state.include_hidden,
             &self.state.extensions,
             browser.sort_mode,
         )?;
+        self.apply_browser_listing_preserving_selection(entries);
+        Ok(())
+    }
+
+    fn apply_browser_listing_preserving_selection(&mut self, entries: Vec<BrowserEntry>) {
+        let Some(browser) = self.state.browser.as_mut() else {
+            return;
+        };
+        let previous = browser.selected_path();
+        let fallback = browser
+            .remembered_selection
+            .get(&browser.listed_directory)
+            .cloned();
         browser.entries = entries;
         browser.selected_index = preferred_browser_index(
             &browser.entries,
@@ -565,7 +603,6 @@ impl GuiApp {
         );
         browser.scroll_to_selection = true;
         browser.remember_current_selection();
-        Ok(())
     }
 
     fn toggle_hidden_files(&mut self) {
@@ -869,13 +906,7 @@ impl GuiApp {
                 }
                 for index in wanted {
                     if let Some(entry) = self.state.entries.get(index) {
-                        let path = entry.path.clone();
-                        self.request(TexKey {
-                            path,
-                            variant,
-                            media_kind: entry.media_kind.clone(),
-                            generation: self.decode_generation,
-                        });
+                        self.request(TexKey::for_entry(entry, variant, self.decode_generation));
                     }
                 }
             }
@@ -895,13 +926,11 @@ impl GuiApp {
                     if let Some(&index) = indices.get(slot)
                         && let Some(entry) = self.state.entries.get(index)
                     {
-                        let path = entry.path.clone();
-                        self.request(TexKey {
-                            path,
-                            variant: Variant::Thumb,
-                            media_kind: entry.media_kind.clone(),
-                            generation: self.decode_generation,
-                        });
+                        self.request(TexKey::for_entry(
+                            entry,
+                            Variant::Thumb,
+                            self.decode_generation,
+                        ));
                     }
                 }
             }
@@ -916,7 +945,10 @@ impl GuiApp {
     }
 
     fn drain_results(&mut self, ctx: &egui::Context) {
-        while let Ok(result) = self.decoder.result_rx.try_recv() {
+        for _ in 0..DECODE_UPLOADS_PER_FRAME {
+            let Ok(result) = self.decoder.result_rx.try_recv() else {
+                break;
+            };
             self.inflight.remove(&result.key);
             if result.key.generation != self.decode_generation {
                 continue;
@@ -943,6 +975,9 @@ impl GuiApp {
                     self.failed.insert(result.key, error);
                 }
             }
+        }
+        if !self.decoder.result_rx.is_empty() {
+            ctx.request_repaint();
         }
     }
 
@@ -1318,6 +1353,255 @@ impl GuiApp {
             Err(error) => {
                 self.status = format!("rescan failed: {error}");
             }
+        }
+    }
+
+    fn attach_watcher(&mut self, ctx: &egui::Context) {
+        let refresh_ctx = ctx.clone();
+        self.refresh = Some(RefreshService::new(move || refresh_ctx.request_repaint()));
+        let repaint_ctx = ctx.clone();
+        match MediaWatcher::new(move || repaint_ctx.request_repaint()) {
+            Ok(watcher) => {
+                let polling = watcher.is_polling();
+                self.watcher = Some(watcher);
+                self.sync_watcher_paths();
+                if polling && self.status.is_empty() {
+                    self.status = "live watching via polling fallback".to_owned();
+                }
+            }
+            Err(error) => {
+                let message = format!("live watching unavailable: {error:#}");
+                tracing::warn!(%message);
+                self.watcher_error = Some(message.clone());
+                self.status = message;
+            }
+        }
+    }
+
+    fn desired_watch_paths(&self) -> HashSet<WatchPath> {
+        let mut paths = HashSet::new();
+        if let Some(selected_files) = &self.state.selected_files {
+            for file in selected_files {
+                if let Some(parent) = file.parent() {
+                    paths.insert(WatchPath::new(parent.to_path_buf(), false));
+                }
+            }
+        } else {
+            paths.insert(WatchPath::new(
+                self.state.directory.clone(),
+                self.state.recursive,
+            ));
+        }
+        if let Some(browser) = &self.state.browser {
+            paths.insert(WatchPath::new(browser.listed_directory.clone(), false));
+        }
+        paths
+    }
+
+    fn sync_watcher_paths(&mut self) {
+        let paths = self.desired_watch_paths();
+        let Some(watcher) = self.watcher.as_mut() else {
+            return;
+        };
+        let was_polling = watcher.is_polling();
+        let result = watcher.replace_paths(paths);
+        let switched_to_polling = !was_polling && watcher.is_polling();
+        if let Err(error) = result {
+            let message = format!("live watch update failed: {error:#}");
+            if self.watcher_error.as_deref() != Some(&message) {
+                tracing::warn!(%message);
+                self.status = message.clone();
+                self.watcher_error = Some(message);
+            }
+        } else {
+            self.watcher_error = None;
+            if switched_to_polling {
+                self.status = "live watching via polling fallback".to_owned();
+            }
+        }
+    }
+
+    fn drain_watcher(&mut self) {
+        let messages = self
+            .watcher
+            .as_ref()
+            .map(MediaWatcher::drain)
+            .unwrap_or_default();
+        if messages.is_empty() {
+            return;
+        }
+
+        let mut paths = HashSet::new();
+        let mut watcher_failed = false;
+        for message in messages {
+            match message {
+                WatchMessage::Changed(changed) => paths.extend(changed),
+                WatchMessage::Error(error) => {
+                    watcher_failed = true;
+                    tracing::warn!(%error, "filesystem watcher event failed");
+                    self.status = format!("live watch error: {error}; reconciling active views");
+                }
+            }
+        }
+
+        let refresh_library = watcher_failed
+            || paths
+                .iter()
+                .any(|path| path_affects_media_state(path, &self.state));
+        let refresh_browser = watcher_failed
+            || self.state.browser.as_ref().is_some_and(|browser| {
+                paths
+                    .iter()
+                    .any(|path| path_affects_flat_directory(path, &browser.listed_directory))
+            });
+
+        if refresh_library {
+            self.request_live_media_refresh();
+        }
+        if refresh_browser {
+            self.request_live_browser_refresh();
+        }
+        self.sync_watcher_paths();
+    }
+
+    fn media_refresh_scope(&self) -> MediaRefreshScope {
+        if let Some(selected_files) = &self.state.selected_files {
+            MediaRefreshScope::SelectedFiles {
+                files: selected_files.iter().cloned().collect(),
+                extensions: self.state.extensions.clone(),
+            }
+        } else {
+            MediaRefreshScope::Directory(ScanOptions {
+                root: self.state.directory.clone(),
+                recursive: self.state.recursive,
+                include_hidden: self.state.include_hidden,
+                extensions: self.state.extensions.clone(),
+            })
+        }
+    }
+
+    fn browser_refresh_scope(&self) -> Option<BrowserRefreshScope> {
+        let browser = self.state.browser.as_ref()?;
+        Some(BrowserRefreshScope {
+            directory: browser.listed_directory.clone(),
+            include_hidden: self.state.include_hidden,
+            extensions: self.state.extensions.clone(),
+            sort_mode: browser.sort_mode,
+        })
+    }
+
+    fn request_live_media_refresh(&mut self) {
+        let scope = self.media_refresh_scope();
+        self.media_refresh_generation = self.media_refresh_generation.wrapping_add(1);
+        if let Some(refresh) = &self.refresh {
+            refresh.request_media(self.media_refresh_generation, scope);
+        }
+    }
+
+    fn request_live_browser_refresh(&mut self) {
+        let Some(scope) = self.browser_refresh_scope() else {
+            return;
+        };
+        self.browser_refresh_generation = self.browser_refresh_generation.wrapping_add(1);
+        if let Some(refresh) = &self.refresh {
+            refresh.request_browser(self.browser_refresh_generation, scope);
+        }
+    }
+
+    fn drain_refresh_results(&mut self) {
+        let results = self
+            .refresh
+            .as_ref()
+            .map(RefreshService::drain)
+            .unwrap_or_default();
+        for result in results {
+            self.handle_refresh_result(result);
+        }
+    }
+
+    fn handle_refresh_result(&mut self, refresh: RefreshResult) {
+        match refresh {
+            RefreshResult::Media {
+                generation,
+                scope,
+                result,
+            } => {
+                if generation != self.media_refresh_generation
+                    || scope != self.media_refresh_scope()
+                {
+                    return;
+                }
+                match result {
+                    Ok(entries) => self.apply_live_media_entries(entries),
+                    Err(error) => self.status = format!("live refresh failed: {error}"),
+                }
+            }
+            RefreshResult::Browser {
+                generation,
+                scope,
+                result,
+            } => {
+                if generation != self.browser_refresh_generation
+                    || self.browser_refresh_scope().as_ref() != Some(&scope)
+                {
+                    return;
+                }
+                match result {
+                    Ok(entries) => {
+                        self.apply_browser_listing_preserving_selection(entries);
+                        self.sync_browser_to_current_path();
+                    }
+                    Err(error) => self.status = format!("browser live refresh failed: {error}"),
+                }
+            }
+        }
+    }
+
+    fn apply_live_media_entries(&mut self, fresh: Vec<MediaEntry>) {
+        let previous_path = self.state.current_path();
+        let old_entries = self.state.entries.clone();
+        let old_queue = self.state.delete_queue.clone();
+        let mut reconciliation = reconcile_entries(&old_entries, fresh);
+        if !reconciliation.changed() {
+            return;
+        }
+
+        if previous_path
+            .as_ref()
+            .is_some_and(|path| reconciliation.invalidated_paths.contains(path))
+        {
+            self.stop_active_video();
+        }
+        sorter::sort_entries(
+            &mut reconciliation.entries,
+            self.state.sort_mode,
+            self.locale.as_deref(),
+        );
+        self.state.delete_queue.retain(|path| {
+            reconciliation.unchanged_paths.contains(path) && old_queue.contains(path)
+        });
+        let unqueued = old_queue
+            .len()
+            .saturating_sub(self.state.delete_queue.len());
+        let added = reconciliation.added;
+        let removed = reconciliation.removed;
+        let updated = reconciliation.updated;
+        self.state
+            .set_entries_preserving_current(reconciliation.entries, previous_path);
+        self.sync_browser_to_current_path();
+        self.scroll_to_current = true;
+        self.status = format!("live update: +{} -{} ~{}", added, removed, updated);
+        if unqueued > 0 {
+            self.status
+                .push_str(&format!("; unqueued {unqueued} changed deletion(s)"));
+        }
+    }
+
+    #[cfg(test)]
+    fn reconcile_live_media(&mut self) {
+        match scan_state_entries(&self.state) {
+            Ok(entries) => self.apply_live_media_entries(entries),
+            Err(error) => self.status = format!("live refresh failed: {error}"),
         }
     }
 
@@ -1784,12 +2068,7 @@ impl GuiApp {
             draw_empty_media_message(ui, &self.empty_media_target);
             return;
         };
-        let key = TexKey {
-            path: entry.path.clone(),
-            variant,
-            media_kind: entry.media_kind.clone(),
-            generation: self.decode_generation,
-        };
+        let key = TexKey::for_entry(entry, variant, self.decode_generation);
         let name = entry.display_name.clone();
         let progress = self.active_video_progress_for(&entry.path);
 
@@ -1974,12 +2253,7 @@ impl GuiApp {
         let media_kind = entry.media_kind.clone();
         let is_current = index == self.state.current_index;
         let is_queued = self.state.delete_queue.contains(&path);
-        let key = TexKey {
-            path: path.clone(),
-            variant: Variant::Thumb,
-            media_kind: media_kind.clone(),
-            generation: self.decode_generation,
-        };
+        let key = TexKey::for_entry(entry, Variant::Thumb, self.decode_generation);
 
         let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL, CELL), egui::Sense::click());
 
@@ -2137,6 +2411,9 @@ impl GuiApp {
         let focused = ctx.input(|input| input.focused);
         self.handle_focus_change(focused);
         self.handle_input(ctx);
+        self.sync_watcher_paths();
+        self.drain_watcher();
+        self.drain_refresh_results();
 
         // Apply a browser selection only once it has rested briefly, so
         // holding j/k doesn't scan every directory the selection crosses.
@@ -2805,6 +3082,8 @@ mod tests {
             path: PathBuf::from(name),
             variant: Variant::Thumb,
             media_kind: MediaKind::Image(ImageKind::Png),
+            file_len: 0,
+            modified: None,
             generation: 0,
         };
         let texture = |name: &str| {
@@ -2832,6 +3111,8 @@ mod tests {
             path: PathBuf::from(name),
             variant: Variant::Thumb,
             media_kind: MediaKind::Image(ImageKind::Png),
+            file_len: 0,
+            modified: None,
             generation: 0,
         };
         let texture = |name: &str| {
@@ -3487,6 +3768,167 @@ mod tests {
     }
 
     #[test]
+    fn live_reconciliation_preserves_unchanged_queue_and_unqueues_invalidated_files() {
+        let temp = tempdir().unwrap();
+        let unchanged = temp.path().join("unchanged.jpg");
+        let modified = temp.path().join("modified.jpg");
+        let removed = temp.path().join("removed.jpg");
+        let added = temp.path().join("added.jpg");
+        touch(&unchanged);
+        touch(&modified);
+        touch(&removed);
+        let entries = scan_directory(ScanOptions {
+            root: temp.path().canonicalize().unwrap(),
+            recursive: false,
+            include_hidden: false,
+            extensions: vec!["jpg".to_owned()],
+        })
+        .unwrap();
+        let mut state = AppState::new(
+            temp.path().canonicalize().unwrap(),
+            false,
+            false,
+            MediaMode::Image,
+            vec!["jpg".to_owned()],
+            SortMode::Discovered,
+            entries,
+        );
+        for entry in &state.entries {
+            state.delete_queue.insert(entry.path.clone());
+        }
+        let unchanged = unchanged.canonicalize().unwrap();
+        let modified = modified.canonicalize().unwrap();
+        let removed = removed.canonicalize().unwrap();
+        let mut app = GuiApp::new(state, None, true, false, temp.path().to_path_buf());
+
+        fs::write(&modified, b"replacement content with a different length").unwrap();
+        fs::remove_file(&removed).unwrap();
+        touch(&added);
+        app.reconcile_live_media();
+
+        assert_eq!(app.state.delete_queue.len(), 1);
+        assert!(app.state.delete_queue.contains(&unchanged));
+        assert!(!app.state.delete_queue.contains(&modified));
+        assert!(!app.state.delete_queue.contains(&removed));
+        assert!(app.state.entries.iter().any(|entry| entry.path == added));
+        assert!(app.status.contains("live update: +1 -1 ~1"));
+        assert!(app.status.contains("unqueued 2 changed deletion"));
+    }
+
+    #[test]
+    fn reconciliation_keeps_enrichment_and_order_for_unchanged_entries() {
+        let mut old = media_entry(
+            PathBuf::from("/tmp/media/existing.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            7,
+        );
+        old.file_len = 12;
+        old.dimensions = Some((1920, 1080));
+        old.dimensions_attempted = true;
+        let mut fresh = old.clone();
+        fresh.discovered_order = 0;
+        fresh.dimensions = None;
+        fresh.dimensions_attempted = false;
+        let added = media_entry(
+            PathBuf::from("/tmp/media/new.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            0,
+        );
+
+        let result = reconcile_entries(&[old], vec![fresh, added]);
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.entries[0].discovered_order, 7);
+        assert_eq!(result.entries[0].dimensions, Some((1920, 1080)));
+        assert_eq!(result.entries[1].discovered_order, 8);
+    }
+
+    #[test]
+    fn decode_key_changes_when_scanned_file_identity_changes() {
+        let mut entry = media_entry(
+            PathBuf::from("/tmp/media/image.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            0,
+        );
+        let before = TexKey::for_entry(&entry, Variant::Fit, 0);
+        entry.file_len = 42;
+        let after = TexKey::for_entry(&entry, Variant::Fit, 0);
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn live_event_scope_respects_recursive_and_selected_file_modes() {
+        let directory = PathBuf::from("/tmp/media");
+        let mut state = AppState::new(
+            directory.clone(),
+            false,
+            false,
+            MediaMode::Both,
+            vec!["jpg".to_owned()],
+            SortMode::Discovered,
+            Vec::new(),
+        );
+        assert!(path_affects_media_state(
+            Path::new("/tmp/media/image.jpg"),
+            &state
+        ));
+        assert!(!path_affects_media_state(
+            Path::new("/tmp/media/nested/image.jpg"),
+            &state
+        ));
+
+        state.recursive = true;
+        assert!(path_affects_media_state(
+            Path::new("/tmp/media/nested/image.jpg"),
+            &state
+        ));
+
+        state.selected_files = Some(IndexSet::from([directory.join("chosen.jpg")]));
+        assert!(path_affects_media_state(
+            Path::new("/tmp/media/chosen.jpg"),
+            &state
+        ));
+        assert!(!path_affects_media_state(
+            Path::new("/tmp/media/unrelated.jpg"),
+            &state
+        ));
+    }
+
+    #[test]
+    fn stale_background_refresh_result_is_ignored() {
+        let original = media_entry(
+            PathBuf::from("/tmp/media/original.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            0,
+        );
+        let replacement = media_entry(
+            PathBuf::from("/tmp/media/replacement.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            0,
+        );
+        let state = app_state(vec![original.clone()], 0);
+        let mut app = GuiApp::new(state, None, true, false, PathBuf::from("/tmp/media"));
+        app.media_refresh_generation = 2;
+        let scope = app.media_refresh_scope();
+
+        app.handle_refresh_result(RefreshResult::Media {
+            generation: 1,
+            scope: scope.clone(),
+            result: Ok(vec![replacement.clone()]),
+        });
+        assert_eq!(app.state.entries[0].path, original.path);
+
+        app.handle_refresh_result(RefreshResult::Media {
+            generation: 2,
+            scope,
+            result: Ok(vec![replacement.clone()]),
+        });
+        assert_eq!(app.state.entries[0].path, replacement.path);
+    }
+
+    #[test]
     fn initial_video_autoplay_only_for_matching_direct_video_file() {
         let image_path = PathBuf::from("/tmp/media/image.jpg");
         let video_path = PathBuf::from("/tmp/media/video.mp4");
@@ -3862,8 +4304,15 @@ pub fn run(cli: Cli) -> Result<()> {
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
-    eframe::run_native("cullr", options, Box::new(|_cc| Ok(Box::new(app))))
-        .map_err(|error| anyhow!("eframe failed: {error}"))?;
+    eframe::run_native(
+        "cullr",
+        options,
+        Box::new(move |cc| {
+            app.attach_watcher(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|error| anyhow!("eframe failed: {error}"))?;
     Ok(())
 }
 
@@ -4001,6 +4450,101 @@ fn scan_state_entries(state: &AppState) -> Result<Vec<MediaEntry>> {
             extensions: state.extensions.clone(),
         })
     }
+}
+
+#[derive(Debug)]
+struct EntryReconciliation {
+    entries: Vec<MediaEntry>,
+    unchanged_paths: HashSet<PathBuf>,
+    invalidated_paths: HashSet<PathBuf>,
+    added: usize,
+    removed: usize,
+    updated: usize,
+}
+
+impl EntryReconciliation {
+    fn changed(&self) -> bool {
+        self.added > 0 || self.removed > 0 || self.updated > 0
+    }
+}
+
+fn reconcile_entries(old: &[MediaEntry], fresh: Vec<MediaEntry>) -> EntryReconciliation {
+    let old_by_path = old
+        .iter()
+        .map(|entry| (entry.path.as_path(), entry))
+        .collect::<HashMap<_, _>>();
+    let fresh_paths = fresh
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    let mut unchanged_paths = HashSet::new();
+    let mut invalidated_paths = old
+        .iter()
+        .filter(|entry| !fresh_paths.contains(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    let removed = invalidated_paths.len();
+    let mut added = 0;
+    let mut updated = 0;
+    let mut next_order = old
+        .iter()
+        .map(|entry| entry.discovered_order)
+        .max()
+        .map_or(0, |order| order.saturating_add(1));
+    let mut entries = Vec::with_capacity(fresh.len());
+
+    for mut entry in fresh {
+        match old_by_path.get(entry.path.as_path()) {
+            Some(previous) if same_scanned_file(previous, &entry) => {
+                unchanged_paths.insert(entry.path.clone());
+                entries.push((*previous).clone());
+            }
+            Some(previous) => {
+                entry.discovered_order = previous.discovered_order;
+                invalidated_paths.insert(entry.path.clone());
+                updated += 1;
+                entries.push(entry);
+            }
+            None => {
+                entry.discovered_order = next_order;
+                next_order = next_order.saturating_add(1);
+                added += 1;
+                entries.push(entry);
+            }
+        }
+    }
+
+    EntryReconciliation {
+        entries,
+        unchanged_paths,
+        invalidated_paths,
+        added,
+        removed,
+        updated,
+    }
+}
+
+fn same_scanned_file(left: &MediaEntry, right: &MediaEntry) -> bool {
+    left.file_len == right.file_len
+        && left.modified == right.modified
+        && left.media_kind == right.media_kind
+}
+
+fn path_affects_media_state(path: &Path, state: &AppState) -> bool {
+    if let Some(selected_files) = &state.selected_files {
+        return selected_files
+            .iter()
+            .any(|file| path == file || file.parent().is_some_and(|parent| path == parent));
+    }
+    if state.recursive {
+        path_is_within(path, &state.directory)
+    } else {
+        path_affects_flat_directory(path, &state.directory)
+    }
+}
+
+fn path_affects_flat_directory(path: &Path, directory: &Path) -> bool {
+    path == directory || path.parent().is_some_and(|parent| parent == directory)
 }
 
 fn initial_view_mode_for_launch(launch: &LaunchTarget) -> ViewMode {

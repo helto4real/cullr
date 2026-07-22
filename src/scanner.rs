@@ -16,7 +16,7 @@ const MPEG_TS_PROBE_PACKETS: usize = 3;
 const MPEG_TS_PROBE_BYTES: usize = MPEG_TS_PACKET_SIZE * MPEG_TS_PROBE_PACKETS;
 const MPEG_TS_SYNC_BYTE: u8 = 0x47;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanOptions {
     pub root: PathBuf,
     pub recursive: bool,
