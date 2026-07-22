@@ -3804,6 +3804,7 @@ mod tests {
         fs::write(&modified, b"replacement content with a different length").unwrap();
         fs::remove_file(&removed).unwrap();
         touch(&added);
+        let added = added.canonicalize().unwrap();
         app.reconcile_live_media();
 
         assert_eq!(app.state.delete_queue.len(), 1);
