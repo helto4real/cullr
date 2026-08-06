@@ -34,7 +34,9 @@ use crate::{
     cli::{Cli, CliViewMode},
     decode::{decode_rgba_capped, estimated_image_decode_bytes},
     delete, metadata,
-    refresh::{BrowserRefreshScope, MediaRefreshScope, RefreshResult, RefreshService},
+    refresh::{
+        BrowserRefreshScope, MediaRefreshOutput, MediaRefreshScope, RefreshResult, RefreshService,
+    },
     scanner::{ScanOptions, scan_directory, scan_files},
     sorter,
     state::{
@@ -44,6 +46,9 @@ use crate::{
     video,
     watcher::{MediaWatcher, WatchMessage, WatchPath, path_is_within},
 };
+
+#[cfg(test)]
+use crate::refresh::prepare_media_refresh;
 
 /// Long-edge cap for fit-to-window decodes. A fit view never needs more pixels
 /// than a high-DPI monitor; the GPU handles any further downscaling.
@@ -1436,6 +1441,7 @@ impl GuiApp {
         for message in messages {
             match message {
                 WatchMessage::Changed(changed) => paths.extend(changed),
+                WatchMessage::Rescan => watcher_failed = true,
                 WatchMessage::Error(error) => {
                     watcher_failed = true;
                     tracing::warn!(%error, "filesystem watcher event failed");
@@ -1494,7 +1500,13 @@ impl GuiApp {
         let scope = self.media_refresh_scope();
         self.media_refresh_generation = self.media_refresh_generation.wrapping_add(1);
         if let Some(refresh) = &self.refresh {
-            refresh.request_media(self.media_refresh_generation, scope);
+            refresh.request_media(
+                self.media_refresh_generation,
+                scope,
+                self.state.entries.clone(),
+                self.state.sort_mode,
+                self.locale.clone(),
+            );
         }
     }
 
@@ -1524,11 +1536,16 @@ impl GuiApp {
             RefreshResult::Media {
                 generation,
                 scope,
+                sort_mode,
                 result,
             } => {
                 if generation != self.media_refresh_generation
                     || scope != self.media_refresh_scope()
                 {
+                    return;
+                }
+                if sort_mode != self.state.sort_mode {
+                    self.request_live_media_refresh();
                     return;
                 }
                 match result {
@@ -1557,11 +1574,9 @@ impl GuiApp {
         }
     }
 
-    fn apply_live_media_entries(&mut self, fresh: Vec<MediaEntry>) {
+    fn apply_live_media_entries(&mut self, reconciliation: MediaRefreshOutput) {
         let previous_path = self.state.current_path();
-        let old_entries = self.state.entries.clone();
         let old_queue = self.state.delete_queue.clone();
-        let mut reconciliation = reconcile_entries(&old_entries, fresh);
         if !reconciliation.changed() {
             return;
         }
@@ -1572,11 +1587,6 @@ impl GuiApp {
         {
             self.stop_active_video();
         }
-        sorter::sort_entries(
-            &mut reconciliation.entries,
-            self.state.sort_mode,
-            self.locale.as_deref(),
-        );
         self.state.delete_queue.retain(|path| {
             reconciliation.unchanged_paths.contains(path) && old_queue.contains(path)
         });
@@ -1600,7 +1610,15 @@ impl GuiApp {
     #[cfg(test)]
     fn reconcile_live_media(&mut self) {
         match scan_state_entries(&self.state) {
-            Ok(entries) => self.apply_live_media_entries(entries),
+            Ok(entries) => {
+                let reconciliation = prepare_media_refresh(
+                    self.state.entries.clone(),
+                    entries,
+                    self.state.sort_mode,
+                    self.locale.as_deref(),
+                );
+                self.apply_live_media_entries(reconciliation);
+            }
             Err(error) => self.status = format!("live refresh failed: {error}"),
         }
     }
@@ -3817,35 +3835,6 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_keeps_enrichment_and_order_for_unchanged_entries() {
-        let mut old = media_entry(
-            PathBuf::from("/tmp/media/existing.jpg"),
-            MediaKind::Image(ImageKind::Jpeg),
-            7,
-        );
-        old.file_len = 12;
-        old.dimensions = Some((1920, 1080));
-        old.dimensions_attempted = true;
-        let mut fresh = old.clone();
-        fresh.discovered_order = 0;
-        fresh.dimensions = None;
-        fresh.dimensions_attempted = false;
-        let added = media_entry(
-            PathBuf::from("/tmp/media/new.jpg"),
-            MediaKind::Image(ImageKind::Jpeg),
-            0,
-        );
-
-        let result = reconcile_entries(&[old], vec![fresh, added]);
-
-        assert_eq!(result.added, 1);
-        assert_eq!(result.updated, 0);
-        assert_eq!(result.entries[0].discovered_order, 7);
-        assert_eq!(result.entries[0].dimensions, Some((1920, 1080)));
-        assert_eq!(result.entries[1].discovered_order, 8);
-    }
-
-    #[test]
     fn decode_key_changes_when_scanned_file_identity_changes() {
         let mut entry = media_entry(
             PathBuf::from("/tmp/media/image.jpg"),
@@ -3917,16 +3906,62 @@ mod tests {
         app.handle_refresh_result(RefreshResult::Media {
             generation: 1,
             scope: scope.clone(),
-            result: Ok(vec![replacement.clone()]),
+            sort_mode: SortMode::Discovered,
+            result: Ok(prepare_media_refresh(
+                vec![original.clone()],
+                vec![replacement.clone()],
+                SortMode::Discovered,
+                None,
+            )),
         });
         assert_eq!(app.state.entries[0].path, original.path);
 
         app.handle_refresh_result(RefreshResult::Media {
             generation: 2,
             scope,
-            result: Ok(vec![replacement.clone()]),
+            sort_mode: SortMode::Discovered,
+            result: Ok(prepare_media_refresh(
+                vec![original.clone()],
+                vec![replacement.clone()],
+                SortMode::Discovered,
+                None,
+            )),
         });
         assert_eq!(app.state.entries[0].path, replacement.path);
+    }
+
+    #[test]
+    fn background_refresh_with_stale_sort_is_ignored_and_rescheduled() {
+        let original = media_entry(
+            PathBuf::from("/tmp/media/original.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            0,
+        );
+        let replacement = media_entry(
+            PathBuf::from("/tmp/media/replacement.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            0,
+        );
+        let mut state = app_state(vec![original.clone()], 0);
+        state.sort_mode = SortMode::NameAsc;
+        let mut app = GuiApp::new(state, None, true, false, PathBuf::from("/tmp/media"));
+        app.media_refresh_generation = 2;
+        let scope = app.media_refresh_scope();
+
+        app.handle_refresh_result(RefreshResult::Media {
+            generation: 2,
+            scope,
+            sort_mode: SortMode::Discovered,
+            result: Ok(prepare_media_refresh(
+                vec![original.clone()],
+                vec![replacement],
+                SortMode::Discovered,
+                None,
+            )),
+        });
+
+        assert_eq!(app.state.entries[0].path, original.path);
+        assert_eq!(app.media_refresh_generation, 3);
     }
 
     #[test]
@@ -4451,84 +4486,6 @@ fn scan_state_entries(state: &AppState) -> Result<Vec<MediaEntry>> {
             extensions: state.extensions.clone(),
         })
     }
-}
-
-#[derive(Debug)]
-struct EntryReconciliation {
-    entries: Vec<MediaEntry>,
-    unchanged_paths: HashSet<PathBuf>,
-    invalidated_paths: HashSet<PathBuf>,
-    added: usize,
-    removed: usize,
-    updated: usize,
-}
-
-impl EntryReconciliation {
-    fn changed(&self) -> bool {
-        self.added > 0 || self.removed > 0 || self.updated > 0
-    }
-}
-
-fn reconcile_entries(old: &[MediaEntry], fresh: Vec<MediaEntry>) -> EntryReconciliation {
-    let old_by_path = old
-        .iter()
-        .map(|entry| (entry.path.as_path(), entry))
-        .collect::<HashMap<_, _>>();
-    let fresh_paths = fresh
-        .iter()
-        .map(|entry| entry.path.clone())
-        .collect::<HashSet<_>>();
-    let mut unchanged_paths = HashSet::new();
-    let mut invalidated_paths = old
-        .iter()
-        .filter(|entry| !fresh_paths.contains(&entry.path))
-        .map(|entry| entry.path.clone())
-        .collect::<HashSet<_>>();
-    let removed = invalidated_paths.len();
-    let mut added = 0;
-    let mut updated = 0;
-    let mut next_order = old
-        .iter()
-        .map(|entry| entry.discovered_order)
-        .max()
-        .map_or(0, |order| order.saturating_add(1));
-    let mut entries = Vec::with_capacity(fresh.len());
-
-    for mut entry in fresh {
-        match old_by_path.get(entry.path.as_path()) {
-            Some(previous) if same_scanned_file(previous, &entry) => {
-                unchanged_paths.insert(entry.path.clone());
-                entries.push((*previous).clone());
-            }
-            Some(previous) => {
-                entry.discovered_order = previous.discovered_order;
-                invalidated_paths.insert(entry.path.clone());
-                updated += 1;
-                entries.push(entry);
-            }
-            None => {
-                entry.discovered_order = next_order;
-                next_order = next_order.saturating_add(1);
-                added += 1;
-                entries.push(entry);
-            }
-        }
-    }
-
-    EntryReconciliation {
-        entries,
-        unchanged_paths,
-        invalidated_paths,
-        added,
-        removed,
-        updated,
-    }
-}
-
-fn same_scanned_file(left: &MediaEntry, right: &MediaEntry) -> bool {
-    left.file_len == right.file_len
-        && left.modified == right.modified
-        && left.media_kind == right.media_kind
 }
 
 fn path_affects_media_state(path: &Path, state: &AppState) -> bool {

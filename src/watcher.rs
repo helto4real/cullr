@@ -1,9 +1,10 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -11,6 +12,7 @@ use flume::{Receiver, Sender};
 use notify::{
     Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
     Watcher,
+    event::{AccessKind, AccessMode, CreateKind, ModifyKind},
 };
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -38,6 +40,7 @@ impl WatchPath {
 #[derive(Debug)]
 pub enum WatchMessage {
     Changed(Vec<PathBuf>),
+    Rescan,
     Error(String),
 }
 
@@ -45,7 +48,7 @@ pub struct MediaWatcher {
     backend: WatchBackend,
     receiver: Receiver<()>,
     pending: Arc<Mutex<PendingMessages>>,
-    raw_pending: Arc<Mutex<PendingMessages>>,
+    raw_pending: Arc<Mutex<RawMessages>>,
     debounce_sender: Sender<()>,
     watched: HashSet<WatchPath>,
 }
@@ -53,7 +56,40 @@ pub struct MediaWatcher {
 #[derive(Default)]
 struct PendingMessages {
     paths: HashSet<PathBuf>,
+    force_rescan: bool,
     errors: Vec<String>,
+}
+
+#[derive(Default)]
+struct RawMessages {
+    dirty: HashMap<PathBuf, SettleRequirement>,
+    ready: HashSet<PathBuf>,
+    force_rescan: bool,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleRequirement {
+    StableMetadata,
+    CloseWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventDisposition {
+    Ignore,
+    Dirty(SettleRequirement),
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+struct SettlingPath {
+    requirement: SettleRequirement,
+    stamp: Option<FileStamp>,
 }
 
 enum WatchBackend {
@@ -78,7 +114,7 @@ impl MediaWatcher {
     pub fn new(repaint: impl Fn() + Send + Sync + 'static) -> Result<Self> {
         let (sender, receiver) = flume::bounded(1);
         let pending = Arc::new(Mutex::new(PendingMessages::default()));
-        let raw_pending = Arc::new(Mutex::new(PendingMessages::default()));
+        let raw_pending = Arc::new(Mutex::new(RawMessages::default()));
         let (debounce_sender, debounce_receiver) = flume::bounded(1);
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(repaint);
         spawn_debouncer(
@@ -88,14 +124,19 @@ impl MediaWatcher {
             pending.clone(),
             repaint,
         );
-        let native_handler = event_handler(debounce_sender.clone(), raw_pending.clone());
+        let native_handler = event_handler(
+            debounce_sender.clone(),
+            raw_pending.clone(),
+            native_close_write_reliable(),
+        );
         let backend = match RecommendedWatcher::new(native_handler, NotifyConfig::default()) {
             Ok(watcher) => WatchBackend::Native(watcher),
             Err(native_error) => {
                 tracing::warn!(%native_error, "native filesystem watcher unavailable; using polling");
                 let notify_config =
                     NotifyConfig::default().with_poll_interval(Duration::from_secs(2));
-                let polling_handler = event_handler(debounce_sender.clone(), raw_pending.clone());
+                let polling_handler =
+                    event_handler(debounce_sender.clone(), raw_pending.clone(), false);
                 let watcher = PollWatcher::new(polling_handler, notify_config)
                     .context("failed to initialize native or polling filesystem watcher")?;
                 WatchBackend::Polling(watcher)
@@ -148,6 +189,9 @@ impl MediaWatcher {
         if !pending.paths.is_empty() {
             messages.push(WatchMessage::Changed(pending.paths.drain().collect()));
         }
+        if std::mem::take(&mut pending.force_rescan) {
+            messages.push(WatchMessage::Rescan);
+        }
         messages.extend(pending.errors.drain(..).map(WatchMessage::Error));
         messages
     }
@@ -158,7 +202,11 @@ impl MediaWatcher {
 
     fn polling_backend(&self) -> Result<WatchBackend> {
         let notify_config = NotifyConfig::default().with_poll_interval(Duration::from_secs(2));
-        let handler = event_handler(self.debounce_sender.clone(), self.raw_pending.clone());
+        let handler = event_handler(
+            self.debounce_sender.clone(),
+            self.raw_pending.clone(),
+            false,
+        );
         let watcher = PollWatcher::new(handler, notify_config)
             .context("failed to initialize polling filesystem watcher")?;
         Ok(WatchBackend::Polling(watcher))
@@ -201,19 +249,44 @@ fn normalized_paths(paths: impl IntoIterator<Item = WatchPath>) -> HashSet<Watch
 
 fn send_raw_result(
     sender: &Sender<()>,
-    pending: &Mutex<PendingMessages>,
+    pending: &Mutex<RawMessages>,
     result: notify::Result<Event>,
+    close_write_reliable: bool,
 ) {
     let mut pending = pending
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut changed = false;
     match result {
-        Ok(event) if event_affects_media(&event.kind) => {
-            changed = !event.paths.is_empty();
-            pending.paths.extend(event.paths);
+        Ok(event) if event.need_rescan() => {
+            pending.force_rescan = true;
+            changed = true;
         }
-        Ok(_) => {}
+        Ok(event) => match event_disposition(&event.kind, close_write_reliable) {
+            EventDisposition::Ignore => {}
+            EventDisposition::Dirty(requirement) => {
+                changed = !event.paths.is_empty();
+                for path in event.paths {
+                    pending.ready.remove(&path);
+                    pending
+                        .dirty
+                        .entry(path)
+                        .and_modify(|current| {
+                            if requirement == SettleRequirement::CloseWrite {
+                                *current = requirement;
+                            }
+                        })
+                        .or_insert(requirement);
+                }
+            }
+            EventDisposition::Ready => {
+                changed = !event.paths.is_empty();
+                for path in event.paths {
+                    pending.dirty.remove(&path);
+                    pending.ready.insert(path);
+                }
+            }
+        },
         Err(error) => {
             pending.errors.push(error.to_string());
             changed = true;
@@ -227,20 +300,41 @@ fn send_raw_result(
 
 fn event_handler(
     sender: Sender<()>,
-    pending: Arc<Mutex<PendingMessages>>,
+    pending: Arc<Mutex<RawMessages>>,
+    close_write_reliable: bool,
 ) -> impl FnMut(notify::Result<Event>) + Send + 'static {
     move |result| {
-        send_raw_result(&sender, &pending, result);
+        send_raw_result(&sender, &pending, result, close_write_reliable);
     }
 }
 
-fn event_affects_media(kind: &EventKind) -> bool {
-    !matches!(kind, EventKind::Access(_))
+fn event_disposition(kind: &EventKind, close_write_reliable: bool) -> EventDisposition {
+    match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => EventDisposition::Ready,
+        EventKind::Access(_) => EventDisposition::Ignore,
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) => EventDisposition::Ready,
+        EventKind::Create(CreateKind::Folder) => EventDisposition::Ready,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_)) => {
+            EventDisposition::Dirty(if close_write_reliable {
+                SettleRequirement::CloseWrite
+            } else {
+                SettleRequirement::StableMetadata
+            })
+        }
+        EventKind::Modify(ModifyKind::Metadata(_))
+        | EventKind::Modify(ModifyKind::Any | ModifyKind::Other)
+        | EventKind::Any
+        | EventKind::Other => EventDisposition::Dirty(SettleRequirement::StableMetadata),
+    }
+}
+
+fn native_close_write_reliable() -> bool {
+    cfg!(any(target_os = "linux", target_os = "android"))
 }
 
 fn spawn_debouncer(
     receiver: Receiver<()>,
-    raw_pending: Arc<Mutex<PendingMessages>>,
+    raw_pending: Arc<Mutex<RawMessages>>,
     sender: Sender<()>,
     pending: Arc<Mutex<PendingMessages>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
@@ -248,25 +342,95 @@ fn spawn_debouncer(
     thread::Builder::new()
         .name("cullr-watch-debounce".to_owned())
         .spawn(move || {
-            while receiver.recv().is_ok() {
-                while receiver.recv_timeout(WATCH_DEBOUNCE).is_ok() {}
+            let mut settling = HashMap::<PathBuf, SettlingPath>::new();
+            loop {
+                let received_event = if settling.is_empty() {
+                    receiver.recv().map(|()| true).map_err(|_| ())
+                } else {
+                    match receiver.recv_timeout(WATCH_DEBOUNCE) {
+                        Ok(()) => Ok(true),
+                        Err(flume::RecvTimeoutError::Timeout) => Ok(false),
+                        Err(flume::RecvTimeoutError::Disconnected) => Err(()),
+                    }
+                };
+                let Ok(received_event) = received_event else {
+                    break;
+                };
+                if received_event {
+                    while receiver.recv_timeout(WATCH_DEBOUNCE).is_ok() {}
+                }
 
-                let mut raw = raw_pending
+                let raw = {
+                    let mut raw = raw_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::mem::take(&mut *raw)
+                };
+                for path in &raw.ready {
+                    settling.remove(path);
+                }
+                for (path, requirement) in raw.dirty {
+                    if raw.ready.contains(&path) {
+                        continue;
+                    }
+                    settling.insert(
+                        path,
+                        SettlingPath {
+                            requirement,
+                            stamp: None,
+                        },
+                    );
+                }
+
+                let mut ready_paths = raw.ready;
+                settling.retain(|path, state| {
+                    if state.requirement == SettleRequirement::CloseWrite {
+                        return true;
+                    }
+                    match file_stamp(path) {
+                        None => {
+                            ready_paths.insert(path.clone());
+                            false
+                        }
+                        Some(stamp) if state.stamp == Some(stamp) => {
+                            ready_paths.insert(path.clone());
+                            false
+                        }
+                        Some(stamp) => {
+                            state.stamp = Some(stamp);
+                            true
+                        }
+                    }
+                });
+
+                let mut output = pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut ready = pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                ready.paths.extend(raw.paths.drain());
-                ready.errors.append(&mut raw.errors);
-                drop(ready);
-                drop(raw);
+                output.paths.extend(ready_paths);
+                output.force_rescan |= raw.force_rescan;
+                output.errors.extend(raw.errors);
+                let changed =
+                    !output.paths.is_empty() || output.force_rescan || !output.errors.is_empty();
+                drop(output);
 
-                let _ = sender.try_send(());
-                repaint();
+                if changed {
+                    let _ = sender.try_send(());
+                    repaint();
+                }
             }
         })
         .expect("failed to start filesystem watch debouncer");
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.is_dir() {
+        return None;
+    }
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 pub fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -276,7 +440,11 @@ pub fn path_is_within(path: &Path, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, time::Instant};
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        time::Instant,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -302,14 +470,63 @@ mod tests {
     }
 
     #[test]
-    fn access_events_do_not_trigger_media_refreshes() {
+    fn event_disposition_waits_for_close_write_when_available() {
         use notify::event::{AccessKind, AccessMode, CreateKind, RemoveKind};
 
-        assert!(!event_affects_media(&EventKind::Access(AccessKind::Open(
-            AccessMode::Read
-        ))));
-        assert!(event_affects_media(&EventKind::Create(CreateKind::File)));
-        assert!(event_affects_media(&EventKind::Remove(RemoveKind::File)));
+        assert_eq!(
+            event_disposition(&EventKind::Access(AccessKind::Open(AccessMode::Read)), true,),
+            EventDisposition::Ignore
+        );
+        assert_eq!(
+            event_disposition(&EventKind::Create(CreateKind::File), true),
+            EventDisposition::Dirty(SettleRequirement::CloseWrite)
+        );
+        assert_eq!(
+            event_disposition(&EventKind::Create(CreateKind::File), false),
+            EventDisposition::Dirty(SettleRequirement::StableMetadata)
+        );
+        assert_eq!(
+            event_disposition(
+                &EventKind::Access(AccessKind::Close(AccessMode::Write)),
+                true,
+            ),
+            EventDisposition::Ready
+        );
+        assert_eq!(
+            event_disposition(&EventKind::Remove(RemoveKind::File), true),
+            EventDisposition::Ready
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn native_watcher_does_not_publish_a_file_while_its_writer_is_open() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("slow.jpg");
+        let mut watcher = MediaWatcher::new(|| {}).unwrap();
+        if watcher.is_polling() {
+            return;
+        }
+        watcher
+            .replace_paths([WatchPath::new(temp.path().to_path_buf(), false)])
+            .unwrap();
+
+        let mut writer = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&file)
+            .unwrap();
+        writer.write_all(b"still being written").unwrap();
+        writer.flush().unwrap();
+
+        assert!(
+            watcher.receiver.recv_timeout(WATCH_DEBOUNCE * 3).is_err(),
+            "a live refresh was published before close-write"
+        );
+
+        drop(writer);
+        wait_for_path(&watcher, &file);
     }
 
     #[test]

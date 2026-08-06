@@ -149,17 +149,22 @@ Video support requires FFmpeg shared libraries available to the system linker.
 
 While the app is open, Cullr watches the active media directory and file-browser
 directory for filesystem changes. Supported files that are added, removed, or
-replaced in place appear automatically after a short 500 ms settling delay.
+replaced in place appear automatically after they have finished writing. Native
+Linux watches use the writer-close event; polling and other backends require the
+file size and modification time to remain stable before refreshing.
 Recursive mode watches the full directory tree. Explicit multi-file launches
 continue to track only the files named on the command line, so unrelated files
-created beside them are not added. Live directory scans run on a background
-worker so large refreshes do not block window input or rendering.
+created beside them are not added. Live directory scans, reconciliation, EXIF
+time metadata, and sorting run on a background worker so large refreshes do not
+block window input or rendering. Only the newest pending media and browser
+results are retained during bursts of filesystem activity.
 
 Cullr prefers native filesystem notifications and falls back to low-frequency
 polling when the platform watcher is unavailable. Automatic updates preserve
 unchanged previews and queued deletions; a queued file is unqueued if it changes
-or disappears. `shift+R` remains a full manual rescan and intentionally clears
-the entire delete queue and decoded-media cache.
+or disappears. Time sorting skips EXIF reads for source files larger than 64 MiB
+and falls back to filesystem timestamps. `shift+R` remains a full manual rescan
+and intentionally clears the entire delete queue and decoded-media cache.
 
 ## Delete Safety
 

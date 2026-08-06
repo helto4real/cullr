@@ -5,12 +5,16 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use exif::{In, Reader, Tag, Value};
 use image::ImageReader;
 use time::{PrimitiveDateTime, macros::format_description};
 
 use crate::state::MediaEntry;
+
+/// Time sorting must never turn a metadata lookup into an unbounded read of a
+/// large TIFF/RAW container. Larger files fall back to filesystem timestamps.
+const MAX_SORT_EXIF_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn enrich_entry(entry: &mut MediaEntry) {
     if !entry.media_kind.is_image() {
@@ -43,7 +47,7 @@ pub fn enrich_entries_for_time_sort(entries: &mut [MediaEntry]) {
         }
         if entry.exif_date.is_none() && !entry.exif_attempted {
             entry.exif_attempted = true;
-            if let Ok(exif) = read_exif_metadata(&entry.path) {
+            if let Ok(exif) = read_exif_metadata_for_sort(&entry.path) {
                 entry.exif_date = exif.date;
                 entry.exif_orientation = entry.exif_orientation.or(exif.orientation);
             }
@@ -99,6 +103,17 @@ pub fn read_exif_metadata(path: &Path) -> Result<ExifMetadata> {
         .and_then(parse_exif_datetime);
 
     Ok(ExifMetadata { date, orientation })
+}
+
+fn read_exif_metadata_for_sort(path: &Path) -> Result<ExifMetadata> {
+    let file_len = path.metadata()?.len();
+    if file_len > MAX_SORT_EXIF_SOURCE_BYTES {
+        return Err(anyhow!(
+            "skipping EXIF time sort for {} byte source",
+            file_len
+        ));
+    }
+    read_exif_metadata(path)
 }
 
 pub fn effective_date(entry: &MediaEntry) -> Option<SystemTime> {
@@ -187,6 +202,18 @@ mod tests {
         enrich_entry(&mut entry);
 
         assert_eq!(entry.dimensions, Some((24, 12)));
+    }
+
+    #[test]
+    fn time_sort_skips_exif_for_oversized_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.tiff");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SORT_EXIF_SOURCE_BYTES + 1).unwrap();
+
+        let error = read_exif_metadata_for_sort(&path).unwrap_err();
+
+        assert!(error.to_string().contains("skipping EXIF time sort"));
     }
 
     fn write_jpeg(path: &Path, width: u32, height: u32) {
