@@ -53,6 +53,7 @@ use crate::refresh::prepare_media_refresh;
 /// Long-edge cap for fit-to-window decodes. A fit view never needs more pixels
 /// than a high-DPI monitor; the GPU handles any further downscaling.
 const FIT_CAP: u32 = 3840;
+const APP_IDENTITY: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"));
 /// Long-edge cap for grid thumbnails.
 const THUMB_CAP: u32 = 320;
 /// How many media files on each side of the current one to decode ahead in preview.
@@ -2493,7 +2494,11 @@ impl GuiApp {
         );
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| ui.label(status));
+            ui.horizontal(|ui| {
+                ui.monospace(APP_IDENTITY);
+                ui.separator();
+                ui.label(status);
+            });
         });
         let mut browser_panel_rect = None;
         if self.state.browser.is_some() {
@@ -4336,12 +4341,12 @@ pub fn run(cli: Cli) -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("cullr")
+            .with_title(APP_IDENTITY)
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "cullr",
+        APP_IDENTITY,
         options,
         Box::new(move |cc| {
             app.attach_watcher(&cc.egui_ctx);
