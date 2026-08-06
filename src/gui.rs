@@ -560,6 +560,22 @@ impl GuiApp {
         self.set_current_index(target as usize);
     }
 
+    fn toggle_queue_current_and_select_next_media(&mut self) {
+        let previous = self.state.current_index;
+        let in_delete_queue = self.state.mode == ViewMode::DeleteQueueGrid;
+        self.state.toggle_queue_current();
+
+        if in_delete_queue {
+            // Removing an entry from the queue already selects the entry that
+            // takes its place in the queue grid.
+            self.finish_selection_change(previous);
+        } else {
+            self.move_by(1);
+        }
+
+        self.status = format!("queued: {}", self.state.queue_count());
+    }
+
     fn browser_is_focused(&self) -> bool {
         self.state
             .browser
@@ -2025,8 +2041,7 @@ impl GuiApp {
                     self.state.enter_delete_queue_grid();
                     self.finish_selection_change(before);
                 } else if i.key_pressed(Key::D) && !i.modifiers.ctrl {
-                    self.state.toggle_queue_current();
-                    self.status = format!("queued: {}", self.state.queue_count());
+                    self.toggle_queue_current_and_select_next_media();
                 }
 
                 // Views / overlays / zoom / sort.
@@ -2545,7 +2560,7 @@ g               toggle grid
 space           play / pause videos
 u / o           rewind / fast-forward active video 10%
 y               show video progress
-d               toggle delete queue
+d               toggle delete queue, then select next media file
 u               unqueue current when no video is active
 shift+D         show delete queue
 ctrl+R          delete queued (confirm)
@@ -3258,6 +3273,43 @@ mod tests {
             &video,
             false
         ));
+    }
+
+    #[test]
+    fn d_queues_current_file_and_selects_the_next_media_file() {
+        let first_image_path = PathBuf::from("/tmp/media/first.jpg");
+        let video_path = PathBuf::from("/tmp/media/between.mp4");
+        let next_image_path = PathBuf::from("/tmp/media/next.jpg");
+        let entries = vec![
+            media_entry(
+                first_image_path.clone(),
+                MediaKind::Image(ImageKind::Jpeg),
+                0,
+            ),
+            media_entry(video_path.clone(), MediaKind::Video(VideoKind::Mp4), 1),
+            media_entry(
+                next_image_path.clone(),
+                MediaKind::Image(ImageKind::Jpeg),
+                2,
+            ),
+        ];
+        let state = app_state(entries, 0);
+        let mut app = GuiApp::new(state, None, true, false, PathBuf::from("/tmp/media"));
+
+        app.toggle_queue_current_and_select_next_media();
+
+        assert!(app.state.delete_queue.contains(&first_image_path));
+        assert_eq!(app.state.current_path().as_ref(), Some(&video_path));
+
+        app.toggle_queue_current_and_select_next_media();
+
+        assert!(app.state.delete_queue.contains(&video_path));
+        assert_eq!(app.state.current_path().as_ref(), Some(&next_image_path));
+
+        app.toggle_queue_current_and_select_next_media();
+
+        assert!(app.state.delete_queue.contains(&next_image_path));
+        assert_eq!(app.state.current_path().as_ref(), Some(&next_image_path));
     }
 
     #[test]

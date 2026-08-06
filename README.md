@@ -103,7 +103,7 @@ Multiple explicit files still open as the focused grid review set.
 | `space` | Play or pause the current video. |
 | `u` / `o` | Rewind or fast-forward the active video by 10%. |
 | `y` | Briefly show the active video progress overlay. |
-| `d` | Toggle the current file in the delete queue. |
+| `d` | Toggle the current file in the delete queue, then select the next media file. |
 | `u` | Remove the current file from the delete queue when no video is active. |
 | `shift+D` | Show the delete queue grid. |
 | `ctrl+R` | Confirm deletion for queued files. |
