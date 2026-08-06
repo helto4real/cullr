@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -32,7 +32,7 @@ use crate::{
         preferred_browser_index, read_browser_entries_with_sort,
     },
     cli::{Cli, CliViewMode},
-    decode::{decode_rgba_capped, estimated_image_decode_bytes},
+    decode::{decode_rgba_capped, estimated_color_image_decode_bytes},
     delete, metadata,
     refresh::{
         BrowserRefreshScope, MediaRefreshOutput, MediaRefreshScope, RefreshResult, RefreshService,
@@ -68,7 +68,7 @@ const DECODE_QUEUE_CAPACITY: usize = 48;
 const DECODE_RESULT_CAPACITY: usize = 8;
 /// Keep image conversion and GPU texture creation from monopolizing a frame.
 /// Decoding remains parallel, but uploads are deliberately paced on the UI thread.
-const DECODE_UPLOADS_PER_FRAME: usize = 2;
+const DECODE_UPLOADS_PER_FRAME: usize = 1;
 const DECODE_MEMORY_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Grid cell edge in points.
 const CELL: f32 = 168.0;
@@ -80,6 +80,12 @@ const EMPTY_MEDIA_PROMPT: &str = "press `r` for recursive search or `q` to quit"
 const BROWSER_APPLY_DEBOUNCE_SECONDS: f64 = 0.12;
 const VIDEO_PROGRESS_OVERLAY_SECONDS: f64 = 2.0;
 const VIDEO_PROGRESS_OVERLAY_FADE_SECONDS: f32 = 0.18;
+
+fn request_background_repaint(enabled: &AtomicBool, request_repaint: impl FnOnce()) {
+    if enabled.load(Ordering::Relaxed) {
+        request_repaint();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Variant {
@@ -123,11 +129,13 @@ impl TexKey {
 
 struct DecodeRequest {
     key: TexKey,
+    work_epoch: u64,
 }
 
 struct DecodeResult {
     key: TexKey,
-    image: std::result::Result<image::RgbaImage, String>,
+    work_epoch: u64,
+    image: std::result::Result<egui::ColorImage, String>,
     _memory_permit: Option<DecodeMemoryPermit>,
 }
 
@@ -205,7 +213,7 @@ impl Drop for DecodeMemoryPermit {
 struct DecodeService {
     job_tx: Sender<DecodeRequest>,
     result_rx: Receiver<DecodeResult>,
-    generation: Arc<AtomicU64>,
+    work_epoch: Arc<AtomicU64>,
     _memory_budget: Arc<DecodeMemoryBudget>,
 }
 
@@ -213,7 +221,7 @@ impl DecodeService {
     fn new() -> Self {
         let (job_tx, job_rx) = flume::bounded::<DecodeRequest>(DECODE_QUEUE_CAPACITY);
         let (result_tx, result_rx) = flume::bounded::<DecodeResult>(DECODE_RESULT_CAPACITY);
-        let generation = Arc::new(AtomicU64::new(0));
+        let work_epoch = Arc::new(AtomicU64::new(0));
         let memory_budget = DecodeMemoryBudget::new(DECODE_MEMORY_BUDGET_BYTES);
         let workers = thread::available_parallelism()
             .map(|count| count.get().clamp(2, 6))
@@ -221,11 +229,11 @@ impl DecodeService {
         for _ in 0..workers {
             let job_rx = job_rx.clone();
             let result_tx = result_tx.clone();
-            let generation = generation.clone();
+            let work_epoch = work_epoch.clone();
             let memory_budget = Arc::clone(&memory_budget);
             thread::spawn(move || {
                 for job in job_rx.iter() {
-                    if job.key.generation != generation.load(Ordering::Relaxed) {
+                    if job.work_epoch != work_epoch.load(Ordering::Relaxed) {
                         continue;
                     }
                     let reservation = match decode_memory_reservation(&job.key) {
@@ -233,6 +241,7 @@ impl DecodeService {
                         Err(error) => {
                             let _ = result_tx.send(DecodeResult {
                                 key: job.key,
+                                work_epoch: job.work_epoch,
                                 image: Err(error),
                                 _memory_permit: None,
                             });
@@ -244,13 +253,14 @@ impl DecodeService {
                         Err(error) => {
                             let _ = result_tx.send(DecodeResult {
                                 key: job.key,
+                                work_epoch: job.work_epoch,
                                 image: Err(error.to_string()),
                                 _memory_permit: None,
                             });
                             continue;
                         }
                     };
-                    if job.key.generation != generation.load(Ordering::Relaxed) {
+                    if job.work_epoch != work_epoch.load(Ordering::Relaxed) {
                         continue;
                     }
                     let image = match &job.key.media_kind {
@@ -261,14 +271,16 @@ impl DecodeService {
                             video::decode_first_frame_rgba(&job.key.path, job.key.variant.cap())
                         }
                     }
+                    .map(color_image_from_rgba)
                     .map_err(|e| format!("{e:#}"));
-                    if job.key.generation != generation.load(Ordering::Relaxed) {
+                    if job.work_epoch != work_epoch.load(Ordering::Relaxed) {
                         continue;
                     }
                     tracing::debug!(path = %job.key.path.display(), ok = image.is_ok(), "decoded");
                     let memory_permit = image.is_ok().then_some(memory_permit);
                     let _ = result_tx.send(DecodeResult {
                         key: job.key,
+                        work_epoch: job.work_epoch,
                         image,
                         _memory_permit: memory_permit,
                     });
@@ -278,28 +290,49 @@ impl DecodeService {
         Self {
             job_tx,
             result_rx,
-            generation,
+            work_epoch,
             _memory_budget: memory_budget,
         }
     }
 
     fn request(&self, key: TexKey) -> bool {
-        self.job_tx.try_send(DecodeRequest { key }).is_ok()
+        let work_epoch = self.work_epoch.load(Ordering::Relaxed);
+        self.job_tx
+            .try_send(DecodeRequest { key, work_epoch })
+            .is_ok()
     }
 
-    fn set_generation(&self, generation: u64) {
-        self.generation.store(generation, Ordering::Relaxed);
+    fn cancel_pending(&self) {
+        self.work_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn accepts(&self, work_epoch: u64) -> bool {
+        work_epoch == self.work_epoch.load(Ordering::Relaxed)
     }
 }
 
 fn decode_memory_reservation(key: &TexKey) -> std::result::Result<usize, String> {
     match &key.media_kind {
-        MediaKind::Image(_) => estimated_image_decode_bytes(&key.path, key.variant.cap())
+        MediaKind::Image(_) => estimated_color_image_decode_bytes(&key.path, key.variant.cap())
             .map_err(|error| format!("{error:#}")),
         // FFmpeg may retain a native-resolution source frame while producing
         // the scaled RGBA frame, so video decode is serialized at full budget.
         MediaKind::Video(_) => Ok(DECODE_MEMORY_BUDGET_BYTES),
     }
+}
+
+fn color_image_from_rgba(image: image::RgbaImage) -> egui::ColorImage {
+    let size = [image.width() as usize, image.height() as usize];
+    egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw())
+}
+
+fn preview_decode_allowed(
+    index: usize,
+    current: usize,
+    path: &Path,
+    deferred_preview_prefetch: &HashSet<PathBuf>,
+) -> bool {
+    index == current || !deferred_preview_prefetch.contains(path)
 }
 
 struct TextureCache {
@@ -391,6 +424,9 @@ struct GuiApp {
     pending_sort: Option<crate::state::SortMode>,
     pending_enrich: bool,
     pending_rescan: bool,
+    deferred_preview_prefetch: HashSet<PathBuf>,
+    paused_live_refresh_pending: bool,
+    background_repaint_enabled: Arc<AtomicBool>,
     watcher: Option<MediaWatcher>,
     watcher_error: Option<String>,
     refresh: Option<RefreshService>,
@@ -457,6 +493,9 @@ impl GuiApp {
             pending_sort: None,
             pending_enrich: false,
             pending_rescan: false,
+            deferred_preview_prefetch: HashSet::new(),
+            paused_live_refresh_pending: false,
+            background_repaint_enabled: Arc::new(AtomicBool::new(true)),
             watcher: None,
             watcher_error: None,
             refresh: None,
@@ -490,11 +529,18 @@ impl GuiApp {
 
     fn invalidate_decodes(&mut self) {
         self.decode_generation = self.decode_generation.wrapping_add(1);
-        self.decoder.set_generation(self.decode_generation);
+        self.decoder.cancel_pending();
         self.previews.clear();
         self.thumbs.clear();
         self.inflight.clear();
         self.failed.clear();
+        self.deferred_preview_prefetch.clear();
+    }
+
+    fn cancel_pending_decodes(&mut self) {
+        self.decoder.cancel_pending();
+        self.inflight.clear();
+        self.decode_retry_pending = false;
     }
 
     /// Move the selection by `delta` entries, clamped to the list bounds.
@@ -899,6 +945,9 @@ impl GuiApp {
         if len == 0 {
             return;
         }
+        if self.paused_video_preview_active() {
+            return;
+        }
         match self.state.mode {
             ViewMode::Preview => {
                 let variant = self.preview_variant();
@@ -911,9 +960,23 @@ impl GuiApp {
                     }
                 }
                 for index in wanted {
-                    if let Some(entry) = self.state.entries.get(index) {
-                        self.request(TexKey::for_entry(entry, variant, self.decode_generation));
+                    let Some(entry) = self.state.entries.get(index) else {
+                        continue;
+                    };
+                    if !preview_decode_allowed(
+                        index,
+                        current,
+                        &entry.path,
+                        &self.deferred_preview_prefetch,
+                    ) {
+                        continue;
                     }
+                    let selected_path = (index == current).then(|| entry.path.clone());
+                    let key = TexKey::for_entry(entry, variant, self.decode_generation);
+                    if let Some(path) = selected_path {
+                        self.deferred_preview_prefetch.remove(&path);
+                    }
+                    self.request(key);
                 }
             }
             ViewMode::Grid | ViewMode::DeleteQueueGrid => {
@@ -956,13 +1019,13 @@ impl GuiApp {
                 break;
             };
             self.inflight.remove(&result.key);
-            if result.key.generation != self.decode_generation {
+            if result.key.generation != self.decode_generation
+                || !self.decoder.accepts(result.work_epoch)
+            {
                 continue;
             }
             match result.image {
-                Ok(image) => {
-                    let size = [image.width() as usize, image.height() as usize];
-                    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+                Ok(color) => {
                     let handle = ctx.load_texture(
                         result.key.path.to_string_lossy(),
                         color,
@@ -1006,9 +1069,9 @@ impl GuiApp {
             if event.error.is_some() {
                 active.ended = true;
             }
-            if let Some(image) = event.frame {
-                let size = [image.width() as usize, image.height() as usize];
-                let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+            if let Some(color) = event.frame
+                && should_apply_video_frame(active.handle.is_paused(), active.texture.is_some())
+            {
                 if let Some(texture) = active.texture.as_mut() {
                     texture.set(color, egui::TextureOptions::LINEAR);
                 } else {
@@ -1031,6 +1094,7 @@ impl GuiApp {
                 self.play_next_video_after_current();
             }
         }
+        self.sync_background_repaint_gate();
     }
 
     fn current_is_video(&self) -> bool {
@@ -1061,6 +1125,22 @@ impl GuiApp {
         self.active_video
             .as_ref()
             .is_some_and(|active| !active.handle.is_paused() && !active.ended)
+    }
+
+    fn paused_video_preview_active(&self) -> bool {
+        if self.state.mode != ViewMode::Preview {
+            return false;
+        }
+        let Some(current_path) = self.state.current_entry().map(|entry| &entry.path) else {
+            return false;
+        };
+        self.active_video_for(current_path)
+            .is_some_and(|active| active.handle.is_paused() && !active.ended)
+    }
+
+    fn sync_background_repaint_gate(&self) {
+        self.background_repaint_enabled
+            .store(!self.paused_video_preview_active(), Ordering::Relaxed);
     }
 
     fn active_video_progress_for(&self, path: &Path) -> Option<VideoProgress> {
@@ -1114,6 +1194,8 @@ impl GuiApp {
             if let Some(active) = &self.active_video {
                 active.handle.set_paused(true);
             }
+            self.cancel_pending_decodes();
+            self.sync_background_repaint_gate();
             self.status = "video paused: window lost focus".to_owned();
         }
         self.selection_autoplay_armed = effect.selection_autoplay_armed;
@@ -1124,6 +1206,7 @@ impl GuiApp {
         if let Some(active) = self.active_video.take() {
             active.handle.stop();
         }
+        self.sync_background_repaint_gate();
         self.hide_video_progress_overlay();
     }
 
@@ -1160,6 +1243,10 @@ impl GuiApp {
             duration: None,
             ended: false,
         });
+        if paused {
+            self.cancel_pending_decodes();
+        }
+        self.sync_background_repaint_gate();
         self.status = if paused {
             "video paused".to_owned()
         } else if self.video_muted {
@@ -1185,6 +1272,10 @@ impl GuiApp {
             let paused = !active.handle.is_paused();
             active.handle.set_paused(paused);
             self.selection_autoplay_armed = selection_autoplay_after_pause_state(paused);
+            if paused {
+                self.cancel_pending_decodes();
+            }
+            self.sync_background_repaint_gate();
             self.status = if paused {
                 "video paused".to_owned()
             } else {
@@ -1364,9 +1455,19 @@ impl GuiApp {
 
     fn attach_watcher(&mut self, ctx: &egui::Context) {
         let refresh_ctx = ctx.clone();
-        self.refresh = Some(RefreshService::new(move || refresh_ctx.request_repaint()));
+        let refresh_repaint_enabled = Arc::clone(&self.background_repaint_enabled);
+        self.refresh = Some(RefreshService::new(move || {
+            request_background_repaint(&refresh_repaint_enabled, || {
+                refresh_ctx.request_repaint();
+            });
+        }));
         let repaint_ctx = ctx.clone();
-        match MediaWatcher::new(move || repaint_ctx.request_repaint()) {
+        let watcher_repaint_enabled = Arc::clone(&self.background_repaint_enabled);
+        match MediaWatcher::new(move || {
+            request_background_repaint(&watcher_repaint_enabled, || {
+                repaint_ctx.request_repaint();
+            });
+        }) {
             Ok(watcher) => {
                 let polling = watcher.is_polling();
                 self.watcher = Some(watcher);
@@ -1462,6 +1563,13 @@ impl GuiApp {
                     .any(|path| path_affects_flat_directory(path, &browser.listed_directory))
             });
 
+        if (refresh_library || refresh_browser) && self.paused_video_preview_active() {
+            self.paused_live_refresh_pending = true;
+            self.status = "live update deferred while video is paused".to_owned();
+            self.sync_watcher_paths();
+            return;
+        }
+
         if refresh_library {
             self.request_live_media_refresh();
         }
@@ -1521,6 +1629,16 @@ impl GuiApp {
         }
     }
 
+    fn flush_deferred_live_refresh(&mut self) {
+        if !self.paused_live_refresh_pending || self.paused_video_preview_active() {
+            return;
+        }
+        self.paused_live_refresh_pending = false;
+        self.request_live_media_refresh();
+        self.request_live_browser_refresh();
+        self.status = "refreshing changes deferred while video was paused".to_owned();
+    }
+
     fn drain_refresh_results(&mut self) {
         let results = self
             .refresh
@@ -1549,6 +1667,10 @@ impl GuiApp {
                     self.request_live_media_refresh();
                     return;
                 }
+                if self.paused_video_preview_active() {
+                    self.paused_live_refresh_pending = true;
+                    return;
+                }
                 match result {
                     Ok(entries) => self.apply_live_media_entries(entries),
                     Err(error) => self.status = format!("live refresh failed: {error}"),
@@ -1562,6 +1684,10 @@ impl GuiApp {
                 if generation != self.browser_refresh_generation
                     || self.browser_refresh_scope().as_ref() != Some(&scope)
                 {
+                    return;
+                }
+                if self.paused_video_preview_active() {
+                    self.paused_live_refresh_pending = true;
                     return;
                 }
                 match result {
@@ -1582,6 +1708,21 @@ impl GuiApp {
             return;
         }
 
+        let present_paths = reconciliation
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<HashSet<_>>();
+        self.deferred_preview_prefetch
+            .retain(|path| present_paths.contains(path));
+        self.deferred_preview_prefetch.extend(
+            reconciliation
+                .entries
+                .iter()
+                .filter(|entry| !reconciliation.unchanged_paths.contains(&entry.path))
+                .map(|entry| entry.path.clone()),
+        );
+
         if previous_path
             .as_ref()
             .is_some_and(|path| reconciliation.invalidated_paths.contains(path))
@@ -1599,6 +1740,9 @@ impl GuiApp {
         let updated = reconciliation.updated;
         self.state
             .set_entries_preserving_current(reconciliation.entries, previous_path);
+        if let Some(current_path) = self.state.current_path() {
+            self.deferred_preview_prefetch.remove(&current_path);
+        }
         self.sync_browser_to_current_path();
         self.scroll_to_current = true;
         self.status = format!("live update: +{} -{} ~{}", added, removed, updated);
@@ -2430,6 +2574,8 @@ impl GuiApp {
         let focused = ctx.input(|input| input.focused);
         self.handle_focus_change(focused);
         self.handle_input(ctx);
+        self.sync_background_repaint_gate();
+        self.flush_deferred_live_refresh();
         self.sync_watcher_paths();
         self.drain_watcher();
         self.drain_refresh_results();
@@ -2573,6 +2719,10 @@ fn should_show_media_type_badge(
     badges_visible
         && media_mode == MediaMode::Both
         && !(media_kind.is_video() && active_video_playing)
+}
+
+fn should_apply_video_frame(paused: bool, has_texture: bool) -> bool {
+    !paused || !has_texture
 }
 
 fn draw_media_type_badge(ui: &egui::Ui, cell_rect: egui::Rect, media_kind: &MediaKind) {
@@ -3055,6 +3205,19 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn background_repaint_requests_respect_the_pause_gate() {
+        let enabled = AtomicBool::new(false);
+        let calls = std::cell::Cell::new(0);
+
+        request_background_repaint(&enabled, || calls.set(calls.get() + 1));
+        assert_eq!(calls.get(), 0);
+
+        enabled.store(true, Ordering::Relaxed);
+        request_background_repaint(&enabled, || calls.set(calls.get() + 1));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
     fn media_type_badge_visibility_matches_mode_and_playback() {
         let image = MediaKind::Image(ImageKind::Jpeg);
         let video = MediaKind::Video(VideoKind::Mp4);
@@ -3094,6 +3257,28 @@ mod tests {
             MediaMode::Video,
             &video,
             false
+        ));
+    }
+
+    #[test]
+    fn paused_video_drops_queued_frames_after_its_preview_exists() {
+        assert!(!should_apply_video_frame(true, true));
+        assert!(should_apply_video_frame(true, false));
+        assert!(should_apply_video_frame(false, true));
+    }
+
+    #[test]
+    fn live_arrivals_are_only_decoded_when_they_become_current() {
+        let path = PathBuf::from("newly-arrived.png");
+        let deferred = HashSet::from([path.clone()]);
+
+        assert!(!preview_decode_allowed(1, 0, &path, &deferred));
+        assert!(preview_decode_allowed(1, 1, &path, &deferred));
+        assert!(preview_decode_allowed(
+            1,
+            0,
+            Path::new("already-known.png"),
+            &deferred,
         ));
     }
 
@@ -3172,6 +3357,16 @@ mod tests {
 
         assert!(budget.acquire(101).is_err());
         assert_eq!(*budget.available.lock().unwrap(), 100);
+    }
+
+    #[test]
+    fn cancelling_decode_work_rejects_results_from_the_previous_epoch() {
+        let decoder = DecodeService::new();
+
+        assert!(decoder.accepts(0));
+        decoder.cancel_pending();
+        assert!(!decoder.accepts(0));
+        assert!(decoder.accepts(1));
     }
 
     #[test]
@@ -3835,6 +4030,7 @@ mod tests {
         assert!(!app.state.delete_queue.contains(&modified));
         assert!(!app.state.delete_queue.contains(&removed));
         assert!(app.state.entries.iter().any(|entry| entry.path == added));
+        assert!(app.deferred_preview_prefetch.contains(&added));
         assert!(app.status.contains("live update: +1 -1 ~1"));
         assert!(app.status.contains("unqueued 2 changed deletion"));
     }
@@ -3967,6 +4163,54 @@ mod tests {
 
         assert_eq!(app.state.entries[0].path, original.path);
         assert_eq!(app.media_refresh_generation, 3);
+    }
+
+    #[test]
+    fn paused_video_defers_live_refresh_until_playback_resumes() {
+        let video_path = PathBuf::from("/tmp/media/current.mp4");
+        let current = media_entry(video_path.clone(), MediaKind::Video(VideoKind::Mp4), 0);
+        let added = media_entry(
+            PathBuf::from("/tmp/media/added.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            1,
+        );
+        let state = app_state(vec![current.clone()], 0);
+        let mut app = GuiApp::new(state, None, true, false, PathBuf::from("/tmp/media"));
+        app.state.mode = ViewMode::Preview;
+        app.active_video = Some(ActiveVideo {
+            handle: video::PlaybackHandle::test_handle(video_path, true),
+            texture: None,
+            position: Duration::ZERO,
+            duration: None,
+            ended: false,
+        });
+        app.sync_background_repaint_gate();
+        assert!(!app.background_repaint_enabled.load(Ordering::Relaxed));
+        app.media_refresh_generation = 1;
+        let scope = app.media_refresh_scope();
+
+        app.handle_refresh_result(RefreshResult::Media {
+            generation: 1,
+            scope,
+            sort_mode: SortMode::Discovered,
+            result: Ok(prepare_media_refresh(
+                vec![current.clone()],
+                vec![current, added],
+                SortMode::Discovered,
+                None,
+            )),
+        });
+
+        assert_eq!(app.state.entries.len(), 1);
+        assert!(app.paused_live_refresh_pending);
+
+        app.active_video.as_ref().unwrap().handle.set_paused(false);
+        app.sync_background_repaint_gate();
+        app.flush_deferred_live_refresh();
+
+        assert!(app.background_repaint_enabled.load(Ordering::Relaxed));
+        assert!(!app.paused_live_refresh_pending);
+        assert_eq!(app.media_refresh_generation, 2);
     }
 
     #[test]

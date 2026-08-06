@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context as AnyhowContext, Result, anyhow};
+use eframe::egui;
 use ffmpeg::{
     ChannelLayout, Rational, codec,
     codec::packet::side_data::Type as PacketSideDataType,
@@ -34,7 +35,7 @@ const MAX_RGBA_FRAME_BYTES: usize = 512 * 1024 * 1024;
 pub struct PlaybackEvent {
     pub playback_id: u64,
     pub path: PathBuf,
-    pub frame: Option<RgbaImage>,
+    pub frame: Option<egui::ColorImage>,
     pub position: Option<Duration>,
     pub duration: Option<Duration>,
     pub ended: bool,
@@ -76,6 +77,19 @@ impl PlaybackHandle {
 
     pub fn stop(&self) {
         self.controls.stop.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_handle(path: PathBuf, paused: bool) -> Self {
+        Self {
+            id: NEXT_PLAYBACK_ID.fetch_add(1, Ordering::SeqCst),
+            path,
+            controls: Arc::new(PlaybackControls {
+                stop: AtomicBool::new(false),
+                paused: AtomicBool::new(paused),
+                muted: AtomicBool::new(true),
+            }),
+        }
     }
 }
 
@@ -294,11 +308,16 @@ fn send_playback_frame(
     {
         return false;
     }
+    if timeline.sent_frames > 0 && controls.paused.load(Ordering::SeqCst) {
+        return true;
+    }
 
+    let size = [frame.image.width() as usize, frame.image.height() as usize];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, frame.image.as_raw());
     let event = PlaybackEvent {
         playback_id,
         path: path.to_path_buf(),
-        frame: Some(frame.image),
+        frame: Some(image),
         position: Some(pts),
         duration: timeline.duration,
         ended: false,

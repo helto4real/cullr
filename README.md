@@ -157,7 +157,16 @@ continue to track only the files named on the command line, so unrelated files
 created beside them are not added. Live directory scans, reconciliation, EXIF
 time metadata, and sorting run on a background worker so large refreshes do not
 block window input or rendering. Only the newest pending media and browser
-results are retained during bursts of filesystem activity.
+results are retained during bursts of filesystem activity. Newly arrived files
+are not full-size preview-prefetched until selected; visible grid thumbnails
+remain available. A paused video keeps its displayed frame and discards late
+queued frames instead of uploading them when a filesystem event wakes the UI.
+Pausing also cancels pending full-size preview work while preserving textures
+that are already resident. Filesystem refreshes are deferred entirely while a
+video preview is paused, then coalesced into one current refresh after playback
+resumes or the selection changes. Watcher and refresh-worker repaint requests
+are also suppressed during the pause, so filesystem activity cannot force a GPU
+present while another workload is writing a large file.
 
 Cullr prefers native filesystem notifications and falls back to low-frequency
 polling when the platform watcher is unavailable. Automatic updates preserve

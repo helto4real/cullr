@@ -21,6 +21,21 @@ struct DecodeSafetyLimit;
 /// this to reserve capacity before starting work so parallel workers cannot
 /// each materialize a maximum-sized image at the same time.
 pub(crate) fn estimated_image_decode_bytes(path: &Path, cap: u32) -> Result<usize> {
+    estimate_image_decode(path, cap).map(|(decode_bytes, _)| decode_bytes)
+}
+
+/// Include the second RGBA-sized allocation needed to convert a decoded image
+/// into egui's texture input on a worker thread.
+pub(crate) fn estimated_color_image_decode_bytes(path: &Path, cap: u32) -> Result<usize> {
+    let (decode_bytes, output_bytes) = estimate_image_decode(path, cap)?;
+    let conversion_bytes = output_bytes
+        .checked_mul(2)
+        .filter(|bytes| *bytes <= MAX_RGBA_DECODE_BYTES)
+        .ok_or(DecodeSafetyLimit)?;
+    Ok(decode_bytes.max(conversion_bytes))
+}
+
+fn estimate_image_decode(path: &Path, cap: u32) -> Result<(usize, usize)> {
     let encoded_bytes = std::fs::metadata(path)
         .ok()
         .and_then(|metadata| usize::try_from(metadata.len()).ok())
@@ -34,7 +49,7 @@ pub(crate) fn estimated_image_decode_bytes(path: &Path, cap: u32) -> Result<usiz
         .and_then(|reader| reader.with_guessed_format().ok());
     let format = reader.as_ref().and_then(image::ImageReader::format);
     let Some((width, height)) = reader.and_then(|reader| reader.into_dimensions().ok()) else {
-        return Ok(MAX_RGBA_DECODE_BYTES);
+        return Ok((MAX_RGBA_DECODE_BYTES, 0));
     };
 
     let (target_width, target_height) = if cap == u32::MAX {
@@ -68,7 +83,10 @@ pub(crate) fn estimated_image_decode_bytes(path: &Path, cap: u32) -> Result<usiz
             .ok_or(DecodeSafetyLimit)?
     };
 
-    checked_decode_reservation([encoded_bytes, retained_bytes, output_bytes])
+    Ok((
+        checked_decode_reservation([encoded_bytes, retained_bytes, output_bytes])?,
+        output_bytes,
+    ))
 }
 
 fn checked_decode_reservation(parts: [usize; 3]) -> Result<usize> {
