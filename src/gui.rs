@@ -416,6 +416,7 @@ struct GuiApp {
     active_video: Option<ActiveVideo>,
     video_muted: bool,
     selection_autoplay_armed: bool,
+    repeat_video: bool,
     auto_next: bool,
     media_type_badges_visible: bool,
     video_progress_overlay_visible_until: f64,
@@ -486,6 +487,7 @@ impl GuiApp {
             active_video: None,
             video_muted: true,
             selection_autoplay_armed: false,
+            repeat_video: false,
             auto_next,
             media_type_badges_visible: true,
             video_progress_overlay_visible_until: 0.0,
@@ -1106,8 +1108,17 @@ impl GuiApp {
             if let Some(status) = terminal_status {
                 self.status = status;
             }
-            if event.ended && self.auto_next && !failed {
-                self.play_next_video_after_current();
+            match playback_end_action(event.ended, failed, self.repeat_video, self.auto_next) {
+                PlaybackEndAction::None => {}
+                PlaybackEndAction::RepeatCurrent => {
+                    self.start_video_playback(event.path);
+                    self.status = if self.video_muted {
+                        "video repeating muted".to_owned()
+                    } else {
+                        "video repeating with audio".to_owned()
+                    };
+                }
+                PlaybackEndAction::Advance => self.play_next_video_after_current(),
             }
         }
         self.sync_background_repaint_gate();
@@ -1391,6 +1402,15 @@ impl GuiApp {
             "auto-next enabled".to_owned()
         } else {
             "auto-next disabled".to_owned()
+        };
+    }
+
+    fn toggle_repeat_video(&mut self) {
+        self.repeat_video = !self.repeat_video;
+        self.status = if self.repeat_video {
+            "video repeat enabled".to_owned()
+        } else {
+            "video repeat disabled".to_owned()
         };
     }
 
@@ -1909,6 +1929,9 @@ impl GuiApp {
             }
             if i.key_pressed(Key::A) {
                 self.toggle_auto_next();
+            }
+            if i.key_pressed(Key::P) {
+                self.toggle_repeat_video();
             }
             if i.key_pressed(Key::Questionmark) {
                 self.state.show_help_overlay = !self.state.show_help_overlay;
@@ -2568,6 +2591,7 @@ z               toggle fit / actual size
 f               toggle fullscreen window
 m               mute / unmute video audio
 a               toggle auto-next video advance
+p               toggle sticky video repeat
 b               show / hide media badges
 t / n           cycle right-pane time / name sort
 r               toggle recursive scan
@@ -2646,10 +2670,11 @@ impl GuiApp {
             )
         };
         let status = format!(
-            "{mode}  |  {position}  |  {zoom}  |  queued: {}  |  sort: {:?}  |  audio: {}  |  auto-next: {}  |  {}",
+            "{mode}  |  {position}  |  {zoom}  |  queued: {}  |  sort: {:?}  |  audio: {}  |  repeat: {}  |  auto-next: {}  |  {}",
             self.state.queue_count(),
             self.state.sort_mode,
             if self.video_muted { "muted" } else { "on" },
+            if self.repeat_video { "on" } else { "off" },
             if self.auto_next { "on" } else { "off" },
             self.status,
         );
@@ -3186,6 +3211,30 @@ fn playback_terminal_status(ended: bool, error: Option<&str>) -> Option<String> 
         Some("video ended".to_owned())
     } else {
         None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackEndAction {
+    None,
+    RepeatCurrent,
+    Advance,
+}
+
+fn playback_end_action(
+    ended: bool,
+    failed: bool,
+    repeat_video: bool,
+    auto_next: bool,
+) -> PlaybackEndAction {
+    if !ended || failed {
+        PlaybackEndAction::None
+    } else if repeat_video {
+        PlaybackEndAction::RepeatCurrent
+    } else if auto_next {
+        PlaybackEndAction::Advance
+    } else {
+        PlaybackEndAction::None
     }
 }
 
@@ -4457,6 +4506,54 @@ mod tests {
         assert_eq!(next_video_index_after(&entries, 1), Some(2));
         assert_eq!(next_video_index_after(&entries, 2), None);
         assert_eq!(next_video_index_after(&entries, usize::MAX), None);
+    }
+
+    #[test]
+    fn repeat_takes_precedence_over_auto_next_and_never_retries_failures() {
+        assert_eq!(
+            playback_end_action(true, false, true, true),
+            PlaybackEndAction::RepeatCurrent
+        );
+        assert_eq!(
+            playback_end_action(true, false, false, true),
+            PlaybackEndAction::Advance
+        );
+        assert_eq!(
+            playback_end_action(true, true, true, true),
+            PlaybackEndAction::None
+        );
+        assert_eq!(
+            playback_end_action(false, false, true, true),
+            PlaybackEndAction::None
+        );
+    }
+
+    #[test]
+    fn p_toggles_video_repeat_and_selection_keeps_it_sticky() {
+        let entries = vec![
+            media_entry(
+                PathBuf::from("/tmp/media/first.mp4"),
+                MediaKind::Video(VideoKind::Mp4),
+                0,
+            ),
+            media_entry(
+                PathBuf::from("/tmp/media/second.mp4"),
+                MediaKind::Video(VideoKind::Mp4),
+                1,
+            ),
+        ];
+        let state = app_state(entries, 0);
+        let mut app = GuiApp::new(state, None, true, false, PathBuf::from("/tmp/media"));
+        let ctx = egui::Context::default();
+
+        run_frame(&mut app, &ctx, vec![key_press(egui::Key::P)]);
+        assert!(app.repeat_video);
+
+        app.set_current_index(1);
+        assert!(app.repeat_video);
+
+        run_frame(&mut app, &ctx, vec![key_press(egui::Key::P)]);
+        assert!(!app.repeat_video);
     }
 
     #[test]

@@ -112,6 +112,7 @@ Multiple explicit files still open as the focused grid review set.
 | `f` | Toggle fullscreen window mode. |
 | `m` | Mute or unmute video audio. Videos start muted. |
 | `a` | Toggle automatically advancing to the next video when playback ends. |
+| `p` | Toggle sticky repeat mode for the current and subsequently selected videos. |
 | `b` | Show or hide gallery media-type badges. |
 | `t` | Cycle time sorting in the focused pane. |
 | `n` | Cycle name sorting in the focused pane. |
