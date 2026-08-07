@@ -6,17 +6,32 @@ use icu::{
 };
 
 use crate::{
-    metadata::{effective_date, enrich_entries_for_time_sort},
+    metadata::{effective_date, enrich_entries_for_time_sort_cancellable},
     state::{MediaEntry, SortMode},
 };
 
 pub fn sort_entries(entries: &mut [MediaEntry], mode: SortMode, locale: Option<&str>) {
+    let completed = sort_entries_cancellable(entries, mode, locale, &|| false);
+    debug_assert!(completed, "cancellation is disabled");
+}
+
+pub(crate) fn sort_entries_cancellable(
+    entries: &mut [MediaEntry],
+    mode: SortMode,
+    locale: Option<&str>,
+    cancelled: &impl Fn() -> bool,
+) -> bool {
+    if cancelled() {
+        return false;
+    }
     match mode {
         SortMode::Discovered => {
             entries.sort_by_key(|entry| entry.discovered_order);
         }
         SortMode::Newest | SortMode::Oldest => {
-            enrich_entries_for_time_sort(entries);
+            if !enrich_entries_for_time_sort_cancellable(entries, cancelled) {
+                return false;
+            }
             entries.sort_by(|a, b| compare_time(a, b, mode));
         }
         SortMode::NameAsc | SortMode::NameDesc => {
@@ -24,6 +39,7 @@ pub fn sort_entries(entries: &mut [MediaEntry], mode: SortMode, locale: Option<&
             entries.sort_by(|a, b| compare_name(a, b, mode, collator.as_ref()));
         }
     }
+    !cancelled()
 }
 
 pub fn next_time_sort(mode: SortMode) -> SortMode {

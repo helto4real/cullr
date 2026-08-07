@@ -102,15 +102,42 @@ fn checked_decode_reservation(parts: [usize; 3]) -> Result<usize> {
 /// down via libjpeg-turbo; other formats decode fully and are then downscaled to
 /// the cap. EXIF orientation is read here so callers need no pre-enriched data.
 pub fn decode_rgba_capped(path: &Path, cap: u32) -> Result<image::RgbaImage> {
+    decode_rgba_capped_cancellable(path, cap, &|| false)
+        .map(|image| image.expect("decode with cancellation disabled cannot be cancelled"))
+}
+
+pub(crate) fn decode_rgba_capped_cancellable(
+    path: &Path,
+    cap: u32,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<image::RgbaImage>> {
+    if cancelled() {
+        return Ok(None);
+    }
     estimated_image_decode_bytes(path, cap)?;
+    if cancelled() {
+        return Ok(None);
+    }
     let orientation = read_exif_metadata(path)
         .ok()
         .and_then(|exif| exif.orientation);
-    let mut image = decode_at_most(path, cap, cap, orientation)?;
+    if cancelled() {
+        return Ok(None);
+    }
+    let Some(mut image) = decode_at_most(path, cap, cap, orientation, cancelled)? else {
+        return Ok(None);
+    };
     if cap != u32::MAX && (image.width() > cap || image.height() > cap) {
+        if cancelled() {
+            return Ok(None);
+        }
         image = image.resize(cap, cap, FilterType::Triangle);
     }
-    Ok(image.to_rgba8())
+    if cancelled() {
+        return Ok(None);
+    }
+    let image = image.to_rgba8();
+    Ok((!cancelled()).then_some(image))
 }
 
 /// Decode to an oriented image no smaller than `max_width`x`max_height` while
@@ -120,15 +147,20 @@ fn decode_at_most(
     max_width: u32,
     max_height: u32,
     orientation: Option<u16>,
-) -> Result<DynamicImage> {
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<DynamicImage>> {
+    if cancelled() {
+        return Ok(None);
+    }
     let reader = image::ImageReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?
         .with_guessed_format()
         .with_context(|| format!("failed to detect image format for {}", path.display()))?;
 
     if matches!(reader.format(), Some(ImageFormat::Jpeg)) {
-        match decode_jpeg_scaled(path, max_width, max_height, orientation) {
-            Ok(image) => return Ok(image),
+        match decode_jpeg_scaled(path, max_width, max_height, orientation, cancelled) {
+            Ok(Some(image)) => return Ok(Some(image)),
+            Ok(None) => return Ok(None),
             Err(error) => {
                 if error.downcast_ref::<DecodeSafetyLimit>().is_some() {
                     return Err(error);
@@ -142,10 +174,16 @@ fn decode_at_most(
         }
     }
 
+    if cancelled() {
+        return Ok(None);
+    }
     let image = reader
         .decode()
         .with_context(|| format!("failed to decode {}", path.display()))?;
-    Ok(apply_orientation(image, orientation))
+    if cancelled() {
+        return Ok(None);
+    }
+    Ok(Some(apply_orientation(image, orientation)))
 }
 
 /// EXIF orientations 5..=8 rotate the image by 90°, swapping its display axes.
@@ -158,8 +196,15 @@ fn decode_jpeg_scaled(
     max_width: u32,
     max_height: u32,
     orientation: Option<u16>,
-) -> Result<DynamicImage> {
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<DynamicImage>> {
+    if cancelled() {
+        return Ok(None);
+    }
     let data = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if cancelled() {
+        return Ok(None);
+    }
     let mut decompressor = turbojpeg::Decompressor::new()
         .map_err(|error| anyhow!("turbojpeg init failed: {error}"))?;
     let header = decompressor
@@ -198,16 +243,22 @@ fn decode_jpeg_scaled(
         height,
         format: turbojpeg::PixelFormat::RGBA,
     };
+    if cancelled() {
+        return Ok(None);
+    }
     decompressor
         .decompress(&data, image.as_deref_mut())
         .map_err(|error| anyhow!("turbojpeg decompress failed: {error}"))?;
 
     let rgba = image::RgbaImage::from_raw(width as u32, height as u32, image.pixels)
         .context("turbojpeg produced an unexpected buffer size")?;
-    Ok(apply_orientation(
+    if cancelled() {
+        return Ok(None);
+    }
+    Ok(Some(apply_orientation(
         DynamicImage::ImageRgba8(rgba),
         orientation,
-    ))
+    )))
 }
 
 fn contained_dimensions(

@@ -40,7 +40,18 @@ pub fn enrich_entry(entry: &mut MediaEntry) {
 }
 
 pub fn enrich_entries_for_time_sort(entries: &mut [MediaEntry]) {
+    let completed = enrich_entries_for_time_sort_cancellable(entries, &|| false);
+    debug_assert!(completed, "cancellation is disabled");
+}
+
+pub(crate) fn enrich_entries_for_time_sort_cancellable(
+    entries: &mut [MediaEntry],
+    cancelled: &impl Fn() -> bool,
+) -> bool {
     for entry in entries {
+        if cancelled() {
+            return false;
+        }
         if !entry.media_kind.is_image() {
             entry.exif_attempted = true;
             continue;
@@ -53,6 +64,7 @@ pub fn enrich_entries_for_time_sort(entries: &mut [MediaEntry]) {
             }
         }
     }
+    !cancelled()
 }
 
 fn read_image_dimensions(path: &Path) -> Result<(u32, u32)> {

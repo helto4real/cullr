@@ -133,11 +133,34 @@ pub(crate) fn read_browser_entries_with_sort(
     extensions: &[String],
     sort_mode: SortMode,
 ) -> Result<Vec<BrowserEntry>> {
+    read_browser_entries_with_sort_cancellable(
+        directory,
+        include_hidden,
+        extensions,
+        sort_mode,
+        &|| false,
+    )
+    .map(|entries| entries.expect("a browser scan with cancellation disabled cannot be cancelled"))
+}
+
+pub(crate) fn read_browser_entries_with_sort_cancellable(
+    directory: &Path,
+    include_hidden: bool,
+    extensions: &[String],
+    sort_mode: SortMode,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<Vec<BrowserEntry>>> {
+    if cancelled() {
+        return Ok(None);
+    }
     let mut entries = Vec::new();
     for (discovered_order, dir_entry) in fs::read_dir(directory)
         .with_context(|| format!("failed to read {}", directory.display()))?
         .enumerate()
     {
+        if cancelled() {
+            return Ok(None);
+        }
         let dir_entry = match dir_entry {
             Ok(value) => value,
             Err(error) => {
@@ -180,8 +203,11 @@ pub(crate) fn read_browser_entries_with_sort(
             discovered_order,
         });
     }
+    if cancelled() {
+        return Ok(None);
+    }
     sort_browser_entries(&mut entries, sort_mode);
-    Ok(entries)
+    Ok((!cancelled()).then_some(entries))
 }
 
 fn browser_file_kind(path: &Path, extensions: &[String]) -> BrowserEntryKind {

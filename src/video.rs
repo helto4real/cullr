@@ -128,24 +128,48 @@ struct PlaybackTimeline {
 }
 
 pub fn decode_first_frame_rgba(path: &Path, cap: u32) -> Result<RgbaImage> {
+    decode_first_frame_rgba_cancellable(path, cap, &|| false)
+        .map(|image| image.expect("video decode with cancellation disabled cannot be cancelled"))
+}
+
+pub(crate) fn decode_first_frame_rgba_cancellable(
+    path: &Path,
+    cap: u32,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<RgbaImage>> {
+    if cancelled() {
+        return Ok(None);
+    }
     ffmpeg::init().context("failed to initialize FFmpeg")?;
+    if cancelled() {
+        return Ok(None);
+    }
     let mut input =
         format::input(path).with_context(|| format!("failed to open video {}", path.display()))?;
+    if cancelled() {
+        return Ok(None);
+    }
     let mut setup = open_video_setup(&mut input, cap)?;
 
     for (stream, packet) in input.packets() {
+        if cancelled() {
+            return Ok(None);
+        }
         if stream.index() != setup.stream_index {
             continue;
         }
         setup.decoder.send_packet(&packet)?;
         if let Some(frame) = receive_scaled_video_frame(&mut setup)? {
-            return Ok(frame.image);
+            return Ok((!cancelled()).then_some(frame.image));
         }
     }
 
+    if cancelled() {
+        return Ok(None);
+    }
     setup.decoder.send_eof()?;
     if let Some(frame) = receive_scaled_video_frame(&mut setup)? {
-        return Ok(frame.image);
+        return Ok((!cancelled()).then_some(frame.image));
     }
 
     Err(anyhow!("no decodable video frames in {}", path.display()))

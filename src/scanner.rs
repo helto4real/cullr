@@ -25,33 +25,62 @@ pub struct ScanOptions {
 }
 
 pub fn scan_directory(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
+    scan_directory_cancellable(opts, &|| false)
+        .map(|entries| entries.expect("a scan with cancellation disabled cannot be cancelled"))
+}
+
+pub(crate) fn scan_directory_cancellable(
+    opts: ScanOptions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<Vec<MediaEntry>>> {
+    if cancelled() {
+        return Ok(None);
+    }
     if opts.recursive {
-        scan_recursive_with_jwalk(opts)
+        scan_recursive_with_jwalk(opts, cancelled)
     } else {
-        scan_flat_with_read_dir(opts)
+        scan_flat_with_read_dir(opts, cancelled)
     }
 }
 
 pub fn scan_files(paths: &[PathBuf], extensions: &[String]) -> Result<Vec<MediaEntry>> {
+    scan_files_cancellable(paths, extensions, &|| false)
+        .map(|entries| entries.expect("a scan with cancellation disabled cannot be cancelled"))
+}
+
+pub(crate) fn scan_files_cancellable(
+    paths: &[PathBuf],
+    extensions: &[String],
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<Vec<MediaEntry>>> {
     let extensions = extension_set(extensions);
     let mut entries = Vec::new();
 
     for path in paths {
+        if cancelled() {
+            return Ok(None);
+        }
         if let Some(entry) = build_entry(path.clone(), entries.len(), &extensions)? {
             entries.push(entry);
         }
     }
 
-    Ok(entries)
+    Ok((!cancelled()).then_some(entries))
 }
 
-fn scan_flat_with_read_dir(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
+fn scan_flat_with_read_dir(
+    opts: ScanOptions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<Vec<MediaEntry>>> {
     let extensions = extension_set(&opts.extensions);
     let mut entries = Vec::new();
 
     for dir_entry in fs::read_dir(&opts.root)
         .with_context(|| format!("failed to read {}", opts.root.display()))?
     {
+        if cancelled() {
+            return Ok(None);
+        }
         let dir_entry = match dir_entry {
             Ok(value) => value,
             Err(error) => {
@@ -68,19 +97,26 @@ fn scan_flat_with_read_dir(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
         }
     }
 
-    Ok(entries)
+    Ok((!cancelled()).then_some(entries))
 }
 
-fn scan_recursive_with_jwalk(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
+fn scan_recursive_with_jwalk(
+    opts: ScanOptions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<Vec<MediaEntry>>> {
     let extensions = extension_set(&opts.extensions);
     let walker = WalkDir::new(&opts.root)
-        .parallelism(Parallelism::RayonDefaultPool {
-            busy_timeout: std::time::Duration::from_millis(500),
-        })
+        // Live refresh already runs on its own worker. Serial traversal keeps a
+        // recursive encrypted/slow volume from consuming Rayon's global pool
+        // and starving the UI and other applications.
+        .parallelism(Parallelism::Serial)
         .skip_hidden(!opts.include_hidden);
 
     let mut entries = Vec::new();
     for dir_entry in walker {
+        if cancelled() {
+            return Ok(None);
+        }
         let dir_entry = match dir_entry {
             Ok(value) => value,
             Err(error) => {
@@ -100,7 +136,7 @@ fn scan_recursive_with_jwalk(opts: ScanOptions) -> Result<Vec<MediaEntry>> {
         }
     }
 
-    Ok(entries)
+    Ok((!cancelled()).then_some(entries))
 }
 
 fn build_entry(
@@ -212,6 +248,7 @@ fn is_hidden_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use tempfile::tempdir;
 
     fn touch(path: &Path) {
@@ -265,6 +302,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn recursive_scan_stops_cooperatively_when_cancelled() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("nested")).unwrap();
+        touch(&temp.path().join("a.jpg"));
+        touch(&temp.path().join("nested").join("b.jpg"));
+        let checks = Cell::new(0);
+        let cancelled = || {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next >= 3
+        };
+
+        let entries = scan_directory_cancellable(
+            ScanOptions {
+                root: temp.path().to_path_buf(),
+                recursive: true,
+                include_hidden: false,
+                extensions: vec!["jpg".to_owned()],
+            },
+            &cancelled,
+        )
+        .unwrap();
+
+        assert!(entries.is_none());
+        assert!(checks.get() >= 3);
     }
 
     #[test]

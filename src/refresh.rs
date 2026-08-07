@@ -1,15 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
 };
 
 use flume::{Receiver, Sender};
 
 use crate::{
-    browser::read_browser_entries_with_sort,
-    scanner::{ScanOptions, scan_directory, scan_files},
+    browser::read_browser_entries_with_sort_cancellable,
+    scanner::{ScanOptions, scan_directory_cancellable, scan_files_cancellable},
     sorter,
     state::{BrowserEntry, MediaEntry, SortMode},
 };
@@ -65,6 +68,7 @@ impl MediaRefreshOutput {
 #[derive(Debug)]
 struct MediaRequest {
     generation: u64,
+    epoch: u64,
     scope: MediaRefreshScope,
     previous_entries: Vec<MediaEntry>,
     sort_mode: SortMode,
@@ -74,6 +78,7 @@ struct MediaRequest {
 #[derive(Debug)]
 struct BrowserRequest {
     generation: u64,
+    epoch: u64,
     scope: BrowserRefreshScope,
 }
 
@@ -94,27 +99,38 @@ pub struct RefreshService {
     pending: Arc<Mutex<PendingRefreshes>>,
     result_wake_rx: Receiver<()>,
     results: Arc<Mutex<PendingResults>>,
+    media_epoch: Arc<AtomicU64>,
+    browser_epoch: Arc<AtomicU64>,
 }
 
 impl RefreshService {
-    pub fn new(repaint: impl Fn() + Send + Sync + 'static) -> Self {
+    pub fn new(suspended: Arc<AtomicBool>, repaint: impl Fn() + Send + Sync + 'static) -> Self {
         let (wake_tx, wake_rx) = flume::bounded(1);
         let (result_wake_tx, result_wake_rx) = flume::bounded(1);
         let pending = Arc::new(Mutex::new(PendingRefreshes::default()));
         let results = Arc::new(Mutex::new(PendingResults::default()));
         let worker_pending = pending.clone();
         let worker_results = results.clone();
+        let media_epoch = Arc::new(AtomicU64::new(0));
+        let browser_epoch = Arc::new(AtomicU64::new(0));
+        let worker_suspended = Arc::clone(&suspended);
+        let worker_media_epoch = Arc::clone(&media_epoch);
+        let worker_browser_epoch = Arc::clone(&browser_epoch);
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(repaint);
         thread::Builder::new()
             .name("cullr-live-refresh".to_owned())
             .spawn(move || {
-                refresh_worker(
+                RefreshWorker {
                     wake_rx,
-                    worker_pending,
+                    pending: worker_pending,
                     result_wake_tx,
-                    worker_results,
+                    results: worker_results,
+                    suspended: worker_suspended,
+                    media_epoch: worker_media_epoch,
+                    browser_epoch: worker_browser_epoch,
                     repaint,
-                );
+                }
+                .run();
             })
             .expect("failed to start live refresh worker");
 
@@ -123,6 +139,8 @@ impl RefreshService {
             pending,
             result_wake_rx,
             results,
+            media_epoch,
+            browser_epoch,
         }
     }
 
@@ -134,12 +152,14 @@ impl RefreshService {
         sort_mode: SortMode,
         locale: Option<String>,
     ) {
+        let epoch = self.media_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         pending.media = Some(MediaRequest {
             generation,
+            epoch,
             scope,
             previous_entries,
             sort_mode,
@@ -150,11 +170,16 @@ impl RefreshService {
     }
 
     pub fn request_browser(&self, generation: u64, scope: BrowserRefreshScope) {
+        let epoch = self.browser_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.browser = Some(BrowserRequest { generation, scope });
+        pending.browser = Some(BrowserRequest {
+            generation,
+            epoch,
+            scope,
+        });
         drop(pending);
         let _ = self.wake_tx.try_send(());
     }
@@ -176,63 +201,114 @@ impl RefreshService {
         }
         drained
     }
+
+    pub fn cancel_all(&self) {
+        self.media_epoch.fetch_add(1, Ordering::AcqRel);
+        self.browser_epoch.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
-fn refresh_worker(
+struct RefreshWorker {
     wake_rx: Receiver<()>,
     pending: Arc<Mutex<PendingRefreshes>>,
     result_wake_tx: Sender<()>,
     results: Arc<Mutex<PendingResults>>,
+    suspended: Arc<AtomicBool>,
+    media_epoch: Arc<AtomicU64>,
+    browser_epoch: Arc<AtomicU64>,
     repaint: Arc<dyn Fn() + Send + Sync>,
-) {
-    while wake_rx.recv().is_ok() {
-        let pending = {
-            let mut guard = pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::take(&mut *guard)
-        };
-        if let Some(request) = pending.media {
-            let result = scan_media(&request.scope)
-                .map(|fresh| {
-                    prepare_media_refresh(
-                        request.previous_entries,
-                        fresh,
-                        request.sort_mode,
-                        request.locale.as_deref(),
-                    )
-                })
-                .map_err(|error| format!("{error:#}"));
-            publish_result(
-                RefreshResult::Media {
-                    generation: request.generation,
-                    scope: request.scope,
-                    sort_mode: request.sort_mode,
-                    result,
-                },
-                &result_wake_tx,
-                &results,
-            );
-            repaint();
-        }
-        if let Some(request) = pending.browser {
-            let result = read_browser_entries_with_sort(
-                &request.scope.directory,
-                request.scope.include_hidden,
-                &request.scope.extensions,
-                request.scope.sort_mode,
-            )
-            .map_err(|error| format!("{error:#}"));
-            publish_result(
-                RefreshResult::Browser {
-                    generation: request.generation,
-                    scope: request.scope,
-                    result,
-                },
-                &result_wake_tx,
-                &results,
-            );
-            repaint();
+}
+
+impl RefreshWorker {
+    fn run(self) {
+        while self.wake_rx.recv().is_ok() {
+            let pending = {
+                let mut guard = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *guard)
+            };
+            if let Some(request) = pending.media {
+                let MediaRequest {
+                    generation,
+                    epoch,
+                    scope,
+                    previous_entries,
+                    sort_mode,
+                    locale,
+                } = request;
+                let cancelled = || {
+                    self.suspended.load(Ordering::Acquire)
+                        || self.media_epoch.load(Ordering::Acquire) != epoch
+                };
+                let result = scan_media(&scope, &cancelled).map(|fresh| {
+                    fresh.and_then(|fresh| {
+                        prepare_media_refresh_cancellable(
+                            previous_entries,
+                            fresh,
+                            sort_mode,
+                            locale.as_deref(),
+                            &cancelled,
+                        )
+                    })
+                });
+                if !cancelled()
+                    && let Some(result) = match result {
+                        Ok(Some(output)) => Some(Ok(output)),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(format!("{error:#}"))),
+                    }
+                {
+                    publish_result(
+                        RefreshResult::Media {
+                            generation,
+                            scope,
+                            sort_mode,
+                            result,
+                        },
+                        &self.result_wake_tx,
+                        &self.results,
+                    );
+                    (self.repaint)();
+                }
+            }
+            if let Some(request) = pending.browser {
+                let BrowserRequest {
+                    generation,
+                    epoch,
+                    scope,
+                } = request;
+                let cancelled = || {
+                    self.suspended.load(Ordering::Acquire)
+                        || self.browser_epoch.load(Ordering::Acquire) != epoch
+                };
+                let result = read_browser_entries_with_sort_cancellable(
+                    &scope.directory,
+                    scope.include_hidden,
+                    &scope.extensions,
+                    scope.sort_mode,
+                    &cancelled,
+                );
+                if !cancelled()
+                    && let Some(result) = match result {
+                        Ok(Some(entries)) => Some(Ok(entries)),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(format!("{error:#}"))),
+                    }
+                {
+                    publish_result(
+                        RefreshResult::Browser {
+                            generation,
+                            scope,
+                            result,
+                        },
+                        &self.result_wake_tx,
+                        &self.results,
+                    );
+                    (self.repaint)();
+                }
+            }
         }
     }
 }
@@ -249,33 +325,65 @@ fn publish_result(result: RefreshResult, wake_tx: &Sender<()>, pending: &Mutex<P
     let _ = wake_tx.try_send(());
 }
 
-fn scan_media(scope: &MediaRefreshScope) -> anyhow::Result<Vec<MediaEntry>> {
+fn scan_media(
+    scope: &MediaRefreshScope,
+    cancelled: &impl Fn() -> bool,
+) -> anyhow::Result<Option<Vec<MediaEntry>>> {
     match scope {
-        MediaRefreshScope::Directory(options) => scan_directory(options.clone()),
-        MediaRefreshScope::SelectedFiles { files, extensions } => scan_files(files, extensions),
+        MediaRefreshScope::Directory(options) => {
+            scan_directory_cancellable(options.clone(), cancelled)
+        }
+        MediaRefreshScope::SelectedFiles { files, extensions } => {
+            scan_files_cancellable(files, extensions, cancelled)
+        }
     }
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_media_refresh(
     old: Vec<MediaEntry>,
     fresh: Vec<MediaEntry>,
     sort_mode: SortMode,
     locale: Option<&str>,
 ) -> MediaRefreshOutput {
-    let old_by_path = old
-        .iter()
-        .map(|entry| (entry.path.as_path(), entry))
-        .collect::<HashMap<_, _>>();
-    let fresh_paths = fresh
-        .iter()
-        .map(|entry| entry.path.clone())
-        .collect::<HashSet<_>>();
+    prepare_media_refresh_cancellable(old, fresh, sort_mode, locale, &|| false)
+        .expect("refresh preparation with cancellation disabled cannot be cancelled")
+}
+
+fn prepare_media_refresh_cancellable(
+    old: Vec<MediaEntry>,
+    fresh: Vec<MediaEntry>,
+    sort_mode: SortMode,
+    locale: Option<&str>,
+    cancelled: &impl Fn() -> bool,
+) -> Option<MediaRefreshOutput> {
+    if cancelled() {
+        return None;
+    }
+    let mut old_by_path = HashMap::with_capacity(old.len());
+    for entry in &old {
+        if cancelled() {
+            return None;
+        }
+        old_by_path.insert(entry.path.as_path(), entry);
+    }
+    let mut fresh_paths = HashSet::with_capacity(fresh.len());
+    for entry in &fresh {
+        if cancelled() {
+            return None;
+        }
+        fresh_paths.insert(entry.path.clone());
+    }
     let mut unchanged_paths = HashSet::new();
-    let mut invalidated_paths = old
-        .iter()
-        .filter(|entry| !fresh_paths.contains(&entry.path))
-        .map(|entry| entry.path.clone())
-        .collect::<HashSet<_>>();
+    let mut invalidated_paths = HashSet::new();
+    for entry in &old {
+        if cancelled() {
+            return None;
+        }
+        if !fresh_paths.contains(&entry.path) {
+            invalidated_paths.insert(entry.path.clone());
+        }
+    }
     let removed = invalidated_paths.len();
     let mut added = 0;
     let mut updated = 0;
@@ -287,6 +395,9 @@ pub(crate) fn prepare_media_refresh(
     let mut entries = Vec::with_capacity(fresh.len());
 
     for mut entry in fresh {
+        if cancelled() {
+            return None;
+        }
         match old_by_path.get(entry.path.as_path()) {
             Some(previous) if same_scanned_file(previous, &entry) => {
                 unchanged_paths.insert(entry.path.clone());
@@ -315,10 +426,12 @@ pub(crate) fn prepare_media_refresh(
         removed,
         updated,
     };
-    if output.changed() {
-        sorter::sort_entries(&mut output.entries, sort_mode, locale);
+    if output.changed()
+        && !sorter::sort_entries_cancellable(&mut output.entries, sort_mode, locale, cancelled)
+    {
+        return None;
     }
-    output
+    (!cancelled()).then_some(output)
 }
 
 fn same_scanned_file(left: &MediaEntry, right: &MediaEntry) -> bool {
@@ -332,6 +445,7 @@ mod tests {
     use super::*;
     use crate::state::{ImageKind, MediaKind};
     use std::{
+        cell::Cell,
         ffi::OsString,
         fs,
         time::{Duration, Instant},
@@ -342,7 +456,7 @@ mod tests {
     fn worker_scans_media_without_blocking_the_caller() {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("image.jpg"), b"image").unwrap();
-        let service = RefreshService::new(|| {});
+        let service = RefreshService::new(Arc::new(AtomicBool::new(false)), || {});
         let scope = MediaRefreshScope::Directory(ScanOptions {
             root: temp.path().to_path_buf(),
             recursive: false,
@@ -373,6 +487,43 @@ mod tests {
             }
             RefreshResult::Browser { .. } => panic!("expected media refresh"),
         }
+    }
+
+    #[test]
+    fn suspended_worker_drops_refresh_without_publishing_a_result() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("image.jpg"), b"image").unwrap();
+        let suspended = Arc::new(AtomicBool::new(true));
+        let service = RefreshService::new(Arc::clone(&suspended), || {});
+        let scope = MediaRefreshScope::Directory(ScanOptions {
+            root: temp.path().to_path_buf(),
+            recursive: true,
+            include_hidden: false,
+            extensions: vec!["jpg".to_owned()],
+        });
+
+        service.request_media(1, scope, Vec::new(), SortMode::Discovered, None);
+        thread::sleep(Duration::from_millis(50));
+
+        assert!(service.drain().is_empty());
+    }
+
+    #[test]
+    fn refresh_reconciliation_stops_cooperatively_when_cancelled() {
+        let old = vec![media_entry("old.jpg", 0)];
+        let fresh = vec![media_entry("new.jpg", 0)];
+        let checks = Cell::new(0);
+        let cancelled = || {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next >= 3
+        };
+
+        let result =
+            prepare_media_refresh_cancellable(old, fresh, SortMode::Discovered, None, &cancelled);
+
+        assert!(result.is_none());
+        assert!(checks.get() >= 3);
     }
 
     #[test]

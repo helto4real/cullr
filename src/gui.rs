@@ -32,7 +32,7 @@ use crate::{
         preferred_browser_index, read_browser_entries_with_sort,
     },
     cli::{Cli, CliViewMode},
-    decode::{decode_rgba_capped, estimated_color_image_decode_bytes},
+    decode::{decode_rgba_capped_cancellable, estimated_color_image_decode_bytes},
     delete, metadata,
     refresh::{
         BrowserRefreshScope, MediaRefreshOutput, MediaRefreshScope, RefreshResult, RefreshService,
@@ -154,10 +154,20 @@ impl DecodeMemoryBudget {
         })
     }
 
+    #[cfg(test)]
     fn acquire(
         self: &Arc<Self>,
         requested: usize,
     ) -> std::result::Result<DecodeMemoryPermit, DecodeMemoryBudgetExceeded> {
+        self.acquire_cancellable(requested, &|| false)
+            .map(|permit| permit.expect("cancellation is disabled"))
+    }
+
+    fn acquire_cancellable(
+        self: &Arc<Self>,
+        requested: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> std::result::Result<Option<DecodeMemoryPermit>, DecodeMemoryBudgetExceeded> {
         if requested == 0 || requested > self.capacity {
             return Err(DecodeMemoryBudgetExceeded {
                 requested,
@@ -170,16 +180,23 @@ impl DecodeMemoryBudget {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *available < bytes {
-            available = self
+            if cancelled() {
+                return Ok(None);
+            }
+            let (next, _) = self
                 .ready
-                .wait(available)
+                .wait_timeout(available, Duration::from_millis(20))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            available = next;
+        }
+        if cancelled() {
+            return Ok(None);
         }
         *available -= bytes;
-        Ok(DecodeMemoryPermit {
+        Ok(Some(DecodeMemoryPermit {
             budget: Arc::clone(self),
             bytes,
-        })
+        }))
     }
 }
 
@@ -214,11 +231,11 @@ struct DecodeService {
     job_tx: Sender<DecodeRequest>,
     result_rx: Receiver<DecodeResult>,
     work_epoch: Arc<AtomicU64>,
-    _memory_budget: Arc<DecodeMemoryBudget>,
+    memory_budget: Arc<DecodeMemoryBudget>,
 }
 
 impl DecodeService {
-    fn new() -> Self {
+    fn new(suspended: Arc<AtomicBool>) -> Self {
         let (job_tx, job_rx) = flume::bounded::<DecodeRequest>(DECODE_QUEUE_CAPACITY);
         let (result_tx, result_rx) = flume::bounded::<DecodeResult>(DECODE_RESULT_CAPACITY);
         let work_epoch = Arc::new(AtomicU64::new(0));
@@ -231,9 +248,14 @@ impl DecodeService {
             let result_tx = result_tx.clone();
             let work_epoch = work_epoch.clone();
             let memory_budget = Arc::clone(&memory_budget);
+            let suspended = Arc::clone(&suspended);
             thread::spawn(move || {
                 for job in job_rx.iter() {
-                    if job.work_epoch != work_epoch.load(Ordering::Relaxed) {
+                    let cancelled = || {
+                        suspended.load(Ordering::Acquire)
+                            || job.work_epoch != work_epoch.load(Ordering::Acquire)
+                    };
+                    if cancelled() {
                         continue;
                     }
                     let reservation = match decode_memory_reservation(&job.key) {
@@ -248,34 +270,46 @@ impl DecodeService {
                             continue;
                         }
                     };
-                    let memory_permit = match memory_budget.acquire(reservation) {
-                        Ok(permit) => permit,
-                        Err(error) => {
-                            let _ = result_tx.send(DecodeResult {
-                                key: job.key,
-                                work_epoch: job.work_epoch,
-                                image: Err(error.to_string()),
-                                _memory_permit: None,
-                            });
-                            continue;
-                        }
+                    if cancelled() {
+                        continue;
+                    }
+                    let memory_permit =
+                        match memory_budget.acquire_cancellable(reservation, &cancelled) {
+                            Ok(Some(permit)) => permit,
+                            Ok(None) => continue,
+                            Err(error) => {
+                                let _ = result_tx.send(DecodeResult {
+                                    key: job.key,
+                                    work_epoch: job.work_epoch,
+                                    image: Err(error.to_string()),
+                                    _memory_permit: None,
+                                });
+                                continue;
+                            }
+                        };
+                    if cancelled() {
+                        continue;
+                    }
+                    let decoded = match &job.key.media_kind {
+                        MediaKind::Image(_) => decode_rgba_capped_cancellable(
+                            &job.key.path,
+                            job.key.variant.cap(),
+                            &cancelled,
+                        ),
+                        MediaKind::Video(_) => video::decode_first_frame_rgba_cancellable(
+                            &job.key.path,
+                            job.key.variant.cap(),
+                            &cancelled,
+                        ),
                     };
-                    if job.work_epoch != work_epoch.load(Ordering::Relaxed) {
+                    if cancelled() {
                         continue;
                     }
-                    let image = match &job.key.media_kind {
-                        MediaKind::Image(_) => {
-                            decode_rgba_capped(&job.key.path, job.key.variant.cap())
-                        }
-                        MediaKind::Video(_) => {
-                            video::decode_first_frame_rgba(&job.key.path, job.key.variant.cap())
-                        }
-                    }
-                    .map(color_image_from_rgba)
-                    .map_err(|e| format!("{e:#}"));
-                    if job.work_epoch != work_epoch.load(Ordering::Relaxed) {
-                        continue;
-                    }
+                    let image = match decoded {
+                        Ok(Some(image)) => Ok(color_image_from_rgba(image)),
+                        Ok(None) => continue,
+                        Err(error) => Err(format!("{error:#}")),
+                    };
                     tracing::debug!(path = %job.key.path.display(), ok = image.is_ok(), "decoded");
                     let memory_permit = image.is_ok().then_some(memory_permit);
                     let _ = result_tx.send(DecodeResult {
@@ -291,7 +325,7 @@ impl DecodeService {
             job_tx,
             result_rx,
             work_epoch,
-            _memory_budget: memory_budget,
+            memory_budget,
         }
     }
 
@@ -303,7 +337,8 @@ impl DecodeService {
     }
 
     fn cancel_pending(&self) {
-        self.work_epoch.fetch_add(1, Ordering::Relaxed);
+        self.work_epoch.fetch_add(1, Ordering::AcqRel);
+        self.memory_budget.ready.notify_all();
     }
 
     fn accepts(&self, work_epoch: u64) -> bool {
@@ -426,13 +461,16 @@ struct GuiApp {
     pending_enrich: bool,
     pending_rescan: bool,
     deferred_preview_prefetch: HashSet<PathBuf>,
-    paused_live_refresh_pending: bool,
+    deferred_live_refresh_pending: bool,
+    background_work_suspended: Arc<AtomicBool>,
     background_repaint_enabled: Arc<AtomicBool>,
     watcher: Option<MediaWatcher>,
     watcher_error: Option<String>,
     refresh: Option<RefreshService>,
     media_refresh_generation: u64,
     browser_refresh_generation: u64,
+    media_refresh_inflight: bool,
+    browser_refresh_inflight: bool,
 }
 
 struct ActiveVideo {
@@ -454,6 +492,7 @@ impl GuiApp {
         // At most one metadata event and one frame may be pending. Playback
         // drops superseded frames instead of accumulating full RGBA buffers.
         let (video_tx, video_rx) = flume::bounded(2);
+        let background_work_suspended = Arc::new(AtomicBool::new(false));
         let status = if state.entries.is_empty() {
             empty_media_status(&empty_media_target)
         } else {
@@ -461,7 +500,7 @@ impl GuiApp {
         };
         Self {
             state,
-            decoder: DecodeService::new(),
+            decoder: DecodeService::new(Arc::clone(&background_work_suspended)),
             video_tx,
             video_rx,
             previews: TextureCache::new(PREVIEW_CACHE_ENTRIES, PREVIEW_CACHE_BYTES),
@@ -496,13 +535,16 @@ impl GuiApp {
             pending_enrich: false,
             pending_rescan: false,
             deferred_preview_prefetch: HashSet::new(),
-            paused_live_refresh_pending: false,
+            deferred_live_refresh_pending: false,
+            background_work_suspended,
             background_repaint_enabled: Arc::new(AtomicBool::new(true)),
             watcher: None,
             watcher_error: None,
             refresh: None,
             media_refresh_generation: 0,
             browser_refresh_generation: 0,
+            media_refresh_inflight: false,
+            browser_refresh_inflight: false,
         }
     }
 
@@ -956,6 +998,9 @@ impl GuiApp {
 
     fn ensure_requested(&mut self) {
         self.decode_retry_pending = false;
+        if self.background_work_is_suspended() {
+            return;
+        }
         if self.browser_selected_is_unsupported() || self.right_pane_error.is_some() {
             return;
         }
@@ -1042,6 +1087,9 @@ impl GuiApp {
             {
                 continue;
             }
+            if self.background_work_is_suspended() {
+                continue;
+            }
             match result.image {
                 Ok(color) => {
                     let handle = ctx.load_texture(
@@ -1069,6 +1117,7 @@ impl GuiApp {
     }
 
     fn drain_video_events(&mut self, ctx: &egui::Context) {
+        let texture_uploads_enabled = !self.background_work_is_suspended();
         while let Ok(event) = self.video_rx.try_recv() {
             let Some(active) = self.active_video.as_mut() else {
                 continue;
@@ -1088,6 +1137,7 @@ impl GuiApp {
                 active.ended = true;
             }
             if let Some(color) = event.frame
+                && texture_uploads_enabled
                 && should_apply_video_frame(active.handle.is_paused(), active.texture.is_some())
             {
                 if let Some(texture) = active.texture.as_mut() {
@@ -1121,7 +1171,7 @@ impl GuiApp {
                 PlaybackEndAction::Advance => self.play_next_video_after_current(),
             }
         }
-        self.sync_background_repaint_gate();
+        self.sync_background_work_state();
     }
 
     fn current_is_video(&self) -> bool {
@@ -1165,9 +1215,28 @@ impl GuiApp {
             .is_some_and(|active| active.handle.is_paused() && !active.ended)
     }
 
-    fn sync_background_repaint_gate(&self) {
+    fn background_work_is_suspended(&self) -> bool {
+        self.background_work_suspended.load(Ordering::Acquire)
+    }
+
+    fn sync_background_work_state(&mut self) {
+        let suspended = !self.window_focused || self.paused_video_preview_active();
+        let was_suspended = self
+            .background_work_suspended
+            .swap(suspended, Ordering::AcqRel);
         self.background_repaint_enabled
-            .store(!self.paused_video_preview_active(), Ordering::Relaxed);
+            .store(!suspended, Ordering::Release);
+        if suspended && !was_suspended {
+            if self.media_refresh_inflight || self.browser_refresh_inflight {
+                self.deferred_live_refresh_pending = true;
+            }
+            self.media_refresh_inflight = false;
+            self.browser_refresh_inflight = false;
+            if let Some(refresh) = &self.refresh {
+                refresh.cancel_all();
+            }
+            self.cancel_pending_decodes();
+        }
     }
 
     fn active_video_progress_for(&self, path: &Path) -> Option<VideoProgress> {
@@ -1221,19 +1290,18 @@ impl GuiApp {
             if let Some(active) = &self.active_video {
                 active.handle.set_paused(true);
             }
-            self.cancel_pending_decodes();
-            self.sync_background_repaint_gate();
             self.status = "video paused: window lost focus".to_owned();
         }
         self.selection_autoplay_armed = effect.selection_autoplay_armed;
         self.window_focused = focused;
+        self.sync_background_work_state();
     }
 
     fn stop_active_video(&mut self) {
         if let Some(active) = self.active_video.take() {
             active.handle.stop();
         }
-        self.sync_background_repaint_gate();
+        self.sync_background_work_state();
         self.hide_video_progress_overlay();
     }
 
@@ -1270,10 +1338,7 @@ impl GuiApp {
             duration: None,
             ended: false,
         });
-        if paused {
-            self.cancel_pending_decodes();
-        }
-        self.sync_background_repaint_gate();
+        self.sync_background_work_state();
         self.status = if paused {
             "video paused".to_owned()
         } else if self.video_muted {
@@ -1299,10 +1364,7 @@ impl GuiApp {
             let paused = !active.handle.is_paused();
             active.handle.set_paused(paused);
             self.selection_autoplay_armed = selection_autoplay_after_pause_state(paused);
-            if paused {
-                self.cancel_pending_decodes();
-            }
-            self.sync_background_repaint_gate();
+            self.sync_background_work_state();
             self.status = if paused {
                 "video paused".to_owned()
             } else {
@@ -1492,11 +1554,14 @@ impl GuiApp {
     fn attach_watcher(&mut self, ctx: &egui::Context) {
         let refresh_ctx = ctx.clone();
         let refresh_repaint_enabled = Arc::clone(&self.background_repaint_enabled);
-        self.refresh = Some(RefreshService::new(move || {
-            request_background_repaint(&refresh_repaint_enabled, || {
-                refresh_ctx.request_repaint();
-            });
-        }));
+        self.refresh = Some(RefreshService::new(
+            Arc::clone(&self.background_work_suspended),
+            move || {
+                request_background_repaint(&refresh_repaint_enabled, || {
+                    refresh_ctx.request_repaint();
+                });
+            },
+        ));
         let repaint_ctx = ctx.clone();
         let watcher_repaint_enabled = Arc::clone(&self.background_repaint_enabled);
         match MediaWatcher::new(move || {
@@ -1599,9 +1664,9 @@ impl GuiApp {
                     .any(|path| path_affects_flat_directory(path, &browser.listed_directory))
             });
 
-        if (refresh_library || refresh_browser) && self.paused_video_preview_active() {
-            self.paused_live_refresh_pending = true;
-            self.status = "live update deferred while video is paused".to_owned();
+        if (refresh_library || refresh_browser) && self.background_work_is_suspended() {
+            self.deferred_live_refresh_pending = true;
+            self.status = "live update deferred while background work is suspended".to_owned();
             self.sync_watcher_paths();
             return;
         }
@@ -1642,9 +1707,14 @@ impl GuiApp {
     }
 
     fn request_live_media_refresh(&mut self) {
+        if self.background_work_is_suspended() {
+            self.deferred_live_refresh_pending = true;
+            return;
+        }
         let scope = self.media_refresh_scope();
         self.media_refresh_generation = self.media_refresh_generation.wrapping_add(1);
         if let Some(refresh) = &self.refresh {
+            self.media_refresh_inflight = true;
             refresh.request_media(
                 self.media_refresh_generation,
                 scope,
@@ -1656,23 +1726,28 @@ impl GuiApp {
     }
 
     fn request_live_browser_refresh(&mut self) {
+        if self.background_work_is_suspended() {
+            self.deferred_live_refresh_pending = true;
+            return;
+        }
         let Some(scope) = self.browser_refresh_scope() else {
             return;
         };
         self.browser_refresh_generation = self.browser_refresh_generation.wrapping_add(1);
         if let Some(refresh) = &self.refresh {
+            self.browser_refresh_inflight = true;
             refresh.request_browser(self.browser_refresh_generation, scope);
         }
     }
 
     fn flush_deferred_live_refresh(&mut self) {
-        if !self.paused_live_refresh_pending || self.paused_video_preview_active() {
+        if !self.deferred_live_refresh_pending || self.background_work_is_suspended() {
             return;
         }
-        self.paused_live_refresh_pending = false;
+        self.deferred_live_refresh_pending = false;
         self.request_live_media_refresh();
         self.request_live_browser_refresh();
-        self.status = "refreshing changes deferred while video was paused".to_owned();
+        self.status = "refreshing changes deferred while background work was suspended".to_owned();
     }
 
     fn drain_refresh_results(&mut self) {
@@ -1700,11 +1775,13 @@ impl GuiApp {
                     return;
                 }
                 if sort_mode != self.state.sort_mode {
+                    self.media_refresh_inflight = false;
                     self.request_live_media_refresh();
                     return;
                 }
-                if self.paused_video_preview_active() {
-                    self.paused_live_refresh_pending = true;
+                self.media_refresh_inflight = false;
+                if self.background_work_is_suspended() {
+                    self.deferred_live_refresh_pending = true;
                     return;
                 }
                 match result {
@@ -1722,8 +1799,9 @@ impl GuiApp {
                 {
                     return;
                 }
-                if self.paused_video_preview_active() {
-                    self.paused_live_refresh_pending = true;
+                self.browser_refresh_inflight = false;
+                if self.background_work_is_suspended() {
+                    self.deferred_live_refresh_pending = true;
                     return;
                 }
                 match result {
@@ -2613,7 +2691,7 @@ impl GuiApp {
         let focused = ctx.input(|input| input.focused);
         self.handle_focus_change(focused);
         self.handle_input(ctx);
-        self.sync_background_repaint_gate();
+        self.sync_background_work_state();
         self.flush_deferred_live_refresh();
         self.sync_watcher_paths();
         self.drain_watcher();
@@ -3461,8 +3539,18 @@ mod tests {
     }
 
     #[test]
+    fn decode_memory_wait_stops_when_work_is_cancelled() {
+        let budget = DecodeMemoryBudget::new(100);
+        let _all_memory = budget.acquire(100).unwrap();
+
+        let permit = budget.acquire_cancellable(1, &|| true).unwrap();
+
+        assert!(permit.is_none());
+    }
+
+    #[test]
     fn cancelling_decode_work_rejects_results_from_the_previous_epoch() {
-        let decoder = DecodeService::new();
+        let decoder = DecodeService::new(Arc::new(AtomicBool::new(false)));
 
         assert!(decoder.accepts(0));
         decoder.cancel_pending();
@@ -4285,8 +4373,9 @@ mod tests {
             duration: None,
             ended: false,
         });
-        app.sync_background_repaint_gate();
+        app.sync_background_work_state();
         assert!(!app.background_repaint_enabled.load(Ordering::Relaxed));
+        assert!(app.background_work_suspended.load(Ordering::Relaxed));
         app.media_refresh_generation = 1;
         let scope = app.media_refresh_scope();
 
@@ -4303,15 +4392,38 @@ mod tests {
         });
 
         assert_eq!(app.state.entries.len(), 1);
-        assert!(app.paused_live_refresh_pending);
+        assert!(app.deferred_live_refresh_pending);
 
         app.active_video.as_ref().unwrap().handle.set_paused(false);
-        app.sync_background_repaint_gate();
+        app.sync_background_work_state();
         app.flush_deferred_live_refresh();
 
         assert!(app.background_repaint_enabled.load(Ordering::Relaxed));
-        assert!(!app.paused_live_refresh_pending);
+        assert!(!app.background_work_suspended.load(Ordering::Relaxed));
+        assert!(!app.deferred_live_refresh_pending);
         assert_eq!(app.media_refresh_generation, 2);
+    }
+
+    #[test]
+    fn losing_focus_suspends_background_work_and_defers_inflight_refresh() {
+        let state = app_state(Vec::new(), 0);
+        let mut app = GuiApp::new(state, None, true, false, PathBuf::from("/tmp/media"));
+        app.media_refresh_inflight = true;
+
+        app.handle_focus_change(false);
+
+        assert!(app.background_work_suspended.load(Ordering::Relaxed));
+        assert!(!app.background_repaint_enabled.load(Ordering::Relaxed));
+        assert!(!app.media_refresh_inflight);
+        assert!(app.deferred_live_refresh_pending);
+
+        app.handle_focus_change(true);
+        app.flush_deferred_live_refresh();
+
+        assert!(!app.background_work_suspended.load(Ordering::Relaxed));
+        assert!(app.background_repaint_enabled.load(Ordering::Relaxed));
+        assert!(!app.deferred_live_refresh_pending);
+        assert_eq!(app.media_refresh_generation, 1);
     }
 
     #[test]
