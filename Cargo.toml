@@ -39,6 +39,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 tempfile = "3"
 
+# ffmpeg-next 8.1.0 does not yet account for the FFmpeg 9 API/ABI changes.
+# Keep the published versions locked while carrying the minimal compatibility
+# patch locally until upstream ships equivalent support.
+[patch.crates-io]
+ffmpeg-next = { path = "vendor/ffmpeg-next-8.1.0" }
+ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next-8.1.0" }
+
 [package.metadata.deb]
 maintainer = "Tomas Hellstrom"
 copyright = "2026, Tomas Hellstrom"
