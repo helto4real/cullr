@@ -108,7 +108,7 @@ Multiple explicit files still open as the focused grid review set.
 | `shift+D` | Show the delete queue grid. |
 | `ctrl+R` | Confirm deletion for queued files. |
 | `y` / `n` | Accept or cancel the delete confirmation. |
-| `z` | Toggle fit-to-window and actual-size / 1:1 zoom. |
+| `z` | Cycle actual-size / 1:1, actual-size capped to the window, and fit-to-window zoom. |
 | `f` | Toggle fullscreen window mode. |
 | `m` | Mute or unmute video audio. Videos start muted. |
 | `a` | Toggle automatically advancing to the next video when playback ends. |

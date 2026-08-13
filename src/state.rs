@@ -117,6 +117,17 @@ pub enum SortMode {
 pub enum ZoomMode {
     Fit,
     OriginalPixels,
+    OriginalPixelsMaxWindow,
+}
+
+impl ZoomMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Fit => Self::OriginalPixels,
+            Self::OriginalPixels => Self::OriginalPixelsMaxWindow,
+            Self::OriginalPixelsMaxWindow => Self::Fit,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +170,7 @@ impl AppState {
             current_index: 0,
             mode: ViewMode::Preview,
             sort_mode,
-            zoom_mode: ZoomMode::Fit,
+            zoom_mode: ZoomMode::OriginalPixelsMaxWindow,
             delete_queue: IndexSet::new(),
             selected_files: None,
             browser: None,
@@ -449,6 +460,31 @@ mod tests {
             dimensions_attempted: false,
             exif_attempted: false,
         }
+    }
+
+    #[test]
+    fn zoom_cycles_through_all_three_modes() {
+        assert_eq!(
+            ZoomMode::OriginalPixels.next(),
+            ZoomMode::OriginalPixelsMaxWindow
+        );
+        assert_eq!(ZoomMode::OriginalPixelsMaxWindow.next(), ZoomMode::Fit);
+        assert_eq!(ZoomMode::Fit.next(), ZoomMode::OriginalPixels);
+    }
+
+    #[test]
+    fn default_zoom_is_original_pixels_capped_to_window() {
+        let state = AppState::new(
+            PathBuf::from("."),
+            false,
+            false,
+            MediaMode::Image,
+            vec!["jpg".to_owned()],
+            SortMode::Discovered,
+            vec![entry("a.jpg", 0)],
+        );
+
+        assert_eq!(state.zoom_mode, ZoomMode::OriginalPixelsMaxWindow);
     }
 
     #[test]

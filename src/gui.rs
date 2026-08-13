@@ -87,6 +87,15 @@ fn request_background_repaint(enabled: &AtomicBool, request_repaint: impl FnOnce
     }
 }
 
+fn preview_scale(zoom_mode: ZoomMode, container_size: egui::Vec2, texture_size: egui::Vec2) -> f32 {
+    let fit_scale = (container_size.x / texture_size.x).min(container_size.y / texture_size.y);
+    match zoom_mode {
+        ZoomMode::Fit => fit_scale,
+        ZoomMode::OriginalPixels => 1.0,
+        ZoomMode::OriginalPixelsMaxWindow => fit_scale.min(1.0),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Variant {
     Fit,
@@ -550,7 +559,7 @@ impl GuiApp {
 
     fn preview_variant(&self) -> Variant {
         match self.state.zoom_mode {
-            ZoomMode::Fit => Variant::Fit,
+            ZoomMode::Fit | ZoomMode::OriginalPixelsMaxWindow => Variant::Fit,
             ZoomMode::OriginalPixels => Variant::Original,
         }
     }
@@ -2157,10 +2166,7 @@ impl GuiApp {
                     self.state.mode = ViewMode::Preview;
                 }
                 if i.key_pressed(Key::Z) {
-                    self.state.zoom_mode = match self.state.zoom_mode {
-                        ZoomMode::Fit => ZoomMode::OriginalPixels,
-                        ZoomMode::OriginalPixels => ZoomMode::Fit,
-                    };
+                    self.state.zoom_mode = self.state.zoom_mode.next();
                 }
                 if i.key_pressed(Key::B) {
                     self.toggle_media_type_badges();
@@ -2360,12 +2366,7 @@ impl GuiApp {
             let (container_rect, _response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
             let tex = handle.size_vec2();
-            let scale = match self.state.zoom_mode {
-                ZoomMode::Fit => {
-                    (container_rect.width() / tex.x).min(container_rect.height() / tex.y)
-                }
-                ZoomMode::OriginalPixels => 1.0,
-            };
+            let scale = preview_scale(self.state.zoom_mode, container_rect.size(), tex);
             let draw = tex * scale;
             let image_rect = egui::Rect::from_center_size(container_rect.center(), draw);
             egui::Image::new(&handle).paint_at(ui, image_rect);
@@ -2665,7 +2666,7 @@ d               toggle delete queue, then select next media file
 u               unqueue current when no video is active
 shift+D         show delete queue
 ctrl+R          delete queued (confirm)
-z               toggle fit / actual size
+z               cycle actual / actual max window / fit
 f               toggle fullscreen window
 m               mute / unmute video audio
 a               toggle auto-next video advance
@@ -2733,6 +2734,7 @@ impl GuiApp {
         let zoom = match self.state.zoom_mode {
             ZoomMode::Fit => "fit",
             ZoomMode::OriginalPixels => "original",
+            ZoomMode::OriginalPixelsMaxWindow => "original/max-window",
         };
         let position = if self.right_pane_error.is_some() {
             "error".to_owned()
@@ -3345,6 +3347,40 @@ mod tests {
     use crate::state::{ImageKind, MediaEntry, SortMode, VideoKind};
     use std::{ffi::OsString, fs};
     use tempfile::tempdir;
+
+    #[test]
+    fn original_pixels_max_window_never_upscales_or_overflows() {
+        let container = egui::vec2(1_000.0, 800.0);
+
+        assert_eq!(
+            preview_scale(
+                ZoomMode::OriginalPixelsMaxWindow,
+                container,
+                egui::vec2(500.0, 400.0),
+            ),
+            1.0
+        );
+        assert_eq!(
+            preview_scale(
+                ZoomMode::OriginalPixelsMaxWindow,
+                container,
+                egui::vec2(2_000.0, 1_600.0),
+            ),
+            0.5
+        );
+    }
+
+    #[test]
+    fn fit_can_upscale_while_original_pixels_stays_at_one_to_one() {
+        let container = egui::vec2(1_000.0, 800.0);
+        let texture = egui::vec2(500.0, 400.0);
+
+        assert_eq!(preview_scale(ZoomMode::Fit, container, texture), 2.0);
+        assert_eq!(
+            preview_scale(ZoomMode::OriginalPixels, container, texture),
+            1.0
+        );
+    }
 
     #[test]
     fn background_repaint_requests_respect_the_pause_gate() {
