@@ -471,8 +471,12 @@ struct GuiApp {
     pending_rescan: bool,
     deferred_preview_prefetch: HashSet<PathBuf>,
     deferred_live_refresh_pending: bool,
-    background_work_suspended: Arc<AtomicBool>,
-    background_repaint_enabled: Arc<AtomicBool>,
+    pending_live_navigation: Option<isize>,
+    // Paused previews stop expensive decode/upload work, but must not stop the
+    // live library refresh that can make a pending boundary move possible.
+    preview_work_suspended: Arc<AtomicBool>,
+    live_refresh_suspended: Arc<AtomicBool>,
+    live_refresh_repaint_enabled: Arc<AtomicBool>,
     watcher: Option<MediaWatcher>,
     watcher_error: Option<String>,
     refresh: Option<RefreshService>,
@@ -501,7 +505,8 @@ impl GuiApp {
         // At most one metadata event and one frame may be pending. Playback
         // drops superseded frames instead of accumulating full RGBA buffers.
         let (video_tx, video_rx) = flume::bounded(2);
-        let background_work_suspended = Arc::new(AtomicBool::new(false));
+        let preview_work_suspended = Arc::new(AtomicBool::new(false));
+        let live_refresh_suspended = Arc::new(AtomicBool::new(false));
         let status = if state.entries.is_empty() {
             empty_media_status(&empty_media_target)
         } else {
@@ -509,7 +514,7 @@ impl GuiApp {
         };
         Self {
             state,
-            decoder: DecodeService::new(Arc::clone(&background_work_suspended)),
+            decoder: DecodeService::new(Arc::clone(&preview_work_suspended)),
             video_tx,
             video_rx,
             previews: TextureCache::new(PREVIEW_CACHE_ENTRIES, PREVIEW_CACHE_BYTES),
@@ -545,8 +550,10 @@ impl GuiApp {
             pending_rescan: false,
             deferred_preview_prefetch: HashSet::new(),
             deferred_live_refresh_pending: false,
-            background_work_suspended,
-            background_repaint_enabled: Arc::new(AtomicBool::new(true)),
+            pending_live_navigation: None,
+            preview_work_suspended,
+            live_refresh_suspended,
+            live_refresh_repaint_enabled: Arc::new(AtomicBool::new(true)),
             watcher: None,
             watcher_error: None,
             refresh: None,
@@ -610,6 +617,14 @@ impl GuiApp {
         }
         let current = self.state.current_index as isize;
         let target = (current + delta).clamp(0, len as isize - 1);
+        if self.state.mode == ViewMode::Preview
+            && target == current
+            && delta != 0
+            && (self.media_refresh_inflight || self.deferred_live_refresh_pending)
+        {
+            self.pending_live_navigation = Some(delta);
+            return;
+        }
         self.set_current_index(target as usize);
     }
 
@@ -1007,7 +1022,7 @@ impl GuiApp {
 
     fn ensure_requested(&mut self) {
         self.decode_retry_pending = false;
-        if self.background_work_is_suspended() {
+        if self.preview_work_is_suspended() {
             return;
         }
         if self.browser_selected_is_unsupported() || self.right_pane_error.is_some() {
@@ -1096,7 +1111,7 @@ impl GuiApp {
             {
                 continue;
             }
-            if self.background_work_is_suspended() {
+            if self.preview_work_is_suspended() {
                 continue;
             }
             match result.image {
@@ -1126,7 +1141,7 @@ impl GuiApp {
     }
 
     fn drain_video_events(&mut self, ctx: &egui::Context) {
-        let texture_uploads_enabled = !self.background_work_is_suspended();
+        let texture_uploads_enabled = !self.preview_work_is_suspended();
         while let Ok(event) = self.video_rx.try_recv() {
             let Some(active) = self.active_video.as_mut() else {
                 continue;
@@ -1180,7 +1195,7 @@ impl GuiApp {
                 PlaybackEndAction::Advance => self.play_next_video_after_current(),
             }
         }
-        self.sync_background_work_state();
+        self.sync_work_suspension_state();
     }
 
     fn current_is_video(&self) -> bool {
@@ -1224,18 +1239,30 @@ impl GuiApp {
             .is_some_and(|active| active.handle.is_paused() && !active.ended)
     }
 
-    fn background_work_is_suspended(&self) -> bool {
-        self.background_work_suspended.load(Ordering::Acquire)
+    fn preview_work_is_suspended(&self) -> bool {
+        self.preview_work_suspended.load(Ordering::Acquire)
     }
 
-    fn sync_background_work_state(&mut self) {
-        let suspended = !self.window_focused || self.paused_video_preview_active();
-        let was_suspended = self
-            .background_work_suspended
-            .swap(suspended, Ordering::AcqRel);
-        self.background_repaint_enabled
-            .store(!suspended, Ordering::Release);
-        if suspended && !was_suspended {
+    fn live_refresh_is_suspended(&self) -> bool {
+        self.live_refresh_suspended.load(Ordering::Acquire)
+    }
+
+    fn sync_work_suspension_state(&mut self) {
+        let preview_work_suspended = !self.window_focused || self.paused_video_preview_active();
+        let was_preview_work_suspended = self
+            .preview_work_suspended
+            .swap(preview_work_suspended, Ordering::AcqRel);
+        if preview_work_suspended && !was_preview_work_suspended {
+            self.cancel_pending_decodes();
+        }
+
+        let live_refresh_suspended = !self.window_focused;
+        let was_live_refresh_suspended = self
+            .live_refresh_suspended
+            .swap(live_refresh_suspended, Ordering::AcqRel);
+        self.live_refresh_repaint_enabled
+            .store(!live_refresh_suspended, Ordering::Release);
+        if live_refresh_suspended && !was_live_refresh_suspended {
             if self.media_refresh_inflight || self.browser_refresh_inflight {
                 self.deferred_live_refresh_pending = true;
             }
@@ -1244,7 +1271,6 @@ impl GuiApp {
             if let Some(refresh) = &self.refresh {
                 refresh.cancel_all();
             }
-            self.cancel_pending_decodes();
         }
     }
 
@@ -1303,14 +1329,14 @@ impl GuiApp {
         }
         self.selection_autoplay_armed = effect.selection_autoplay_armed;
         self.window_focused = focused;
-        self.sync_background_work_state();
+        self.sync_work_suspension_state();
     }
 
     fn stop_active_video(&mut self) {
         if let Some(active) = self.active_video.take() {
             active.handle.stop();
         }
-        self.sync_background_work_state();
+        self.sync_work_suspension_state();
         self.hide_video_progress_overlay();
     }
 
@@ -1347,7 +1373,7 @@ impl GuiApp {
             duration: None,
             ended: false,
         });
-        self.sync_background_work_state();
+        self.sync_work_suspension_state();
         self.status = if paused {
             "video paused".to_owned()
         } else if self.video_muted {
@@ -1373,7 +1399,7 @@ impl GuiApp {
             let paused = !active.handle.is_paused();
             active.handle.set_paused(paused);
             self.selection_autoplay_armed = selection_autoplay_after_pause_state(paused);
-            self.sync_background_work_state();
+            self.sync_work_suspension_state();
             self.status = if paused {
                 "video paused".to_owned()
             } else {
@@ -1486,6 +1512,7 @@ impl GuiApp {
     }
 
     fn set_current_index(&mut self, index: usize) {
+        self.pending_live_navigation = None;
         let previous = self.state.current_index;
         self.state.current_index = index.min(self.state.entries.len().saturating_sub(1));
         self.finish_selection_change(previous);
@@ -1562,9 +1589,9 @@ impl GuiApp {
 
     fn attach_watcher(&mut self, ctx: &egui::Context) {
         let refresh_ctx = ctx.clone();
-        let refresh_repaint_enabled = Arc::clone(&self.background_repaint_enabled);
+        let refresh_repaint_enabled = Arc::clone(&self.live_refresh_repaint_enabled);
         self.refresh = Some(RefreshService::new(
-            Arc::clone(&self.background_work_suspended),
+            Arc::clone(&self.live_refresh_suspended),
             move || {
                 request_background_repaint(&refresh_repaint_enabled, || {
                     refresh_ctx.request_repaint();
@@ -1572,7 +1599,7 @@ impl GuiApp {
             },
         ));
         let repaint_ctx = ctx.clone();
-        let watcher_repaint_enabled = Arc::clone(&self.background_repaint_enabled);
+        let watcher_repaint_enabled = Arc::clone(&self.live_refresh_repaint_enabled);
         match MediaWatcher::new(move || {
             request_background_repaint(&watcher_repaint_enabled, || {
                 repaint_ctx.request_repaint();
@@ -1673,9 +1700,9 @@ impl GuiApp {
                     .any(|path| path_affects_flat_directory(path, &browser.listed_directory))
             });
 
-        if (refresh_library || refresh_browser) && self.background_work_is_suspended() {
+        if (refresh_library || refresh_browser) && self.live_refresh_is_suspended() {
             self.deferred_live_refresh_pending = true;
-            self.status = "live update deferred while background work is suspended".to_owned();
+            self.status = "live update deferred while window is unfocused".to_owned();
             self.sync_watcher_paths();
             return;
         }
@@ -1716,7 +1743,7 @@ impl GuiApp {
     }
 
     fn request_live_media_refresh(&mut self) {
-        if self.background_work_is_suspended() {
+        if self.live_refresh_is_suspended() {
             self.deferred_live_refresh_pending = true;
             return;
         }
@@ -1735,7 +1762,7 @@ impl GuiApp {
     }
 
     fn request_live_browser_refresh(&mut self) {
-        if self.background_work_is_suspended() {
+        if self.live_refresh_is_suspended() {
             self.deferred_live_refresh_pending = true;
             return;
         }
@@ -1750,13 +1777,13 @@ impl GuiApp {
     }
 
     fn flush_deferred_live_refresh(&mut self) {
-        if !self.deferred_live_refresh_pending || self.background_work_is_suspended() {
+        if !self.deferred_live_refresh_pending || self.live_refresh_is_suspended() {
             return;
         }
         self.deferred_live_refresh_pending = false;
         self.request_live_media_refresh();
         self.request_live_browser_refresh();
-        self.status = "refreshing changes deferred while background work was suspended".to_owned();
+        self.status = "refreshing changes deferred while window was unfocused".to_owned();
     }
 
     fn drain_refresh_results(&mut self) {
@@ -1789,13 +1816,16 @@ impl GuiApp {
                     return;
                 }
                 self.media_refresh_inflight = false;
-                if self.background_work_is_suspended() {
+                if self.live_refresh_is_suspended() {
                     self.deferred_live_refresh_pending = true;
                     return;
                 }
                 match result {
                     Ok(entries) => self.apply_live_media_entries(entries),
-                    Err(error) => self.status = format!("live refresh failed: {error}"),
+                    Err(error) => {
+                        self.pending_live_navigation = None;
+                        self.status = format!("live refresh failed: {error}");
+                    }
                 }
             }
             RefreshResult::Browser {
@@ -1809,7 +1839,7 @@ impl GuiApp {
                     return;
                 }
                 self.browser_refresh_inflight = false;
-                if self.background_work_is_suspended() {
+                if self.live_refresh_is_suspended() {
                     self.deferred_live_refresh_pending = true;
                     return;
                 }
@@ -1828,6 +1858,7 @@ impl GuiApp {
         let previous_path = self.state.current_path();
         let old_queue = self.state.delete_queue.clone();
         if !reconciliation.changed() {
+            self.pending_live_navigation = None;
             return;
         }
 
@@ -1872,6 +1903,9 @@ impl GuiApp {
         if unqueued > 0 {
             self.status
                 .push_str(&format!("; unqueued {unqueued} changed deletion(s)"));
+        }
+        if let Some(delta) = self.pending_live_navigation.take() {
+            self.move_by(delta);
         }
     }
 
@@ -2691,12 +2725,14 @@ impl GuiApp {
     fn update_impl(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|input| input.focused);
         self.handle_focus_change(focused);
-        self.handle_input(ctx);
-        self.sync_background_work_state();
         self.flush_deferred_live_refresh();
         self.sync_watcher_paths();
         self.drain_watcher();
         self.drain_refresh_results();
+        self.handle_input(ctx);
+        self.sync_work_suspension_state();
+        self.flush_deferred_live_refresh();
+        self.sync_watcher_paths();
 
         // Apply a browser selection only once it has rested briefly, so
         // holding j/k doesn't scan every directory the selection crosses.
@@ -4391,7 +4427,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_video_defers_live_refresh_until_playback_resumes() {
+    fn paused_video_suspends_preview_work_but_applies_live_refresh() {
         let video_path = PathBuf::from("/tmp/media/current.mp4");
         let current = media_entry(video_path.clone(), MediaKind::Video(VideoKind::Mp4), 0);
         let added = media_entry(
@@ -4409,9 +4445,9 @@ mod tests {
             duration: None,
             ended: false,
         });
-        app.sync_background_work_state();
-        assert!(!app.background_repaint_enabled.load(Ordering::Relaxed));
-        assert!(app.background_work_suspended.load(Ordering::Relaxed));
+        app.sync_work_suspension_state();
+        assert!(app.preview_work_suspended.load(Ordering::Relaxed));
+        assert!(app.live_refresh_repaint_enabled.load(Ordering::Relaxed));
         app.media_refresh_generation = 1;
         let scope = app.media_refresh_scope();
 
@@ -4427,39 +4463,86 @@ mod tests {
             )),
         });
 
-        assert_eq!(app.state.entries.len(), 1);
-        assert!(app.deferred_live_refresh_pending);
-
-        app.active_video.as_ref().unwrap().handle.set_paused(false);
-        app.sync_background_work_state();
-        app.flush_deferred_live_refresh();
-
-        assert!(app.background_repaint_enabled.load(Ordering::Relaxed));
-        assert!(!app.background_work_suspended.load(Ordering::Relaxed));
+        assert_eq!(app.state.entries.len(), 2);
         assert!(!app.deferred_live_refresh_pending);
-        assert_eq!(app.media_refresh_generation, 2);
+        assert!(app.preview_work_suspended.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn losing_focus_suspends_background_work_and_defers_inflight_refresh() {
-        let state = app_state(Vec::new(), 0);
+    fn boundary_navigation_waits_for_a_newer_live_entry() {
+        let current_path = PathBuf::from("/tmp/media/current.mp4");
+        let older_path = PathBuf::from("/tmp/media/older.mp4");
+        let newer_path = PathBuf::from("/tmp/media/newer.mp4");
+        let mut current = media_entry(current_path.clone(), MediaKind::Video(VideoKind::Mp4), 1);
+        let older = media_entry(older_path, MediaKind::Video(VideoKind::Mp4), 0);
+        current.modified = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        let mut state = app_state(vec![current.clone(), older.clone()], 0);
+        state.sort_mode = SortMode::Newest;
         let mut app = GuiApp::new(state, None, true, false, PathBuf::from("/tmp/media"));
+        app.active_video = Some(ActiveVideo {
+            handle: video::PlaybackHandle::test_handle(current_path, true),
+            texture: None,
+            position: Duration::ZERO,
+            duration: None,
+            ended: false,
+        });
+        app.sync_work_suspension_state();
+        app.media_refresh_generation = 1;
+        app.media_refresh_inflight = true;
+
+        app.move_by(-1);
+        assert_eq!(app.state.current_path().as_ref(), Some(&current.path));
+
+        let mut newer = media_entry(newer_path.clone(), MediaKind::Video(VideoKind::Mp4), 0);
+        newer.modified = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(3));
+        let scope = app.media_refresh_scope();
+        app.handle_refresh_result(RefreshResult::Media {
+            generation: 1,
+            scope,
+            sort_mode: SortMode::Newest,
+            result: Ok(prepare_media_refresh(
+                vec![current.clone(), older.clone()],
+                vec![current, older, newer],
+                SortMode::Newest,
+                None,
+            )),
+        });
+
+        assert_eq!(app.state.current_path().as_ref(), Some(&newer_path));
+        assert!(app.active_video.is_none());
+    }
+
+    #[test]
+    fn focus_gain_allows_live_refresh_while_focus_paused_video_stays_paused() {
+        let video_path = PathBuf::from("/tmp/media/current.mp4");
+        let current = media_entry(video_path.clone(), MediaKind::Video(VideoKind::Mp4), 0);
+        let state = app_state(vec![current], 0);
+        let mut app = GuiApp::new(state, None, true, false, PathBuf::from("/tmp/media"));
+        app.active_video = Some(ActiveVideo {
+            handle: video::PlaybackHandle::test_handle(video_path, false),
+            texture: None,
+            position: Duration::ZERO,
+            duration: None,
+            ended: false,
+        });
         app.media_refresh_inflight = true;
 
         app.handle_focus_change(false);
 
-        assert!(app.background_work_suspended.load(Ordering::Relaxed));
-        assert!(!app.background_repaint_enabled.load(Ordering::Relaxed));
+        assert!(app.preview_work_suspended.load(Ordering::Relaxed));
+        assert!(!app.live_refresh_repaint_enabled.load(Ordering::Relaxed));
         assert!(!app.media_refresh_inflight);
         assert!(app.deferred_live_refresh_pending);
 
         app.handle_focus_change(true);
         app.flush_deferred_live_refresh();
 
-        assert!(!app.background_work_suspended.load(Ordering::Relaxed));
-        assert!(app.background_repaint_enabled.load(Ordering::Relaxed));
+        assert!(app.preview_work_suspended.load(Ordering::Relaxed));
+        assert!(!app.live_refresh_suspended.load(Ordering::Relaxed));
+        assert!(app.live_refresh_repaint_enabled.load(Ordering::Relaxed));
         assert!(!app.deferred_live_refresh_pending);
         assert_eq!(app.media_refresh_generation, 1);
+        assert!(app.active_video.as_ref().unwrap().handle.is_paused());
     }
 
     #[test]
