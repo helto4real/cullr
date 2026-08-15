@@ -42,6 +42,42 @@ pub struct PlaybackEvent {
     pub error: Option<String>,
 }
 
+pub(crate) type RepaintSignal = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone)]
+struct PlaybackEventSink {
+    tx: flume::Sender<PlaybackEvent>,
+    request_repaint: RepaintSignal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TryPlaybackEventSend {
+    Sent,
+    Full,
+    Disconnected,
+}
+
+impl PlaybackEventSink {
+    fn send(&self, event: PlaybackEvent) -> bool {
+        if self.tx.send(event).is_err() {
+            return false;
+        }
+        (self.request_repaint)();
+        true
+    }
+
+    fn try_send(&self, event: PlaybackEvent) -> TryPlaybackEventSend {
+        match self.tx.try_send(event) {
+            Ok(()) => {
+                (self.request_repaint)();
+                TryPlaybackEventSend::Sent
+            }
+            Err(flume::TrySendError::Full(_)) => TryPlaybackEventSend::Full,
+            Err(flume::TrySendError::Disconnected(_)) => TryPlaybackEventSend::Disconnected,
+        }
+    }
+}
+
 pub struct PlaybackHandle {
     id: u64,
     path: PathBuf,
@@ -183,6 +219,26 @@ pub fn spawn_playback(
     paused: bool,
     frame_tx: flume::Sender<PlaybackEvent>,
 ) -> PlaybackHandle {
+    spawn_playback_with_repaint(
+        path,
+        cap,
+        muted,
+        start_at,
+        paused,
+        frame_tx,
+        Arc::new(|| {}),
+    )
+}
+
+pub(crate) fn spawn_playback_with_repaint(
+    path: PathBuf,
+    cap: u32,
+    muted: bool,
+    start_at: Duration,
+    paused: bool,
+    frame_tx: flume::Sender<PlaybackEvent>,
+    request_repaint: RepaintSignal,
+) -> PlaybackHandle {
     let id = NEXT_PLAYBACK_ID.fetch_add(1, Ordering::SeqCst);
     let controls = Arc::new(PlaybackControls {
         stop: AtomicBool::new(false),
@@ -191,6 +247,10 @@ pub fn spawn_playback(
     });
     let thread_controls = controls.clone();
     let thread_path = path.clone();
+    let event_sink = PlaybackEventSink {
+        tx: frame_tx,
+        request_repaint,
+    };
     thread::spawn(move || {
         if let Err(error) = run_video_playback(
             id,
@@ -198,9 +258,9 @@ pub fn spawn_playback(
             cap,
             start_at,
             thread_controls,
-            frame_tx.clone(),
+            &event_sink,
         ) {
-            let _ = frame_tx.send(PlaybackEvent {
+            let _ = event_sink.send(PlaybackEvent {
                 playback_id: id,
                 path: thread_path,
                 frame: None,
@@ -221,14 +281,14 @@ fn run_video_playback(
     cap: u32,
     start_at: Duration,
     controls: Arc<PlaybackControls>,
-    frame_tx: flume::Sender<PlaybackEvent>,
+    event_sink: &PlaybackEventSink,
 ) -> Result<()> {
     ffmpeg::init().context("failed to initialize FFmpeg")?;
 
     let mut input =
         format::input(&path).with_context(|| format!("failed to open video {}", path.display()))?;
     let duration = format_duration(input.duration());
-    let _ = frame_tx.send(PlaybackEvent {
+    let _ = event_sink.send(PlaybackEvent {
         playback_id,
         path: path.clone(),
         frame: None,
@@ -267,7 +327,7 @@ fn run_video_playback(
                 &path,
                 frame,
                 &controls,
-                &frame_tx,
+                event_sink,
                 &mut timeline,
             ) {
                 return Ok(());
@@ -282,7 +342,7 @@ fn run_video_playback(
             &path,
             frame,
             &controls,
-            &frame_tx,
+            event_sink,
             &mut timeline,
         ) {
             return Ok(());
@@ -290,7 +350,7 @@ fn run_video_playback(
     }
 
     controls.stop.store(true, Ordering::SeqCst);
-    let _ = frame_tx.send(PlaybackEvent {
+    let _ = event_sink.send(PlaybackEvent {
         playback_id,
         path,
         frame: None,
@@ -307,7 +367,7 @@ fn send_playback_frame(
     path: &Path,
     frame: VideoFrame,
     controls: &Arc<PlaybackControls>,
-    frame_tx: &flume::Sender<PlaybackEvent>,
+    event_sink: &PlaybackEventSink,
     timeline: &mut PlaybackTimeline,
 ) -> bool {
     let fallback_time =
@@ -347,10 +407,10 @@ fn send_playback_frame(
         ended: false,
         error: None,
     };
-    match frame_tx.try_send(event) {
-        Ok(()) => timeline.sent_frames += 1,
-        Err(flume::TrySendError::Full(_)) => {}
-        Err(flume::TrySendError::Disconnected(_)) => return false,
+    match event_sink.try_send(event) {
+        TryPlaybackEventSend::Sent => timeline.sent_frames += 1,
+        TryPlaybackEventSend::Full => {}
+        TryPlaybackEventSend::Disconnected => return false,
     }
     true
 }
@@ -773,6 +833,35 @@ fn usable_channel_layout(layout: ChannelLayout, channels: u16) -> ChannelLayout 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_playback_events_request_repaint() {
+        let (tx, _rx) = flume::bounded(2);
+        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&repaint_count);
+        let sink = PlaybackEventSink {
+            tx,
+            request_repaint: Arc::new(move || {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        };
+        let event = || PlaybackEvent {
+            playback_id: 1,
+            path: PathBuf::from("video.mp4"),
+            frame: None,
+            position: None,
+            duration: None,
+            ended: false,
+            error: None,
+        };
+
+        assert!(sink.send(event()));
+        assert_eq!(sink.try_send(event()), TryPlaybackEventSend::Sent);
+
+        assert_eq!(repaint_count.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.try_send(event()), TryPlaybackEventSend::Full);
+        assert_eq!(repaint_count.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn caps_video_dimensions_on_long_edge() {

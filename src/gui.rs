@@ -437,6 +437,7 @@ struct GuiApp {
     decoder: DecodeService,
     video_tx: Sender<video::PlaybackEvent>,
     video_rx: Receiver<video::PlaybackEvent>,
+    video_repaint: video::RepaintSignal,
     previews: TextureCache,
     thumbs: TextureCache,
     inflight: HashSet<TexKey>,
@@ -458,6 +459,7 @@ struct GuiApp {
     fullscreen: bool,
     window_focused: bool,
     active_video: Option<ActiveVideo>,
+    pending_initial_video_autoplay: Option<PathBuf>,
     video_muted: bool,
     selection_autoplay_armed: bool,
     repeat_video: bool,
@@ -517,6 +519,7 @@ impl GuiApp {
             decoder: DecodeService::new(Arc::clone(&preview_work_suspended)),
             video_tx,
             video_rx,
+            video_repaint: Arc::new(|| {}),
             previews: TextureCache::new(PREVIEW_CACHE_ENTRIES, PREVIEW_CACHE_BYTES),
             thumbs: TextureCache::new(THUMB_CACHE_ENTRIES, THUMB_CACHE_BYTES),
             inflight: HashSet::new(),
@@ -538,6 +541,7 @@ impl GuiApp {
             fullscreen: false,
             window_focused: true,
             active_video: None,
+            pending_initial_video_autoplay: None,
             video_muted: true,
             selection_autoplay_armed: false,
             repeat_video: false,
@@ -1332,6 +1336,16 @@ impl GuiApp {
         self.sync_work_suspension_state();
     }
 
+    fn start_pending_initial_video_autoplay(&mut self, focused: bool) {
+        if let Some(path) = take_pending_initial_video_autoplay(
+            focused,
+            &mut self.pending_initial_video_autoplay,
+            &self.state,
+        ) {
+            self.start_video_playback(path);
+        }
+    }
+
     fn stop_active_video(&mut self) {
         if let Some(active) = self.active_video.take() {
             active.handle.stop();
@@ -1358,13 +1372,14 @@ impl GuiApp {
     ) {
         self.stop_active_video();
         self.selection_autoplay_armed = selection_autoplay_armed;
-        let handle = video::spawn_playback(
+        let handle = video::spawn_playback_with_repaint(
             path.clone(),
             FIT_CAP,
             self.video_muted,
             start_at,
             paused,
             self.video_tx.clone(),
+            Arc::clone(&self.video_repaint),
         );
         self.active_video = Some(ActiveVideo {
             handle,
@@ -1588,6 +1603,8 @@ impl GuiApp {
     }
 
     fn attach_watcher(&mut self, ctx: &egui::Context) {
+        let video_repaint_ctx = ctx.clone();
+        self.video_repaint = Arc::new(move || video_repaint_ctx.request_repaint());
         let refresh_ctx = ctx.clone();
         let refresh_repaint_enabled = Arc::clone(&self.live_refresh_repaint_enabled);
         self.refresh = Some(RefreshService::new(
@@ -2725,6 +2742,7 @@ impl GuiApp {
     fn update_impl(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|input| input.focused);
         self.handle_focus_change(focused);
+        self.start_pending_initial_video_autoplay(focused);
         self.flush_deferred_live_refresh();
         self.sync_watcher_paths();
         self.drain_watcher();
@@ -3196,6 +3214,18 @@ fn should_autoplay_initial_video(state: &AppState, initial_file: Option<&Path>) 
     state
         .current_entry()
         .is_some_and(|entry| entry.path.as_path() == initial_file && entry.media_kind.is_video())
+}
+
+fn take_pending_initial_video_autoplay(
+    focused: bool,
+    pending: &mut Option<PathBuf>,
+    state: &AppState,
+) -> Option<PathBuf> {
+    if !focused {
+        return None;
+    }
+    let path = pending.take()?;
+    should_autoplay_initial_video(state, Some(&path)).then_some(path)
 }
 
 fn selection_autoplay_after_playback_start() -> bool {
@@ -4568,6 +4598,31 @@ mod tests {
     }
 
     #[test]
+    fn direct_video_autoplay_waits_for_a_focused_frame() {
+        let video_path = PathBuf::from("/tmp/media/video.mp4");
+        let state = app_state(
+            vec![media_entry(
+                video_path.clone(),
+                MediaKind::Video(VideoKind::Mp4),
+                0,
+            )],
+            0,
+        );
+        let mut pending = Some(video_path.clone());
+
+        assert_eq!(
+            take_pending_initial_video_autoplay(false, &mut pending, &state),
+            None
+        );
+        assert_eq!(pending.as_ref(), Some(&video_path));
+        assert_eq!(
+            take_pending_initial_video_autoplay(true, &mut pending, &state),
+            Some(video_path)
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
     fn selection_autoplay_stays_armed_across_images_until_pause() {
         let image = media_entry(
             PathBuf::from("/tmp/media/image.jpg"),
@@ -4956,8 +5011,8 @@ pub fn run(cli: Cli) -> Result<()> {
         cli.auto_next,
         empty_media_target,
     );
-    if autoplay_initial_video && let Some(path) = app.state.current_path() {
-        app.start_video_playback(path);
+    if autoplay_initial_video {
+        app.pending_initial_video_autoplay = app.state.current_path();
     }
     if let Some(error) = browser_launch_error {
         app.status = format!("browser failed: {error:#}");
