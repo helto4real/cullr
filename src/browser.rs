@@ -15,10 +15,7 @@ use eframe::egui;
 
 use crate::{
     scanner,
-    state::{
-        AppState, BrowserEntry, BrowserEntryKind, BrowserPaneFocus, BrowserState, MediaKind,
-        SortMode, ViewMode,
-    },
+    state::{BrowserEntry, BrowserEntryKind, BrowserPaneFocus, BrowserState, MediaKind, SortMode},
 };
 
 pub(crate) const BROWSER_DEFAULT_WIDTH: f32 = 320.0;
@@ -76,26 +73,6 @@ impl BrowserState {
         })
     }
 
-    /// Browser state for whatever the app is currently looking at: the current
-    /// file in preview mode, otherwise the scanned directory.
-    pub(crate) fn for_current_view(state: &AppState) -> Result<Self> {
-        let target = if matches!(state.mode, ViewMode::Preview) {
-            state
-                .current_path()
-                .unwrap_or_else(|| state.directory.clone())
-        } else {
-            state.directory.clone()
-        };
-        let listed_directory = listed_directory_for_target(&target);
-        Self::for_directory(
-            listed_directory,
-            Some(target),
-            HashMap::new(),
-            state.include_hidden,
-            &state.extensions,
-        )
-    }
-
     pub(crate) fn selected_path(&self) -> Option<PathBuf> {
         self.entries
             .get(self.selected_index)
@@ -109,6 +86,7 @@ impl BrowserState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set_sort_mode_preserving_selection(&mut self, sort_mode: SortMode) {
         let previous = self.selected_path();
         self.sort_mode = sort_mode;
@@ -230,7 +208,7 @@ fn browser_file_kind(path: &Path, extensions: &[String]) -> BrowserEntryKind {
     }
 }
 
-fn sort_browser_entries(entries: &mut [BrowserEntry], sort_mode: SortMode) {
+pub(crate) fn sort_browser_entries(entries: &mut [BrowserEntry], sort_mode: SortMode) {
     entries.sort_by(|a, b| {
         browser_kind_rank(&a.kind)
             .cmp(&browser_kind_rank(&b.kind))

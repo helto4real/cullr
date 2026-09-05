@@ -163,13 +163,30 @@ media and browser results are retained during bursts of filesystem activity.
 Newly arrived files are not full-size preview-prefetched until selected; visible
 grid thumbnails remain available.
 
-When the window is unfocused, or its active video preview is paused, Cullr
-suspends background media work. Pending refreshes and decodes are cooperatively
-cancelled, no new scans or decodes start, late video frames and decoded images
-are not uploaded as GPU textures, and background repaint requests are
-suppressed. Existing textures and the paused video's displayed frame remain
-available. Filesystem changes are coalesced into one current refresh after the
-window regains focus, playback resumes, or the selection changes.
+Manual folder opening, rescanning, sorting, and information metadata reads use
+that same background worker. The existing view stays visible with a loading
+status until the new view is ready. During folder changes and full rescans,
+media actions on the old view are disabled; browser navigation can replace the
+pending request. Failed reads preserve the old data. Watcher notifications are
+coalesced while a manual read is pending and reconciled against the resulting view.
+
+When the window is unfocused, reads and image decodes are cooperatively
+cancelled, texture uploads stop, and background repaint requests are suppressed.
+The latest pending manual request is retried when focus returns. Focus loss also
+pauses video and discards repeat/auto-next actions from completion messages
+processed without focus. Returning focus does not automatically resume video.
+Pausing a video while focused suspends preview decoding, but live library updates
+remain available. Existing textures and the paused video's frame remain visible.
+
+Decode results and new video frames request repaint when ready. Waiting for work
+does not continuously redraw the window; a 50 ms retry is scheduled only while a
+decode request cannot enter the full queue. Video retains only the latest pending
+frame, with metadata and terminal status kept separately. Overdue frames are
+skipped before scaling and RGBA conversion, after required codec decoding.
+
+VSync is disabled to avoid a presentation wait observed in NVIDIA EGL/Wayland
+when switching workspaces, including with paused video. Extended manual testing
+on Arch Linux with Hyprland showed no further hangs or playback issues.
 
 Cullr prefers native filesystem notifications and falls back to low-frequency
 polling when the platform watcher is unavailable. Automatic updates preserve

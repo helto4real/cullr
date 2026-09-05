@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     slice,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -44,37 +44,88 @@ pub struct PlaybackEvent {
 
 pub(crate) type RepaintSignal = Arc<dyn Fn() + Send + Sync>;
 
-#[derive(Clone)]
-struct PlaybackEventSink {
-    tx: flume::Sender<PlaybackEvent>,
-    request_repaint: RepaintSignal,
+/// Bounded handoff for the active playback. Frames may be replaced, but
+/// metadata and terminal events have independent slots.
+#[derive(Clone, Default)]
+pub struct PlaybackEvents(Arc<Mutex<PendingPlaybackEvents>>);
+
+#[derive(Default)]
+struct PendingPlaybackEvents {
+    playback_id: u64,
+    metadata: Option<PlaybackEvent>,
+    frame: Option<PlaybackEvent>,
+    terminal: Option<PlaybackEvent>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TryPlaybackEventSend {
-    Sent,
-    Full,
-    Disconnected,
+impl PlaybackEvents {
+    pub(crate) fn activate(&self, playback_id: u64) {
+        let old = {
+            let mut pending = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(
+                &mut *pending,
+                PendingPlaybackEvents {
+                    playback_id,
+                    ..Default::default()
+                },
+            )
+        };
+        drop(old);
+    }
+
+    pub(crate) fn publish(&self, event: PlaybackEvent) -> bool {
+        let replaced = {
+            let mut pending = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.playback_id != event.playback_id {
+                return false;
+            }
+            let slot = if event.ended || event.error.is_some() {
+                &mut pending.terminal
+            } else if event.frame.is_some() {
+                &mut pending.frame
+            } else {
+                &mut pending.metadata
+            };
+            slot.replace(event)
+        };
+        drop(replaced);
+        true
+    }
+
+    pub fn drain(&self) -> Vec<PlaybackEvent> {
+        let batch = {
+            let mut pending = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            [
+                pending.metadata.take(),
+                pending.frame.take(),
+                pending.terminal.take(),
+            ]
+        };
+        batch.into_iter().flatten().collect()
+    }
+}
+
+#[derive(Clone)]
+struct PlaybackEventSink {
+    events: PlaybackEvents,
+    request_repaint: RepaintSignal,
 }
 
 impl PlaybackEventSink {
     fn send(&self, event: PlaybackEvent) -> bool {
-        if self.tx.send(event).is_err() {
+        if !self.events.publish(event) {
             return false;
         }
         (self.request_repaint)();
         true
-    }
-
-    fn try_send(&self, event: PlaybackEvent) -> TryPlaybackEventSend {
-        match self.tx.try_send(event) {
-            Ok(()) => {
-                (self.request_repaint)();
-                TryPlaybackEventSend::Sent
-            }
-            Err(flume::TrySendError::Full(_)) => TryPlaybackEventSend::Full,
-            Err(flume::TrySendError::Disconnected(_)) => TryPlaybackEventSend::Disconnected,
-        }
     }
 }
 
@@ -217,17 +268,9 @@ pub fn spawn_playback(
     muted: bool,
     start_at: Duration,
     paused: bool,
-    frame_tx: flume::Sender<PlaybackEvent>,
+    events: PlaybackEvents,
 ) -> PlaybackHandle {
-    spawn_playback_with_repaint(
-        path,
-        cap,
-        muted,
-        start_at,
-        paused,
-        frame_tx,
-        Arc::new(|| {}),
-    )
+    spawn_playback_with_repaint(path, cap, muted, start_at, paused, events, Arc::new(|| {}))
 }
 
 pub(crate) fn spawn_playback_with_repaint(
@@ -236,7 +279,7 @@ pub(crate) fn spawn_playback_with_repaint(
     muted: bool,
     start_at: Duration,
     paused: bool,
-    frame_tx: flume::Sender<PlaybackEvent>,
+    events: PlaybackEvents,
     request_repaint: RepaintSignal,
 ) -> PlaybackHandle {
     let id = NEXT_PLAYBACK_ID.fetch_add(1, Ordering::SeqCst);
@@ -247,8 +290,9 @@ pub(crate) fn spawn_playback_with_repaint(
     });
     let thread_controls = controls.clone();
     let thread_path = path.clone();
+    events.activate(id);
     let event_sink = PlaybackEventSink {
-        tx: frame_tx,
+        events,
         request_repaint,
     };
     thread::spawn(move || {
@@ -321,30 +365,32 @@ fn run_video_playback(
             continue;
         }
         setup.decoder.send_packet(&packet)?;
-        while let Some(frame) = receive_scaled_video_frame(&mut setup)? {
+        while let Some(frame) = receive_decoded_video_frame(&mut setup)? {
             if !send_playback_frame(
                 playback_id,
                 &path,
-                frame,
+                frame.timestamp,
                 &controls,
                 event_sink,
                 &mut timeline,
-            ) {
+                || scale_color_frame(&mut setup, &frame.frame),
+            )? {
                 return Ok(());
             }
         }
     }
 
     setup.decoder.send_eof()?;
-    while let Some(frame) = receive_scaled_video_frame(&mut setup)? {
+    while let Some(frame) = receive_decoded_video_frame(&mut setup)? {
         if !send_playback_frame(
             playback_id,
             &path,
-            frame,
+            frame.timestamp,
             &controls,
             event_sink,
             &mut timeline,
-        ) {
+            || scale_color_frame(&mut setup, &frame.frame),
+        )? {
             return Ok(());
         }
     }
@@ -365,17 +411,18 @@ fn run_video_playback(
 fn send_playback_frame(
     playback_id: u64,
     path: &Path,
-    frame: VideoFrame,
+    timestamp: Option<Duration>,
     controls: &Arc<PlaybackControls>,
     event_sink: &PlaybackEventSink,
     timeline: &mut PlaybackTimeline,
-) -> bool {
+    convert: impl FnOnce() -> Result<egui::ColorImage>,
+) -> Result<bool> {
     let fallback_time =
         timeline.start_at + mul_duration(timeline.frame_duration, timeline.fallback_index);
     timeline.fallback_index += 1;
-    let pts = frame.timestamp.unwrap_or(fallback_time);
-    if should_discard_seek_preroll(frame.timestamp, timeline.start_at) {
-        return true;
+    let pts = timestamp.unwrap_or(fallback_time);
+    if should_discard_seek_preroll(timestamp, timeline.start_at) {
+        return Ok(true);
     }
     let base = *timeline.first_pts.get_or_insert(pts);
     let relative = pts.saturating_sub(base);
@@ -390,14 +437,23 @@ fn send_playback_frame(
             &mut timeline.paused_total,
         )
     {
-        return false;
+        return Ok(false);
     }
     if timeline.sent_frames > 0 && controls.paused.load(Ordering::SeqCst) {
-        return true;
+        return Ok(true);
     }
 
-    let size = [frame.image.width() as usize, frame.image.height() as usize];
-    let image = egui::ColorImage::from_rgba_unmultiplied(size, frame.image.as_raw());
+    if controls.stop.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    let target = timeline.playback_start + timeline.paused_total + relative;
+    if timeline.sent_frames > 0 && Instant::now() > target + timeline.frame_duration {
+        return Ok(true);
+    }
+    let image = convert()?;
+    if controls.stop.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
     let event = PlaybackEvent {
         playback_id,
         path: path.to_path_buf(),
@@ -407,12 +463,11 @@ fn send_playback_frame(
         ended: false,
         error: None,
     };
-    match event_sink.try_send(event) {
-        TryPlaybackEventSend::Sent => timeline.sent_frames += 1,
-        TryPlaybackEventSend::Full => {}
-        TryPlaybackEventSend::Disconnected => return false,
+    if !event_sink.send(event) {
+        return Ok(false);
     }
-    true
+    timeline.sent_frames += 1;
+    Ok(true)
 }
 
 fn wait_until(
@@ -489,26 +544,54 @@ fn open_video_setup(input: &mut format::context::Input, cap: u32) -> Result<Vide
 
 struct VideoFrame {
     image: RgbaImage,
+}
+
+struct DecodedVideoFrame {
+    frame: frame::Video,
     timestamp: Option<Duration>,
 }
 
-fn receive_scaled_video_frame(setup: &mut VideoSetup) -> Result<Option<VideoFrame>> {
+fn receive_decoded_video_frame(setup: &mut VideoSetup) -> Result<Option<DecodedVideoFrame>> {
     let mut decoded = frame::Video::empty();
     match setup.decoder.receive_frame(&mut decoded) {
         Ok(()) => {
             let timestamp = decoded
                 .timestamp()
                 .and_then(|value| timestamp_to_duration(value, setup.time_base));
-            let mut rgba_frame = frame::Video::empty();
-            setup.scaler.run(&decoded, &mut rgba_frame)?;
-            Ok(Some(VideoFrame {
-                image: apply_video_rotation(rgba_image_from_frame(&rgba_frame)?, setup.rotation),
+            Ok(Some(DecodedVideoFrame {
+                frame: decoded,
                 timestamp,
             }))
         }
         Err(error) if decoder_needs_more_input(error) => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn scale_video_frame(setup: &mut VideoSetup, decoded: &frame::Video) -> Result<RgbaImage> {
+    let mut rgba_frame = frame::Video::empty();
+    setup.scaler.run(decoded, &mut rgba_frame)?;
+    Ok(apply_video_rotation(
+        rgba_image_from_frame(&rgba_frame)?,
+        setup.rotation,
+    ))
+}
+
+fn scale_color_frame(setup: &mut VideoSetup, decoded: &frame::Video) -> Result<egui::ColorImage> {
+    let image = scale_video_frame(setup, decoded)?;
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [image.width() as usize, image.height() as usize],
+        image.as_raw(),
+    ))
+}
+
+fn receive_scaled_video_frame(setup: &mut VideoSetup) -> Result<Option<VideoFrame>> {
+    let Some(decoded) = receive_decoded_video_frame(setup)? else {
+        return Ok(None);
+    };
+    Ok(Some(VideoFrame {
+        image: scale_video_frame(setup, &decoded.frame)?,
+    }))
 }
 
 fn stream_rotation(stream: &format::stream::Stream<'_>) -> VideoRotation {
@@ -835,32 +918,158 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queued_playback_events_request_repaint() {
-        let (tx, _rx) = flume::bounded(2);
-        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let callback_count = Arc::clone(&repaint_count);
+    fn mailbox_keeps_latest_frame_and_terminal_without_accepting_old_playback() {
+        let events = PlaybackEvents::default();
+        events.activate(1);
+        let event = |id, frame: bool, ended| PlaybackEvent {
+            playback_id: id,
+            path: PathBuf::from("video.mp4"),
+            frame: frame.then(|| egui::ColorImage::new([1, 1], egui::Color32::WHITE)),
+            position: Some(Duration::from_secs(id)),
+            duration: None,
+            ended,
+            error: None,
+        };
+        assert!(events.publish(event(1, false, false)));
+        assert!(events.publish(event(1, true, false)));
+        let mut latest = event(1, true, false);
+        latest.position = Some(Duration::from_secs(5));
+        assert!(events.publish(latest));
+        assert!(events.publish(event(1, false, true)));
+        let batch = events.drain();
+        assert_eq!(batch.len(), 3);
+        assert!(batch[0].frame.is_none());
+        assert_eq!(batch[1].position, Some(Duration::from_secs(5)));
+        assert!(batch[2].ended);
+        events.activate(2);
+        assert!(!events.publish(event(1, true, false)));
+        assert!(events.drain().is_empty());
+    }
+
+    #[test]
+    fn published_events_wake_ui_only_after_acceptance() {
+        let events = PlaybackEvents::default();
+        events.activate(1);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = count.clone();
         let sink = PlaybackEventSink {
-            tx,
+            events,
             request_repaint: Arc::new(move || {
                 callback_count.fetch_add(1, Ordering::SeqCst);
             }),
         };
-        let event = || PlaybackEvent {
-            playback_id: 1,
-            path: PathBuf::from("video.mp4"),
-            frame: None,
-            position: None,
-            duration: None,
-            ended: false,
-            error: None,
+        for id in [1, 2] {
+            assert_eq!(
+                sink.send(PlaybackEvent {
+                    playback_id: id,
+                    path: PathBuf::from("video.mp4"),
+                    frame: None,
+                    position: None,
+                    duration: None,
+                    ended: false,
+                    error: None,
+                }),
+                id == 1
+            );
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn overdue_frames_skip_conversion_but_first_frame_and_missing_pts_are_supported() {
+        let handle = PlaybackHandle::test_handle(PathBuf::from("synthetic.mp4"), false);
+        let events = PlaybackEvents::default();
+        events.activate(handle.id());
+        let sink = PlaybackEventSink {
+            events: events.clone(),
+            request_repaint: Arc::new(|| {}),
         };
+        let mut timeline = PlaybackTimeline {
+            start_at: Duration::ZERO,
+            playback_start: Instant::now() - Duration::from_secs(2),
+            paused_total: Duration::ZERO,
+            first_pts: None,
+            fallback_index: 0,
+            sent_frames: 0,
+            frame_duration: Duration::from_millis(40),
+            duration: None,
+        };
+        assert!(
+            send_playback_frame(
+                handle.id(),
+                handle.path(),
+                None,
+                &handle.controls,
+                &sink,
+                &mut timeline,
+                || Ok(egui::ColorImage::new([1, 1], egui::Color32::WHITE))
+            )
+            .unwrap()
+        );
+        assert_eq!(events.drain()[0].position, Some(Duration::ZERO));
+        for pts in [None, Some(Duration::from_millis(80))] {
+            assert!(
+                send_playback_frame(
+                    handle.id(),
+                    handle.path(),
+                    pts,
+                    &handle.controls,
+                    &sink,
+                    &mut timeline,
+                    || panic!("overdue frame reached conversion")
+                )
+                .unwrap()
+            );
+        }
+        assert!(events.drain().is_empty());
+        assert_eq!(timeline.fallback_index, 3);
+        assert_eq!(timeline.sent_frames, 1);
+    }
 
-        assert!(sink.send(event()));
-        assert_eq!(sink.try_send(event()), TryPlaybackEventSend::Sent);
-
-        assert_eq!(repaint_count.load(Ordering::SeqCst), 2);
-        assert_eq!(sink.try_send(event()), TryPlaybackEventSend::Full);
-        assert_eq!(repaint_count.load(Ordering::SeqCst), 2);
+    #[test]
+    fn paused_first_frame_and_seek_preroll_keep_their_conversion_rules() {
+        let handle = PlaybackHandle::test_handle(PathBuf::from("synthetic.mp4"), true);
+        let events = PlaybackEvents::default();
+        events.activate(handle.id());
+        let sink = PlaybackEventSink {
+            events: events.clone(),
+            request_repaint: Arc::new(|| {}),
+        };
+        let mut timeline = PlaybackTimeline {
+            start_at: Duration::from_secs(10),
+            playback_start: Instant::now(),
+            paused_total: Duration::ZERO,
+            first_pts: None,
+            fallback_index: 0,
+            sent_frames: 0,
+            frame_duration: Duration::from_millis(40),
+            duration: None,
+        };
+        assert!(
+            send_playback_frame(
+                handle.id(),
+                handle.path(),
+                Some(Duration::from_secs(9)),
+                &handle.controls,
+                &sink,
+                &mut timeline,
+                || panic!("seek preroll reached conversion")
+            )
+            .unwrap()
+        );
+        assert!(
+            send_playback_frame(
+                handle.id(),
+                handle.path(),
+                Some(Duration::from_secs(10)),
+                &handle.controls,
+                &sink,
+                &mut timeline,
+                || Ok(egui::ColorImage::new([1, 1], egui::Color32::WHITE))
+            )
+            .unwrap()
+        );
+        assert_eq!(events.drain()[0].position, Some(Duration::from_secs(10)));
     }
 
     #[test]

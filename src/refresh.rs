@@ -12,6 +12,7 @@ use flume::{Receiver, Sender};
 
 use crate::{
     browser::read_browser_entries_with_sort_cancellable,
+    metadata,
     scanner::{ScanOptions, scan_directory_cancellable, scan_files_cancellable},
     sorter,
     state::{BrowserEntry, MediaEntry, SortMode},
@@ -34,8 +35,142 @@ pub struct BrowserRefreshScope {
     pub sort_mode: SortMode,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum ReadJob {
+    #[cfg(test)]
+    Blocked {
+        started: Sender<()>,
+        release: Receiver<()>,
+        job: Box<ReadJob>,
+    },
+    Media {
+        scope: MediaRefreshScope,
+        sort_mode: SortMode,
+        locale: Option<String>,
+    },
+    Browser(BrowserRefreshScope),
+    SortMedia {
+        entries: Vec<MediaEntry>,
+        sort_mode: SortMode,
+        locale: Option<String>,
+    },
+    SortBrowser {
+        entries: Vec<BrowserEntry>,
+        sort_mode: SortMode,
+    },
+    Metadata(MediaEntry),
+}
+
+#[derive(Debug)]
+pub enum ReadOutput {
+    Media(Vec<MediaEntry>),
+    Browser(Vec<BrowserEntry>),
+    Metadata(MediaEntry),
+}
+
+#[derive(Debug)]
+struct ReadRequest {
+    generation: u64,
+    epoch: u64,
+    job: ReadJob,
+}
+
+fn execute_read(job: ReadJob, cancelled: &impl Fn() -> bool) -> anyhow::Result<Option<ReadOutput>> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let output = match job {
+        #[cfg(test)]
+        ReadJob::Blocked {
+            started,
+            release,
+            job,
+        } => {
+            let _ = started.send(());
+            release.recv_timeout(std::time::Duration::from_secs(5))?;
+            return execute_read(*job, cancelled);
+        }
+        ReadJob::Media {
+            scope,
+            sort_mode,
+            locale,
+        } => {
+            let Some(mut entries) = scan_media(&scope, cancelled)? else {
+                return Ok(None);
+            };
+            if !sorter::sort_entries_cancellable(
+                &mut entries,
+                sort_mode,
+                locale.as_deref(),
+                cancelled,
+            ) {
+                return Ok(None);
+            }
+            ReadOutput::Media(entries)
+        }
+        ReadJob::Browser(scope) => {
+            let Some(entries) = read_browser_entries_with_sort_cancellable(
+                &scope.directory,
+                scope.include_hidden,
+                &scope.extensions,
+                scope.sort_mode,
+                cancelled,
+            )?
+            else {
+                return Ok(None);
+            };
+            ReadOutput::Browser(entries)
+        }
+        ReadJob::SortMedia {
+            mut entries,
+            sort_mode,
+            locale,
+        } => {
+            if !sorter::sort_entries_cancellable(
+                &mut entries,
+                sort_mode,
+                locale.as_deref(),
+                cancelled,
+            ) {
+                return Ok(None);
+            }
+            ReadOutput::Media(entries)
+        }
+        ReadJob::SortBrowser {
+            mut entries,
+            sort_mode,
+        } => {
+            crate::browser::sort_browser_entries(&mut entries, sort_mode);
+            ReadOutput::Browser(entries)
+        }
+        ReadJob::Metadata(mut entry) => {
+            let matches_identity = || -> anyhow::Result<bool> {
+                let current = std::fs::metadata(&entry.path)?;
+                Ok(current.len() == entry.file_len && current.modified().ok() == entry.modified)
+            };
+            anyhow::ensure!(matches_identity()?, "file changed before metadata read");
+            metadata::enrich_entry_cancellable(&mut entry, cancelled);
+            if cancelled() {
+                return Ok(None);
+            }
+            let current = std::fs::metadata(&entry.path)?;
+            anyhow::ensure!(
+                current.len() == entry.file_len && current.modified().ok() == entry.modified,
+                "file changed during metadata read"
+            );
+            ReadOutput::Metadata(entry)
+        }
+    };
+    Ok((!cancelled()).then_some(output))
+}
+
 #[derive(Debug)]
 pub enum RefreshResult {
+    #[doc(hidden)]
+    Read {
+        generation: u64,
+        result: Result<ReadOutput, String>,
+    },
     Media {
         generation: u64,
         scope: MediaRefreshScope,
@@ -84,12 +219,14 @@ struct BrowserRequest {
 
 #[derive(Debug, Default)]
 struct PendingRefreshes {
+    read: Option<ReadRequest>,
     media: Option<MediaRequest>,
     browser: Option<BrowserRequest>,
 }
 
 #[derive(Debug, Default)]
 struct PendingResults {
+    read: Option<RefreshResult>,
     media: Option<RefreshResult>,
     browser: Option<RefreshResult>,
 }
@@ -101,6 +238,7 @@ pub struct RefreshService {
     results: Arc<Mutex<PendingResults>>,
     media_epoch: Arc<AtomicU64>,
     browser_epoch: Arc<AtomicU64>,
+    read_epoch: Arc<AtomicU64>,
 }
 
 impl RefreshService {
@@ -113,6 +251,8 @@ impl RefreshService {
         let worker_results = results.clone();
         let media_epoch = Arc::new(AtomicU64::new(0));
         let browser_epoch = Arc::new(AtomicU64::new(0));
+        let read_epoch = Arc::new(AtomicU64::new(0));
+        let worker_read_epoch = Arc::clone(&read_epoch);
         let worker_suspended = Arc::clone(&suspended);
         let worker_media_epoch = Arc::clone(&media_epoch);
         let worker_browser_epoch = Arc::clone(&browser_epoch);
@@ -128,6 +268,7 @@ impl RefreshService {
                     suspended: worker_suspended,
                     media_epoch: worker_media_epoch,
                     browser_epoch: worker_browser_epoch,
+                    read_epoch: worker_read_epoch,
                     repaint,
                 }
                 .run();
@@ -141,7 +282,25 @@ impl RefreshService {
             results,
             media_epoch,
             browser_epoch,
+            read_epoch,
         }
+    }
+
+    pub(crate) fn request_read(&self, generation: u64, job: ReadJob) {
+        let epoch = self.read_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let old = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.read.replace(ReadRequest {
+                generation,
+                epoch,
+                job,
+            })
+        };
+        drop(old);
+        let _ = self.wake_tx.try_send(());
     }
 
     pub fn request_media(
@@ -192,7 +351,10 @@ impl RefreshService {
             .results
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut drained = Vec::with_capacity(2);
+        let mut drained = Vec::with_capacity(3);
+        if let Some(result) = results.read.take() {
+            drained.push(result);
+        }
         if let Some(result) = results.media.take() {
             drained.push(result);
         }
@@ -203,6 +365,7 @@ impl RefreshService {
     }
 
     pub fn cancel_all(&self) {
+        self.read_epoch.fetch_add(1, Ordering::AcqRel);
         self.media_epoch.fetch_add(1, Ordering::AcqRel);
         self.browser_epoch.fetch_add(1, Ordering::AcqRel);
     }
@@ -216,6 +379,7 @@ struct RefreshWorker {
     suspended: Arc<AtomicBool>,
     media_epoch: Arc<AtomicU64>,
     browser_epoch: Arc<AtomicU64>,
+    read_epoch: Arc<AtomicU64>,
     repaint: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -229,6 +393,31 @@ impl RefreshWorker {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 std::mem::take(&mut *guard)
             };
+            if let Some(request) = pending.read {
+                let cancelled = || {
+                    self.suspended.load(Ordering::Acquire)
+                        || self.read_epoch.load(Ordering::Acquire) != request.epoch
+                };
+                let output = execute_read(request.job, &cancelled);
+                if !cancelled() {
+                    let result = match output {
+                        Ok(Some(output)) => Some(Ok(output)),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(format!("{error:#}"))),
+                    };
+                    if let Some(result) = result {
+                        publish_result(
+                            RefreshResult::Read {
+                                generation: request.generation,
+                                result,
+                            },
+                            &self.result_wake_tx,
+                            &self.results,
+                        );
+                        (self.repaint)();
+                    }
+                }
+            }
             if let Some(request) = pending.media {
                 let MediaRequest {
                     generation,
@@ -318,6 +507,7 @@ fn publish_result(result: RefreshResult, wake_tx: &Sender<()>, pending: &Mutex<P
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match &result {
+        RefreshResult::Read { .. } => pending.read = Some(result),
         RefreshResult::Media { .. } => pending.media = Some(result),
         RefreshResult::Browser { .. } => pending.browser = Some(result),
     }
@@ -442,6 +632,24 @@ fn same_scanned_file(left: &MediaEntry, right: &MediaEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metadata_read_rejects_changed_identity_and_enriches_current_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("synthetic.jpg");
+        image::RgbImage::new(8, 8).save(&path).unwrap();
+        let mut entries =
+            crate::scanner::scan_files(std::slice::from_ref(&path), &["jpg".to_owned()]).unwrap();
+        let entry = entries.remove(0);
+        let Some(ReadOutput::Metadata(enriched)) =
+            execute_read(ReadJob::Metadata(entry.clone()), &|| false).unwrap()
+        else {
+            panic!("expected enriched metadata");
+        };
+        assert_eq!(enriched.dimensions, Some((8, 8)));
+        std::fs::write(path, b"changed").unwrap();
+        assert!(execute_read(ReadJob::Metadata(entry), &|| false).is_err());
+    }
+
     use super::*;
     use crate::state::{ImageKind, MediaKind};
     use std::{
@@ -485,7 +693,7 @@ mod tests {
                 assert_eq!(returned_scope, scope);
                 assert_eq!(result.unwrap().entries.len(), 1);
             }
-            RefreshResult::Browser { .. } => panic!("expected media refresh"),
+            _ => panic!("expected media refresh"),
         }
     }
 

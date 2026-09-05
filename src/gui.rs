@@ -29,13 +29,14 @@ use crate::{
     browser::{
         BROWSER_DEFAULT_WIDTH, BROWSER_ROW_HEIGHT, browser_move_index, draw_browser_icon,
         draw_unsupported_file_message, left_elided_text, listed_directory_for_target,
-        preferred_browser_index, read_browser_entries_with_sort,
+        preferred_browser_index,
     },
     cli::{Cli, CliViewMode},
     decode::{decode_rgba_capped_cancellable, estimated_color_image_decode_bytes},
-    delete, metadata,
+    delete,
     refresh::{
-        BrowserRefreshScope, MediaRefreshOutput, MediaRefreshScope, RefreshResult, RefreshService,
+        BrowserRefreshScope, MediaRefreshOutput, MediaRefreshScope, ReadJob, ReadOutput,
+        RefreshResult, RefreshService,
     },
     scanner::{ScanOptions, scan_directory, scan_files},
     sorter,
@@ -241,6 +242,7 @@ struct DecodeService {
     result_rx: Receiver<DecodeResult>,
     work_epoch: Arc<AtomicU64>,
     memory_budget: Arc<DecodeMemoryBudget>,
+    repaint: Arc<Mutex<video::RepaintSignal>>,
 }
 
 impl DecodeService {
@@ -249,6 +251,7 @@ impl DecodeService {
         let (result_tx, result_rx) = flume::bounded::<DecodeResult>(DECODE_RESULT_CAPACITY);
         let work_epoch = Arc::new(AtomicU64::new(0));
         let memory_budget = DecodeMemoryBudget::new(DECODE_MEMORY_BUDGET_BYTES);
+        let repaint: Arc<Mutex<video::RepaintSignal>> = Arc::new(Mutex::new(Arc::new(|| {})));
         let workers = thread::available_parallelism()
             .map(|count| count.get().clamp(2, 6))
             .unwrap_or(2);
@@ -258,7 +261,17 @@ impl DecodeService {
             let work_epoch = work_epoch.clone();
             let memory_budget = Arc::clone(&memory_budget);
             let suspended = Arc::clone(&suspended);
+            let repaint = Arc::clone(&repaint);
             thread::spawn(move || {
+                let publish = |result| {
+                    if result_tx.send(result).is_ok() && !suspended.load(Ordering::Acquire) {
+                        let signal = repaint
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        signal();
+                    }
+                };
                 for job in job_rx.iter() {
                     let cancelled = || {
                         suspended.load(Ordering::Acquire)
@@ -270,7 +283,7 @@ impl DecodeService {
                     let reservation = match decode_memory_reservation(&job.key) {
                         Ok(reservation) => reservation,
                         Err(error) => {
-                            let _ = result_tx.send(DecodeResult {
+                            publish(DecodeResult {
                                 key: job.key,
                                 work_epoch: job.work_epoch,
                                 image: Err(error),
@@ -287,7 +300,7 @@ impl DecodeService {
                             Ok(Some(permit)) => permit,
                             Ok(None) => continue,
                             Err(error) => {
-                                let _ = result_tx.send(DecodeResult {
+                                publish(DecodeResult {
                                     key: job.key,
                                     work_epoch: job.work_epoch,
                                     image: Err(error.to_string()),
@@ -321,7 +334,7 @@ impl DecodeService {
                     };
                     tracing::debug!(path = %job.key.path.display(), ok = image.is_ok(), "decoded");
                     let memory_permit = image.is_ok().then_some(memory_permit);
-                    let _ = result_tx.send(DecodeResult {
+                    publish(DecodeResult {
                         key: job.key,
                         work_epoch: job.work_epoch,
                         image,
@@ -335,14 +348,13 @@ impl DecodeService {
             result_rx,
             work_epoch,
             memory_budget,
+            repaint,
         }
     }
 
-    fn request(&self, key: TexKey) -> bool {
+    fn request(&self, key: TexKey) -> Result<(), flume::TrySendError<DecodeRequest>> {
         let work_epoch = self.work_epoch.load(Ordering::Relaxed);
-        self.job_tx
-            .try_send(DecodeRequest { key, work_epoch })
-            .is_ok()
+        self.job_tx.try_send(DecodeRequest { key, work_epoch })
     }
 
     fn cancel_pending(&self) {
@@ -435,8 +447,7 @@ fn texture_byte_len(handle: &egui::TextureHandle) -> usize {
 struct GuiApp {
     state: AppState,
     decoder: DecodeService,
-    video_tx: Sender<video::PlaybackEvent>,
-    video_rx: Receiver<video::PlaybackEvent>,
+    video_events: video::PlaybackEvents,
     video_repaint: video::RepaintSignal,
     previews: TextureCache,
     thumbs: TextureCache,
@@ -482,10 +493,41 @@ struct GuiApp {
     watcher: Option<MediaWatcher>,
     watcher_error: Option<String>,
     refresh: Option<RefreshService>,
+    pending_read: Option<PendingRead>,
+    read_generation: u64,
+    read_inflight: bool,
     media_refresh_generation: u64,
     browser_refresh_generation: u64,
     media_refresh_inflight: bool,
     browser_refresh_inflight: bool,
+}
+
+struct PendingRead {
+    job: ReadJob,
+    effect: ReadEffect,
+}
+
+enum ReadEffect {
+    Browse {
+        browser: BrowserState,
+        preferred: Option<PathBuf>,
+        force_reload: bool,
+    },
+    Load(ViewLoad),
+    SortMedia(SortMode),
+    SortBrowser(SortMode),
+    Metadata,
+}
+
+#[derive(Clone)]
+struct ViewLoad {
+    directory: PathBuf,
+    selected_files: Option<IndexSet<PathBuf>>,
+    preferred: Option<PathBuf>,
+    required_file: Option<PathBuf>,
+    mode: ViewMode,
+    target: PathBuf,
+    browser: Option<BrowserState>,
 }
 
 struct ActiveVideo {
@@ -504,9 +546,6 @@ impl GuiApp {
         auto_next: bool,
         empty_media_target: PathBuf,
     ) -> Self {
-        // At most one metadata event and one frame may be pending. Playback
-        // drops superseded frames instead of accumulating full RGBA buffers.
-        let (video_tx, video_rx) = flume::bounded(2);
         let preview_work_suspended = Arc::new(AtomicBool::new(false));
         let live_refresh_suspended = Arc::new(AtomicBool::new(false));
         let status = if state.entries.is_empty() {
@@ -517,8 +556,7 @@ impl GuiApp {
         Self {
             state,
             decoder: DecodeService::new(Arc::clone(&preview_work_suspended)),
-            video_tx,
-            video_rx,
+            video_events: video::PlaybackEvents::default(),
             video_repaint: Arc::new(|| {}),
             previews: TextureCache::new(PREVIEW_CACHE_ENTRIES, PREVIEW_CACHE_BYTES),
             thumbs: TextureCache::new(THUMB_CACHE_ENTRIES, THUMB_CACHE_BYTES),
@@ -561,11 +599,312 @@ impl GuiApp {
             watcher: None,
             watcher_error: None,
             refresh: None,
+            pending_read: None,
+            read_generation: 0,
+            read_inflight: false,
             media_refresh_generation: 0,
             browser_refresh_generation: 0,
             media_refresh_inflight: false,
             browser_refresh_inflight: false,
         }
+    }
+
+    fn media_actions_blocked(&self) -> bool {
+        self.pending_browser_apply
+            || self.browser_apply_deadline.is_some()
+            || self.pending_read.as_ref().is_some_and(|read| {
+                matches!(read.effect, ReadEffect::Browse { .. } | ReadEffect::Load(_))
+            })
+    }
+
+    fn cancel_read(&mut self) {
+        if self.media_refresh_inflight || self.browser_refresh_inflight {
+            self.deferred_live_refresh_pending = true;
+        }
+        self.media_refresh_generation = self.media_refresh_generation.wrapping_add(1);
+        self.browser_refresh_generation = self.browser_refresh_generation.wrapping_add(1);
+        self.media_refresh_inflight = false;
+        self.browser_refresh_inflight = false;
+        self.read_generation = self.read_generation.wrapping_add(1);
+        self.pending_read = None;
+        self.read_inflight = false;
+        if let Some(refresh) = &self.refresh {
+            refresh.cancel_all();
+        }
+        self.sync_work_suspension_state();
+    }
+
+    fn begin_read(&mut self, job: ReadJob, effect: ReadEffect) {
+        self.cancel_read();
+        self.pending_read = Some(PendingRead { job, effect });
+        if self.media_actions_blocked() {
+            self.state.confirm_delete = false;
+            self.stop_active_video();
+        }
+        self.status = "loading…".to_owned();
+        self.sync_work_suspension_state();
+        self.resume_read();
+    }
+
+    fn resume_read(&mut self) {
+        if self.read_inflight || !self.window_focused {
+            return;
+        }
+        let Some(read) = &self.pending_read else {
+            return;
+        };
+        let signal = Arc::clone(&self.decoder.repaint);
+        let refresh = self.refresh.get_or_insert_with(|| {
+            RefreshService::new(Arc::clone(&self.live_refresh_suspended), move || {
+                let callback = signal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                callback();
+            })
+        });
+        refresh.request_read(self.read_generation, read.job.clone());
+        self.read_inflight = true;
+    }
+
+    fn handle_read_result(&mut self, generation: u64, result: Result<ReadOutput, String>) {
+        if generation != self.read_generation {
+            return;
+        }
+        self.read_inflight = false;
+        if !self.window_focused {
+            return;
+        }
+        let Some(read) = self.pending_read.take() else {
+            return;
+        };
+        self.sync_work_suspension_state();
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                if matches!(read.effect, ReadEffect::Load(_)) {
+                    self.right_pane_error = Some(format!("Failed to scan media\n{error}"));
+                }
+                self.status = format!("load failed: {error}");
+                return;
+            }
+        };
+        match (read.effect, output) {
+            (
+                ReadEffect::Browse {
+                    mut browser,
+                    preferred,
+                    force_reload,
+                },
+                ReadOutput::Browser(entries),
+            ) => {
+                let remembered = browser.remembered_selection.get(&browser.listed_directory);
+                browser.selected_index =
+                    preferred_browser_index(&entries, preferred.as_ref().or(remembered), 0);
+                browser.entries = entries;
+                browser.remember_current_selection();
+                self.load_browser_preview(browser, force_reload);
+            }
+            (ReadEffect::Load(load), ReadOutput::Media(entries)) => {
+                if load
+                    .required_file
+                    .as_ref()
+                    .is_some_and(|path| !entries.iter().any(|e| &e.path == path))
+                {
+                    self.right_pane_error =
+                        Some("Selected file is no longer available after rescanning".to_owned());
+                    self.status = "selected file disappeared".to_owned();
+                    return;
+                }
+                let queued = self.state.queue_count();
+                self.invalidate_decodes();
+                self.state.delete_queue.clear();
+                self.state.directory = load.directory;
+                self.state.selected_files = load.selected_files;
+                self.state.mode = load.mode;
+                self.empty_media_target = load.target;
+                self.state
+                    .set_entries_preserving_current(entries, load.preferred);
+                if let Some(browser) = load.browser {
+                    self.state.browser = Some(browser);
+                }
+                self.right_pane_error = None;
+                self.status = if self.state.entries.is_empty() {
+                    empty_media_status(&self.empty_media_target)
+                } else {
+                    format!("scanned {} media files", self.state.entries.len())
+                };
+                if queued > 0 {
+                    self.status
+                        .push_str(&format!("; cleared {queued} queued deletion(s)"));
+                }
+                self.sync_browser_to_current_path();
+                self.scroll_to_current = true;
+            }
+            (ReadEffect::SortMedia(mode), ReadOutput::Media(entries)) => {
+                let current = self.state.current_path();
+                self.state.sort_mode = mode;
+                self.state.set_entries_preserving_current(entries, current);
+                self.sync_browser_to_current_path();
+                self.scroll_to_current = true;
+                self.status = format!("sort: {mode:?}");
+            }
+            (ReadEffect::SortBrowser(mode), ReadOutput::Browser(entries)) => {
+                self.apply_browser_listing_preserving_selection(entries);
+                if let Some(browser) = self.state.browser.as_mut() {
+                    browser.sort_mode = mode;
+                }
+                self.status = format!("browser sort: {mode:?}");
+            }
+            (ReadEffect::Metadata, ReadOutput::Metadata(enriched)) => {
+                if let Some(entry) = self.state.current_entry_mut()
+                    && entry.path == enriched.path
+                    && entry.file_len == enriched.file_len
+                    && entry.modified == enriched.modified
+                {
+                    *entry = enriched;
+                }
+                self.status = "metadata loaded".to_owned();
+            }
+            _ => unreachable!("read result must match its request"),
+        }
+        self.sync_work_suspension_state();
+    }
+
+    fn queue_browser(
+        &mut self,
+        directory: PathBuf,
+        preferred: Option<PathBuf>,
+        force_reload: bool,
+    ) {
+        let (remembered_selection, sort_mode) = self
+            .state
+            .browser
+            .as_ref()
+            .map(|b| (b.remembered_selection.clone(), b.sort_mode))
+            .unwrap_or((HashMap::new(), SortMode::NameAsc));
+        let scope = BrowserRefreshScope {
+            directory: directory.clone(),
+            include_hidden: self.state.include_hidden,
+            extensions: self.state.extensions.clone(),
+            sort_mode,
+        };
+        let browser = BrowserState {
+            listed_directory: directory,
+            entries: Vec::new(),
+            selected_index: 0,
+            focus: BrowserPaneFocus::Browser,
+            sort_mode,
+            remembered_selection,
+            scroll_to_selection: true,
+        };
+        self.begin_read(
+            ReadJob::Browser(scope),
+            ReadEffect::Browse {
+                browser,
+                preferred,
+                force_reload,
+            },
+        );
+    }
+
+    fn load_browser_preview(&mut self, browser: BrowserState, force_reload: bool) {
+        let selected = browser.entries.get(browser.selected_index).cloned();
+        match selected {
+            Some(entry) if entry.kind == BrowserEntryKind::UnsupportedFile => {
+                self.state.browser = Some(browser);
+                self.stop_active_video();
+                self.state.mode = ViewMode::Preview;
+                self.right_pane_error = None;
+                self.empty_media_target = entry.path;
+                self.status = "unsupported file".to_owned();
+            }
+            Some(entry) if matches!(entry.kind, BrowserEntryKind::Media(_)) => {
+                self.queue_file(entry.path, force_reload, Some(browser));
+            }
+            entry => {
+                let directory = entry
+                    .map(|e| e.path)
+                    .unwrap_or_else(|| browser.listed_directory.clone());
+                self.queue_directory(directory, Some(browser));
+            }
+        }
+    }
+
+    fn queue_directory(&mut self, directory: PathBuf, browser: Option<BrowserState>) {
+        let preferred = (self.state.directory == directory)
+            .then(|| self.state.current_path())
+            .flatten();
+        self.queue_view(ViewLoad {
+            directory: directory.clone(),
+            selected_files: None,
+            preferred,
+            required_file: None,
+            mode: ViewMode::Grid,
+            target: directory,
+            browser,
+        });
+    }
+
+    fn queue_view(&mut self, load: ViewLoad) {
+        let scope = if let Some(files) = &load.selected_files {
+            MediaRefreshScope::SelectedFiles {
+                files: files.iter().cloned().collect(),
+                extensions: self.state.extensions.clone(),
+            }
+        } else {
+            MediaRefreshScope::Directory(ScanOptions {
+                root: load.directory.clone(),
+                recursive: self.state.recursive,
+                include_hidden: self.state.include_hidden,
+                extensions: self.state.extensions.clone(),
+            })
+        };
+        self.begin_read(
+            ReadJob::Media {
+                scope,
+                sort_mode: self.state.sort_mode,
+                locale: self.locale.clone(),
+            },
+            ReadEffect::Load(load),
+        );
+    }
+
+    fn queue_file(&mut self, path: PathBuf, force_reload: bool, browser: Option<BrowserState>) {
+        let Some(directory) = path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        if !force_reload
+            && self.state.selected_files.is_none()
+            && self.state.directory == directory
+            && let Some(index) = self
+                .state
+                .entries
+                .iter()
+                .position(|entry| entry.path == path)
+        {
+            self.cancel_read();
+            self.stop_active_video();
+            if let Some(browser) = browser {
+                self.state.browser = Some(browser);
+            }
+            self.state.mode = ViewMode::Preview;
+            self.state.current_index = index;
+            self.empty_media_target = path;
+            self.right_pane_error = None;
+            self.scroll_to_current = true;
+            self.status = "preview".to_owned();
+            return;
+        }
+        self.queue_view(ViewLoad {
+            directory,
+            selected_files: None,
+            preferred: Some(path.clone()),
+            required_file: Some(path.clone()),
+            mode: ViewMode::Preview,
+            target: path,
+            browser,
+        });
     }
 
     fn preview_variant(&self) -> Variant {
@@ -584,10 +923,15 @@ impl GuiApp {
         if cached || self.inflight.contains(&key) || self.failed.contains_key(&key) {
             return;
         }
-        if self.decoder.request(key.clone()) {
-            self.inflight.insert(key);
-        } else {
-            self.decode_retry_pending = true;
+        match self.decoder.request(key.clone()) {
+            Ok(()) => {
+                self.inflight.insert(key);
+            }
+            Err(flume::TrySendError::Full(_)) => self.decode_retry_pending = true,
+            Err(flume::TrySendError::Disconnected(_)) => {
+                self.failed
+                    .insert(key, "decode workers unavailable".to_owned());
+            }
         }
     }
 
@@ -687,11 +1031,19 @@ impl GuiApp {
     }
 
     fn toggle_browser_view(&mut self) {
-        if self.state.browser.is_some() {
-            self.state.browser = None;
+        let opening = self
+            .pending_read
+            .as_ref()
+            .is_some_and(|read| match &read.effect {
+                ReadEffect::Browse { .. } => true,
+                ReadEffect::Load(load) => load.browser.is_some(),
+                _ => false,
+            });
+        self.cancel_read();
+        self.pending_browser_apply = false;
+        self.browser_apply_deadline = None;
+        if self.state.browser.take().is_some() || opening {
             self.right_pane_error = None;
-            self.pending_browser_apply = false;
-            self.browser_apply_deadline = None;
             self.status = "browser closed".to_owned();
             return;
         }
@@ -699,31 +1051,24 @@ impl GuiApp {
             self.status = "browser unavailable for explicit selected-file launches".to_owned();
             return;
         }
-
-        match BrowserState::for_current_view(&self.state) {
-            Ok(browser) => {
-                self.state.browser = Some(browser);
-                self.status = "browser opened".to_owned();
-                self.apply_browser_selection();
-            }
-            Err(error) => {
-                self.status = format!("browser failed: {error}");
-            }
-        }
+        let target = if self.state.mode == ViewMode::Preview {
+            self.state
+                .current_path()
+                .unwrap_or_else(|| self.state.directory.clone())
+        } else {
+            self.state.directory.clone()
+        };
+        self.queue_browser(listed_directory_for_target(&target), Some(target), false);
     }
 
-    fn refresh_browser_listing_preserving_selection(&mut self) -> Result<()> {
-        let Some(browser) = self.state.browser.as_ref() else {
-            return Ok(());
-        };
-        let entries = read_browser_entries_with_sort(
-            &browser.listed_directory,
-            self.state.include_hidden,
-            &self.state.extensions,
-            browser.sort_mode,
-        )?;
-        self.apply_browser_listing_preserving_selection(entries);
-        Ok(())
+    fn refresh_browser_listing_preserving_selection(&mut self) {
+        if let Some(browser) = &self.state.browser {
+            self.queue_browser(
+                browser.listed_directory.clone(),
+                browser.selected_path(),
+                true,
+            );
+        }
     }
 
     fn apply_browser_listing_preserving_selection(&mut self, entries: Vec<BrowserEntry>) {
@@ -747,29 +1092,7 @@ impl GuiApp {
 
     fn toggle_hidden_files(&mut self) {
         self.state.include_hidden = !self.state.include_hidden;
-        let hidden = self.state.include_hidden;
-        if self.state.browser.is_some() {
-            match self.refresh_browser_listing_preserving_selection() {
-                Ok(()) => {
-                    self.apply_browser_selection_with_force(true);
-                    self.status = if hidden {
-                        "hidden files shown".to_owned()
-                    } else {
-                        "hidden files hidden".to_owned()
-                    };
-                }
-                Err(error) => {
-                    self.status = format!("browser refresh failed: {error}");
-                }
-            }
-        } else {
-            self.pending_rescan = true;
-            self.status = if hidden {
-                "hidden files shown".to_owned()
-            } else {
-                "hidden files hidden".to_owned()
-            };
-        }
+        self.pending_rescan = true;
     }
 
     fn select_browser_index(&mut self, index: usize) {
@@ -785,6 +1108,7 @@ impl GuiApp {
         browser.scroll_to_selection = true;
         browser.remember_current_selection();
         if changed {
+            self.cancel_read();
             self.right_pane_error = None;
             // Defer the right-pane load; update() applies it once the
             // selection has rested for BROWSER_APPLY_DEBOUNCE_SECONDS.
@@ -800,12 +1124,30 @@ impl GuiApp {
         self.select_browser_index(target);
     }
 
+    fn pending_browser_sort_mode(&self) -> Option<SortMode> {
+        match self.pending_read.as_ref().map(|read| &read.effect) {
+            Some(ReadEffect::SortBrowser(mode)) => Some(*mode),
+            _ => None,
+        }
+    }
+
+    fn pending_media_sort_mode(&self) -> SortMode {
+        match self.pending_read.as_ref().map(|read| &read.effect) {
+            Some(ReadEffect::SortMedia(mode)) => *mode,
+            _ => self.state.sort_mode,
+        }
+    }
+
     fn resort_browser(&mut self, sort_mode: SortMode) {
-        let Some(browser) = self.state.browser.as_mut() else {
-            return;
-        };
-        browser.set_sort_mode_preserving_selection(sort_mode);
-        self.status = format!("browser sort: {:?}", sort_mode);
+        if let Some(browser) = &self.state.browser {
+            self.begin_read(
+                ReadJob::SortBrowser {
+                    entries: browser.entries.clone(),
+                    sort_mode,
+                },
+                ReadEffect::SortBrowser(sort_mode),
+            );
+        }
     }
 
     fn enter_selected_browser_directory(&mut self) {
@@ -846,26 +1188,9 @@ impl GuiApp {
     }
 
     fn open_browser_directory(&mut self, directory: PathBuf, preferred_selection: Option<PathBuf>) {
-        let (remembered, sort_mode) = match self.state.browser.as_ref() {
-            Some(browser) => (browser.remembered_selection.clone(), browser.sort_mode),
-            None => (HashMap::new(), SortMode::NameAsc),
-        };
-        match BrowserState::for_directory_with_sort(
-            directory,
-            preferred_selection,
-            remembered,
-            self.state.include_hidden,
-            &self.state.extensions,
-            sort_mode,
-        ) {
-            Ok(browser) => {
-                self.state.browser = Some(browser);
-                self.apply_browser_selection();
-            }
-            Err(error) => {
-                self.status = format!("browser failed: {error}");
-            }
-        }
+        self.pending_browser_apply = false;
+        self.browser_apply_deadline = None;
+        self.queue_browser(directory, preferred_selection, false);
     }
 
     fn apply_browser_selection(&mut self) {
@@ -873,6 +1198,9 @@ impl GuiApp {
     }
 
     fn apply_browser_selection_with_force(&mut self, force_reload: bool) {
+        self.pending_browser_apply = false;
+        self.browser_apply_deadline = None;
+        self.cancel_read();
         let Some(entry) = self.browser_selected_entry_cloned() else {
             if let Some(directory) = self
                 .state
@@ -903,107 +1231,11 @@ impl GuiApp {
     }
 
     fn load_right_pane_directory(&mut self, directory: PathBuf) {
-        self.stop_active_video();
-        let previous = if self.state.directory == directory {
-            self.state.current_path()
-        } else {
-            None
-        };
-        match scan_directory(ScanOptions {
-            root: directory.clone(),
-            recursive: self.state.recursive,
-            include_hidden: self.state.include_hidden,
-            extensions: self.state.extensions.clone(),
-        }) {
-            Ok(mut entries) => {
-                self.invalidate_decodes();
-                sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
-                self.state.delete_queue.clear();
-                self.state.selected_files = None;
-                self.state.directory = directory.clone();
-                self.state.mode = ViewMode::Grid;
-                self.empty_media_target = directory;
-                self.state.set_entries_preserving_current(entries, previous);
-                self.right_pane_error = None;
-                self.status = format!(
-                    "scanned {} media files{}",
-                    self.state.entries.len(),
-                    if self.state.recursive {
-                        " recursively"
-                    } else {
-                        ""
-                    }
-                );
-                self.scroll_to_current = true;
-            }
-            Err(error) => {
-                self.right_pane_error =
-                    Some(format!("Failed to scan {}\n{error:#}", directory.display()));
-                self.status = format!("scan failed: {error}");
-            }
-        }
+        self.queue_directory(directory, None);
     }
 
     fn load_right_pane_file(&mut self, path: PathBuf, force_reload: bool) {
-        self.stop_active_video();
-        let Some(directory) = path.parent().map(Path::to_path_buf) else {
-            self.status = format!("file has no parent: {}", path.display());
-            return;
-        };
-        // Fast path: stepping between files of the already-scanned directory
-        // only repositions the selection — no rescan.
-        if !force_reload
-            && self.state.selected_files.is_none()
-            && self.state.directory == directory
-            && let Some(index) = self
-                .state
-                .entries
-                .iter()
-                .position(|entry| entry.path == path)
-        {
-            self.state.mode = ViewMode::Preview;
-            self.empty_media_target = path.clone();
-            self.state.current_index = index;
-            self.right_pane_error = None;
-            self.status = format!("preview: {}", path.display());
-            self.scroll_to_current = true;
-            return;
-        }
-        match scan_directory(ScanOptions {
-            root: directory.clone(),
-            recursive: self.state.recursive,
-            include_hidden: self.state.include_hidden,
-            extensions: self.state.extensions.clone(),
-        }) {
-            Ok(mut entries) => {
-                sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
-                let Some(index) = entries.iter().position(|entry| entry.path == path) else {
-                    self.right_pane_error = Some(format!(
-                        "Selected file is no longer available after rescanning {}",
-                        directory.display()
-                    ));
-                    self.status = format!("selected file disappeared: {}", path.display());
-                    return;
-                };
-                self.invalidate_decodes();
-                self.state.delete_queue.clear();
-                self.state.selected_files = None;
-                self.state.directory = directory;
-                self.state.mode = ViewMode::Preview;
-                self.empty_media_target = path.clone();
-                self.state
-                    .set_entries_preserving_current(entries, Some(path.clone()));
-                self.state.current_index = index;
-                self.right_pane_error = None;
-                self.status = format!("preview: {}", path.display());
-                self.scroll_to_current = true;
-            }
-            Err(error) => {
-                self.right_pane_error =
-                    Some(format!("Failed to scan {}\n{error:#}", directory.display()));
-                self.status = format!("scan failed: {error}");
-            }
-        }
+        self.queue_file(path, force_reload, None);
     }
 
     fn sync_browser_to_current_path(&mut self) {
@@ -1105,21 +1337,30 @@ impl GuiApp {
     }
 
     fn drain_results(&mut self, ctx: &egui::Context) {
-        for _ in 0..DECODE_UPLOADS_PER_FRAME {
+        let mut uploads = 0;
+        for _ in 0..self.decoder.result_rx.len() {
             let Ok(result) = self.decoder.result_rx.try_recv() else {
                 break;
             };
-            self.inflight.remove(&result.key);
             if result.key.generation != self.decode_generation
                 || !self.decoder.accepts(result.work_epoch)
             {
                 continue;
             }
-            if self.preview_work_is_suspended() {
+            self.inflight.remove(&result.key);
+            if self.preview_work_is_suspended()
+                || !self.state.entries.iter().any(|entry| {
+                    entry.path == result.key.path
+                        && entry.file_len == result.key.file_len
+                        && entry.modified == result.key.modified
+                        && entry.media_kind == result.key.media_kind
+                })
+            {
                 continue;
             }
             match result.image {
                 Ok(color) => {
+                    uploads += 1;
                     let handle = ctx.load_texture(
                         result.key.path.to_string_lossy(),
                         color,
@@ -1138,15 +1379,18 @@ impl GuiApp {
                     self.failed.insert(result.key, error);
                 }
             }
+            if uploads == DECODE_UPLOADS_PER_FRAME {
+                break;
+            }
         }
-        if !self.decoder.result_rx.is_empty() {
+        if !self.preview_work_is_suspended() && !self.decoder.result_rx.is_empty() {
             ctx.request_repaint();
         }
     }
 
     fn drain_video_events(&mut self, ctx: &egui::Context) {
         let texture_uploads_enabled = !self.preview_work_is_suspended();
-        while let Ok(event) = self.video_rx.try_recv() {
+        for event in self.video_events.drain() {
             let Some(active) = self.active_video.as_mut() else {
                 continue;
             };
@@ -1177,7 +1421,6 @@ impl GuiApp {
                         egui::TextureOptions::LINEAR,
                     ));
                 }
-                ctx.request_repaint();
             }
             if event.ended {
                 active.ended = true;
@@ -1185,6 +1428,9 @@ impl GuiApp {
             }
             if let Some(status) = terminal_status {
                 self.status = status;
+            }
+            if !self.window_focused {
+                continue;
             }
             match playback_end_action(event.ended, failed, self.repeat_video, self.auto_next) {
                 PlaybackEndAction::None => {}
@@ -1252,7 +1498,9 @@ impl GuiApp {
     }
 
     fn sync_work_suspension_state(&mut self) {
-        let preview_work_suspended = !self.window_focused || self.paused_video_preview_active();
+        let preview_work_suspended = !self.window_focused
+            || self.paused_video_preview_active()
+            || self.media_actions_blocked();
         let was_preview_work_suspended = self
             .preview_work_suspended
             .swap(preview_work_suspended, Ordering::AcqRel);
@@ -1267,6 +1515,8 @@ impl GuiApp {
         self.live_refresh_repaint_enabled
             .store(!live_refresh_suspended, Ordering::Release);
         if live_refresh_suspended && !was_live_refresh_suspended {
+            self.read_inflight = false;
+            self.read_generation = self.read_generation.wrapping_add(1);
             if self.media_refresh_inflight || self.browser_refresh_inflight {
                 self.deferred_live_refresh_pending = true;
             }
@@ -1337,6 +1587,9 @@ impl GuiApp {
     }
 
     fn start_pending_initial_video_autoplay(&mut self, focused: bool) {
+        if self.media_actions_blocked() {
+            return;
+        }
         if let Some(path) = take_pending_initial_video_autoplay(
             focused,
             &mut self.pending_initial_video_autoplay,
@@ -1347,6 +1600,7 @@ impl GuiApp {
     }
 
     fn stop_active_video(&mut self) {
+        self.video_events.activate(0);
         if let Some(active) = self.active_video.take() {
             active.handle.stop();
         }
@@ -1370,6 +1624,9 @@ impl GuiApp {
         paused: bool,
         selection_autoplay_armed: bool,
     ) {
+        if !self.window_focused || self.media_actions_blocked() {
+            return;
+        }
         self.stop_active_video();
         self.selection_autoplay_armed = selection_autoplay_armed;
         let handle = video::spawn_playback_with_repaint(
@@ -1378,7 +1635,7 @@ impl GuiApp {
             self.video_muted,
             start_at,
             paused,
-            self.video_tx.clone(),
+            self.video_events.clone(),
             Arc::clone(&self.video_repaint),
         );
         self.active_video = Some(ActiveVideo {
@@ -1399,6 +1656,9 @@ impl GuiApp {
     }
 
     fn toggle_current_video_playback(&mut self) {
+        if !self.window_focused || self.media_actions_blocked() {
+            return;
+        }
         let Some(entry) = self.state.current_entry() else {
             return;
         };
@@ -1427,6 +1687,9 @@ impl GuiApp {
     }
 
     fn seek_current_video(&mut self, direction: VideoSeekDirection, now: f64) -> bool {
+        if self.media_actions_blocked() {
+            return false;
+        }
         let Some(entry) = self.state.current_entry() else {
             return false;
         };
@@ -1542,79 +1805,86 @@ impl GuiApp {
         self.scroll_to_current = true;
     }
 
-    fn resort(&mut self, new_mode: crate::state::SortMode) {
+    fn resort(&mut self, new_mode: SortMode) {
         self.stop_active_video();
-        let previous = self.state.current_path();
-        self.state.sort_mode = new_mode;
-        sorter::sort_entries(&mut self.state.entries, new_mode, self.locale.as_deref());
-        let entries = std::mem::take(&mut self.state.entries);
-        self.state.set_entries_preserving_current(entries, previous);
-        self.status = format!("sort: {:?}", new_mode);
-        self.scroll_to_current = true;
+        self.begin_read(
+            ReadJob::SortMedia {
+                entries: self.state.entries.clone(),
+                sort_mode: new_mode,
+                locale: self.locale.clone(),
+            },
+            ReadEffect::SortMedia(new_mode),
+        );
     }
 
     fn rescan(&mut self) {
-        if self.state.browser.is_some() {
-            match self.refresh_browser_listing_preserving_selection() {
-                Ok(()) => self.apply_browser_selection_with_force(true),
-                Err(error) => {
-                    self.status = format!("browser refresh failed: {error}");
+        // Settings changes during navigation apply to the pending destination.
+        if let Some(read) = &self.pending_read {
+            match &read.effect {
+                ReadEffect::Browse {
+                    browser, preferred, ..
+                } => {
+                    self.queue_browser(browser.listed_directory.clone(), preferred.clone(), true);
+                    return;
                 }
+                ReadEffect::Load(load) => {
+                    let load = load.clone();
+                    if let Some(browser) = load.browser {
+                        self.queue_browser(
+                            browser.listed_directory.clone(),
+                            browser.selected_path(),
+                            true,
+                        );
+                    } else {
+                        self.queue_view(load);
+                    }
+                    return;
+                }
+                _ => {}
             }
+        }
+        if self.state.browser.is_some() {
+            self.refresh_browser_listing_preserving_selection();
             return;
         }
+        self.queue_view(ViewLoad {
+            directory: self.state.directory.clone(),
+            selected_files: self.state.selected_files.clone(),
+            preferred: self.state.current_path(),
+            required_file: None,
+            mode: self.state.mode,
+            target: self.empty_media_target.clone(),
+            browser: None,
+        });
+    }
 
-        self.stop_active_video();
-        let previous = self.state.current_path();
-        let queued_before_rescan = self.state.queue_count();
-        let result = scan_state_entries(&self.state);
-        match result {
-            Ok(mut entries) => {
-                sorter::sort_entries(&mut entries, self.state.sort_mode, self.locale.as_deref());
-                self.invalidate_decodes();
-                self.state.delete_queue.clear();
-                self.state.set_entries_preserving_current(entries, previous);
-                if self.state.entries.is_empty() {
-                    self.status = empty_media_status(&self.empty_media_target);
-                } else if self.state.is_selected_file_scope() {
-                    self.status = format!("scanned {} selected files", self.state.entries.len());
-                } else {
-                    self.status = format!(
-                        "scanned {} media files{}",
-                        self.state.entries.len(),
-                        if self.state.recursive {
-                            " recursively"
-                        } else {
-                            ""
-                        }
-                    );
-                }
-                if queued_before_rescan > 0 {
-                    self.status.push_str(&format!(
-                        "; cleared {queued_before_rescan} queued deletion(s)"
-                    ));
-                }
-                self.scroll_to_current = true;
-            }
-            Err(error) => {
-                self.status = format!("rescan failed: {error}");
-            }
-        }
+    fn attach_repaint(&mut self, ctx: &egui::Context) {
+        let video_repaint_ctx = ctx.clone();
+        let video_repaint_enabled = Arc::clone(&self.live_refresh_repaint_enabled);
+        self.video_repaint = Arc::new(move || {
+            request_background_repaint(&video_repaint_enabled, || {
+                video_repaint_ctx.request_repaint()
+            });
+        });
+        *self
+            .decoder
+            .repaint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&self.video_repaint);
+        let signal = Arc::clone(&self.decoder.repaint);
+        self.refresh.get_or_insert_with(|| {
+            RefreshService::new(Arc::clone(&self.live_refresh_suspended), move || {
+                let callback = signal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                callback();
+            })
+        });
     }
 
     fn attach_watcher(&mut self, ctx: &egui::Context) {
-        let video_repaint_ctx = ctx.clone();
-        self.video_repaint = Arc::new(move || video_repaint_ctx.request_repaint());
-        let refresh_ctx = ctx.clone();
-        let refresh_repaint_enabled = Arc::clone(&self.live_refresh_repaint_enabled);
-        self.refresh = Some(RefreshService::new(
-            Arc::clone(&self.live_refresh_suspended),
-            move || {
-                request_background_repaint(&refresh_repaint_enabled, || {
-                    refresh_ctx.request_repaint();
-                });
-            },
-        ));
+        self.attach_repaint(ctx);
         let repaint_ctx = ctx.clone();
         let watcher_repaint_enabled = Arc::clone(&self.live_refresh_repaint_enabled);
         match MediaWatcher::new(move || {
@@ -1706,6 +1976,14 @@ impl GuiApp {
             }
         }
 
+        // A pending view may target a different directory from the one still displayed.
+        // Preserve the notification and reconcile the committed view after the read.
+        if self.pending_read.is_some() || self.media_actions_blocked() {
+            self.deferred_live_refresh_pending |= watcher_failed || !paths.is_empty();
+            self.sync_watcher_paths();
+            return;
+        }
+
         let refresh_library = watcher_failed
             || paths
                 .iter()
@@ -1760,7 +2038,10 @@ impl GuiApp {
     }
 
     fn request_live_media_refresh(&mut self) {
-        if self.live_refresh_is_suspended() {
+        if self.live_refresh_is_suspended()
+            || self.pending_read.is_some()
+            || self.media_actions_blocked()
+        {
             self.deferred_live_refresh_pending = true;
             return;
         }
@@ -1779,7 +2060,10 @@ impl GuiApp {
     }
 
     fn request_live_browser_refresh(&mut self) {
-        if self.live_refresh_is_suspended() {
+        if self.live_refresh_is_suspended()
+            || self.pending_read.is_some()
+            || self.media_actions_blocked()
+        {
             self.deferred_live_refresh_pending = true;
             return;
         }
@@ -1794,7 +2078,11 @@ impl GuiApp {
     }
 
     fn flush_deferred_live_refresh(&mut self) {
-        if !self.deferred_live_refresh_pending || self.live_refresh_is_suspended() {
+        if !self.deferred_live_refresh_pending
+            || self.live_refresh_is_suspended()
+            || self.pending_read.is_some()
+            || self.media_actions_blocked()
+        {
             return;
         }
         self.deferred_live_refresh_pending = false;
@@ -1816,6 +2104,9 @@ impl GuiApp {
 
     fn handle_refresh_result(&mut self, refresh: RefreshResult) {
         match refresh {
+            RefreshResult::Read { generation, result } => {
+                self.handle_read_result(generation, result)
+            }
             RefreshResult::Media {
                 generation,
                 scope,
@@ -1943,6 +2234,10 @@ impl GuiApp {
     }
 
     fn confirm_delete(&mut self) {
+        if self.media_actions_blocked() {
+            return;
+        }
+        self.cancel_read();
         self.stop_active_video();
         self.state.confirm_delete = false;
         let report = delete::delete_queued(&mut self.state, self.dry_run);
@@ -1964,8 +2259,7 @@ impl GuiApp {
             self.state.mode = ViewMode::Preview;
         }
         if self.state.browser.is_some() {
-            let _ = self.refresh_browser_listing_preserving_selection();
-            self.apply_browser_selection();
+            self.refresh_browser_listing_preserving_selection();
         }
         self.scroll_to_current = true;
     }
@@ -1973,7 +2267,7 @@ impl GuiApp {
     fn handle_input(&mut self, ctx: &egui::Context) {
         use egui::Key;
         // Confirmation modal swallows everything except y/n/esc.
-        if self.state.confirm_delete {
+        if self.state.confirm_delete && !self.media_actions_blocked() {
             ctx.input(|i| {
                 if i.key_pressed(Key::Y) {
                     if y_key_action(true) == YKeyAction::ConfirmDelete {
@@ -2031,8 +2325,10 @@ impl GuiApp {
             // until the selection changes.
             let browser_focused = self.browser_is_focused();
             let unsupported_selected = self.browser_selected_is_unsupported();
-            let right_pane_active =
-                !browser_focused && !unsupported_selected && self.right_pane_error.is_none();
+            let right_pane_active = !browser_focused
+                && !unsupported_selected
+                && self.right_pane_error.is_none()
+                && !self.media_actions_blocked();
 
             // Keys that follow the active video rather than a pane.
             if i.key_pressed(Key::Space) && self.current_is_video() {
@@ -2132,12 +2428,18 @@ impl GuiApp {
                 if i.key_pressed(Key::T)
                     && let Some(browser) = self.state.browser.as_ref()
                 {
-                    self.resort_browser(sorter::next_time_sort(browser.sort_mode));
+                    self.resort_browser(sorter::next_time_sort(
+                        self.pending_browser_sort_mode()
+                            .unwrap_or(browser.sort_mode),
+                    ));
                 }
                 if i.key_pressed(Key::N)
                     && let Some(browser) = self.state.browser.as_ref()
                 {
-                    self.resort_browser(sorter::next_name_sort(browser.sort_mode));
+                    self.resort_browser(sorter::next_name_sort(
+                        self.pending_browser_sort_mode()
+                            .unwrap_or(browser.sort_mode),
+                    ));
                 }
             } else if right_pane_active {
                 if in_grid {
@@ -2223,10 +2525,12 @@ impl GuiApp {
                     self.toggle_media_type_badges();
                 }
                 if i.key_pressed(Key::T) {
-                    self.pending_sort = Some(sorter::next_time_sort(self.state.sort_mode));
+                    self.pending_sort =
+                        Some(sorter::next_time_sort(self.pending_media_sort_mode()));
                 }
                 if i.key_pressed(Key::N) {
-                    self.pending_sort = Some(sorter::next_name_sort(self.state.sort_mode));
+                    self.pending_sort =
+                        Some(sorter::next_name_sort(self.pending_media_sort_mode()));
                 }
                 if i.key_pressed(Key::I) {
                     self.state.show_info_overlay = !self.state.show_info_overlay;
@@ -2241,7 +2545,8 @@ impl GuiApp {
         if std::mem::take(&mut self.pending_enrich)
             && let Some(entry) = self.state.current_entry_mut()
         {
-            metadata::enrich_entry(entry);
+            let entry = entry.clone();
+            self.begin_read(ReadJob::Metadata(entry), ReadEffect::Metadata);
         }
         if std::mem::take(&mut self.pending_rescan) {
             self.rescan();
@@ -2439,6 +2744,9 @@ impl GuiApp {
         video_rect: egui::Rect,
         progress: Option<VideoProgress>,
     ) {
+        if !self.window_focused {
+            return;
+        }
         let now = ui.ctx().input(|input| input.time);
         let target_visible = progress.is_some()
             && video_progress_overlay_target_visible(
@@ -2743,6 +3051,7 @@ impl GuiApp {
         let focused = ctx.input(|input| input.focused);
         self.handle_focus_change(focused);
         self.start_pending_initial_video_autoplay(focused);
+        self.resume_read();
         self.flush_deferred_live_refresh();
         self.sync_watcher_paths();
         self.drain_watcher();
@@ -2758,7 +3067,9 @@ impl GuiApp {
         if std::mem::take(&mut self.pending_browser_apply) {
             self.browser_apply_deadline = Some(now + BROWSER_APPLY_DEBOUNCE_SECONDS);
         }
-        if let Some(deadline) = self.browser_apply_deadline {
+        if let Some(deadline) = self.browser_apply_deadline
+            && focused
+        {
             if now >= deadline {
                 self.browser_apply_deadline = None;
                 self.apply_browser_selection();
@@ -2810,7 +3121,11 @@ impl GuiApp {
             if self.video_muted { "muted" } else { "on" },
             if self.repeat_video { "on" } else { "off" },
             if self.auto_next { "on" } else { "off" },
-            self.status,
+            if self.pending_read.is_some() {
+                "loading…"
+            } else {
+                &self.status
+            },
         );
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -2831,14 +3146,16 @@ impl GuiApp {
         }
         let central_rect = egui::CentralPanel::default()
             .show(ctx, |ui| {
-                if self.state.browser.is_some() {
-                    self.draw_browser_right_pane(ui);
-                } else {
-                    match self.state.mode {
-                        ViewMode::Preview => self.draw_preview(ui),
-                        ViewMode::Grid | ViewMode::DeleteQueueGrid => self.draw_grid(ui),
+                ui.add_enabled_ui(!self.media_actions_blocked(), |ui| {
+                    if self.state.browser.is_some() {
+                        self.draw_browser_right_pane(ui);
+                    } else {
+                        match self.state.mode {
+                            ViewMode::Preview => self.draw_preview(ui),
+                            ViewMode::Grid | ViewMode::DeleteQueueGrid => self.draw_grid(ui),
+                        }
                     }
-                }
+                });
             })
             .response
             .rect;
@@ -2867,19 +3184,12 @@ impl GuiApp {
         let now = ctx.input(|input| input.time);
         let progress_overlay_visible =
             video_progress_overlay_target_visible(now, self.video_progress_overlay_visible_until);
-        if progress_overlay_visible {
+        if progress_overlay_visible && focused {
             let remaining = (self.video_progress_overlay_visible_until - now).max(0.0);
             ctx.request_repaint_after(Duration::from_secs_f64(remaining));
         }
-        if !self.inflight.is_empty()
-            || self.decode_retry_pending
-            || progress_overlay_visible
-            || self
-                .active_video
-                .as_ref()
-                .is_some_and(|active| !active.handle.is_paused() && !active.ended)
-        {
-            ctx.request_repaint();
+        if self.decode_retry_pending && !self.preview_work_is_suspended() {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
 }
@@ -3391,12 +3701,12 @@ struct FocusPlaybackEffect {
 }
 
 fn focus_playback_effect(
-    was_focused: bool,
+    _was_focused: bool,
     is_focused: bool,
     active_video_playing: bool,
     selection_autoplay_armed: bool,
 ) -> FocusPlaybackEffect {
-    let pause_video = was_focused && !is_focused && active_video_playing;
+    let pause_video = !is_focused && active_video_playing;
     FocusPlaybackEffect {
         pause_video,
         selection_autoplay_armed: if pause_video {
@@ -3821,6 +4131,618 @@ mod tests {
         assert_eq!(initial_view_mode_for_launch(&launch), ViewMode::Grid);
     }
 
+    fn controlled_decode_queue(
+        app: &mut GuiApp,
+    ) -> (Receiver<DecodeRequest>, Sender<DecodeResult>) {
+        let (job_tx, job_rx) = flume::bounded(1);
+        let (result_tx, result_rx) = flume::bounded(8);
+        app.decoder.job_tx = job_tx;
+        app.decoder.result_rx = result_rx;
+        (job_rx, result_tx)
+    }
+
+    fn repaint_delay(output: &egui::FullOutput) -> Duration {
+        output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+    }
+
+    #[test]
+    fn gui_repaints_only_for_full_decode_queue_or_available_results() {
+        let temp = tempdir().unwrap();
+        let entries = ["a.jpg", "b.jpg"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                media_entry(
+                    temp.path().join(name),
+                    MediaKind::Image(ImageKind::Jpeg),
+                    index,
+                )
+            })
+            .collect();
+        let mut app = GuiApp::new(
+            app_state(entries, 0),
+            None,
+            true,
+            false,
+            temp.path().to_path_buf(),
+        );
+        app.state.zoom_mode = ZoomMode::Fit;
+        let (jobs, results) = controlled_decode_queue(&mut app);
+        let ctx = egui::Context::default();
+        for time in 0..4 {
+            frame_output(&mut app, &ctx, true, f64::from(time));
+        }
+        let output = frame_output(&mut app, &ctx, true, 4.0);
+        assert!(app.decode_retry_pending);
+        assert_eq!(repaint_delay(&output), Duration::from_millis(50));
+        let first = jobs.try_recv().unwrap();
+        frame_output(&mut app, &ctx, true, 5.0);
+        let second = jobs.try_recv().unwrap();
+        assert!(!app.decode_retry_pending);
+        let output = frame_output(&mut app, &ctx, true, 6.0);
+        assert!(
+            repaint_delay(&output) > Duration::from_secs(60),
+            "inflight jobs must not poll"
+        );
+        let mut stale_key = first.key.clone();
+        stale_key.generation = stale_key.generation.wrapping_add(1);
+        for key in [stale_key, first.key, second.key] {
+            results
+                .send(DecodeResult {
+                    key,
+                    work_epoch: app.decoder.work_epoch.load(Ordering::Acquire),
+                    image: Ok(egui::ColorImage::new([1, 1], egui::Color32::WHITE)),
+                    _memory_permit: None,
+                })
+                .unwrap();
+        }
+        let output = frame_output(&mut app, &ctx, true, 7.0);
+        assert_eq!(app.previews.entries.len(), 1);
+        assert_eq!(output.textures_delta.set.len(), 1);
+        assert_eq!(repaint_delay(&output), Duration::ZERO);
+        let output = frame_output(&mut app, &ctx, true, 8.0);
+        assert_eq!(app.previews.entries.len(), 2);
+        assert_eq!(output.textures_delta.set.len(), 1);
+        assert!(app.inflight.is_empty());
+    }
+
+    #[test]
+    fn full_decode_queue_stops_retrying_while_unfocused_and_restarts_on_return() {
+        let temp = tempdir().unwrap();
+        let entries = ["a.jpg", "b.jpg"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                media_entry(
+                    temp.path().join(name),
+                    MediaKind::Image(ImageKind::Jpeg),
+                    index,
+                )
+            })
+            .collect();
+        let mut app = GuiApp::new(
+            app_state(entries, 0),
+            None,
+            true,
+            false,
+            temp.path().to_path_buf(),
+        );
+        app.state.zoom_mode = ZoomMode::Fit;
+        let (_jobs, _results) = controlled_decode_queue(&mut app);
+        let ctx = egui::Context::default();
+        frame_output(&mut app, &ctx, true, 0.0);
+        assert!(app.decode_retry_pending);
+        for time in 1..4 {
+            frame_output(&mut app, &ctx, false, f64::from(time));
+        }
+        assert!(!app.decode_retry_pending);
+        let output = frame_output(&mut app, &ctx, false, 4.0);
+        assert!(repaint_delay(&output) > Duration::from_secs(60));
+        frame_output(&mut app, &ctx, true, 5.0);
+        assert!(app.decode_retry_pending);
+    }
+
+    #[test]
+    fn decode_workers_wake_idle_gui_for_success_and_error_without_mouse_input() {
+        for valid in [true, false] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("synthetic.jpg");
+            if valid {
+                image::RgbImage::new(8, 8).save(&path).unwrap();
+            } else {
+                touch(&path);
+            }
+            let mut app = app_for_browser_tests(temp.path());
+            app.rescan();
+            finish_reads(&mut app);
+            app.state.mode = ViewMode::Preview;
+            let deferred_entries = if valid {
+                Vec::new()
+            } else {
+                std::mem::take(&mut app.state.entries)
+            };
+            let ctx = egui::Context::default();
+            app.attach_repaint(&ctx);
+            // Hold the real worker's memory permit, so a valid decode cannot complete yet.
+            let permit = valid.then(|| {
+                app.decoder
+                    .memory_budget
+                    .acquire(DECODE_MEMORY_BUDGET_BYTES)
+                    .unwrap()
+            });
+            for time in 0..4 {
+                frame_output(&mut app, &ctx, true, f64::from(time));
+            }
+            let (wake_tx, wake_rx) = flume::unbounded();
+            ctx.set_request_repaint_callback(move |_| {
+                let _ = wake_tx.send(());
+            });
+            if valid {
+                let output = frame_output(&mut app, &ctx, true, 4.0);
+                assert!(repaint_delay(&output) > Duration::from_secs(60));
+                assert!(!app.inflight.is_empty());
+                drop(permit);
+            } else {
+                // No error job is submitted before the callback is installed.
+                app.state.entries = deferred_entries;
+                app.ensure_requested();
+            }
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            frame_output(&mut app, &ctx, true, 5.0);
+            if valid {
+                assert_eq!(app.previews.entries.len(), 1);
+            } else {
+                assert_eq!(app.failed.len(), 1);
+            }
+            frame_output(&mut app, &ctx, false, 6.0);
+            while wake_rx.try_recv().is_ok() {}
+            (app.video_repaint)();
+            assert!(
+                wake_rx.try_recv().is_err(),
+                "background notification must respect focus gate"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_uploads_latest_video_frame_once_and_then_handles_terminal_status() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("synthetic.mp4");
+        let entry = media_entry(path.clone(), MediaKind::Video(VideoKind::Mp4), 0);
+        let mut app = GuiApp::new(
+            app_state(vec![entry], 0),
+            None,
+            true,
+            false,
+            temp.path().to_path_buf(),
+        );
+        let (_jobs, _results) = controlled_decode_queue(&mut app);
+        let handle = video::PlaybackHandle::test_handle(path.clone(), false);
+        let id = handle.id();
+        app.video_events.activate(id);
+        app.active_video = Some(ActiveVideo {
+            handle,
+            texture: None,
+            position: Duration::ZERO,
+            duration: None,
+            ended: false,
+        });
+        let ctx = egui::Context::default();
+        for time in 0..4 {
+            frame_output(&mut app, &ctx, true, f64::from(time));
+        }
+        assert!(repaint_delay(&frame_output(&mut app, &ctx, true, 4.0)) > Duration::from_secs(60));
+        for width in 1..=8 {
+            app.video_events.publish(video::PlaybackEvent {
+                playback_id: id,
+                path: path.clone(),
+                frame: Some(egui::ColorImage::new([width, 1], egui::Color32::WHITE)),
+                position: Some(Duration::from_millis(width as u64)),
+                duration: None,
+                ended: false,
+                error: None,
+            });
+        }
+        app.video_events.publish(video::PlaybackEvent {
+            playback_id: id,
+            path,
+            frame: None,
+            position: None,
+            duration: None,
+            ended: true,
+            error: Some("synthetic error".to_owned()),
+        });
+        let output = frame_output(&mut app, &ctx, true, 5.0);
+        assert_eq!(output.textures_delta.set.len(), 1);
+        let active = app.active_video.as_ref().unwrap();
+        assert_eq!(active.texture.as_ref().unwrap().size(), [8, 1]);
+        assert_eq!(active.position, Duration::from_millis(8));
+        assert!(active.ended);
+        assert!(app.status.contains("synthetic error"));
+    }
+
+    fn frame_output(
+        app: &mut GuiApp,
+        ctx: &egui::Context,
+        focused: bool,
+        time: f64,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                focused,
+                predicted_dt: 0.0,
+                time: Some(time),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.update_impl(ctx),
+        )
+    }
+
+    fn blocked_directory_read(app: &mut GuiApp, directory: &Path) -> (Receiver<()>, Sender<()>) {
+        let (started_tx, started_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let job = ReadJob::Media {
+            scope: MediaRefreshScope::Directory(ScanOptions {
+                root: directory.to_path_buf(),
+                recursive: false,
+                include_hidden: false,
+                extensions: vec!["jpg".to_owned()],
+            }),
+            sort_mode: SortMode::NameAsc,
+            locale: None,
+        };
+        app.begin_read(
+            ReadJob::Blocked {
+                started: started_tx,
+                release: release_rx,
+                job: Box::new(job),
+            },
+            ReadEffect::Load(ViewLoad {
+                directory: directory.to_path_buf(),
+                selected_files: None,
+                preferred: None,
+                required_file: None,
+                mode: ViewMode::Grid,
+                target: directory.to_path_buf(),
+                browser: None,
+            }),
+        );
+        (started_rx, release_tx)
+    }
+
+    #[test]
+    fn blocked_read_keeps_ui_responsive_and_old_media_actions_disabled() {
+        let temp = tempdir().unwrap();
+        let old = temp.path().join("old.jpg");
+        touch(&old);
+        let folder = temp.path().join("new");
+        fs::create_dir(&folder).unwrap();
+        touch(&folder.join("new.jpg"));
+        let mut app = app_for_browser_tests(temp.path());
+        app.rescan();
+        finish_reads(&mut app);
+        app.state.delete_queue.insert(old.clone());
+        let ctx = egui::Context::default();
+        app.attach_repaint(&ctx);
+        let (started, release) = blocked_directory_read(&mut app, &folder);
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_press(egui::Key::D),
+                key_press(egui::Key::Space),
+                key_press(egui::Key::O),
+            ],
+        );
+        assert_eq!(app.state.directory, temp.path());
+        assert!(app.media_actions_blocked());
+        assert_eq!(app.state.current_path(), Some(old.clone()));
+        app.confirm_delete();
+        assert_eq!(app.state.queue_count(), 1);
+        run_frame(&mut app, &ctx, vec![key_press(egui::Key::Questionmark)]);
+        assert!(
+            app.state.show_help_overlay,
+            "UI handles input while worker is blocked"
+        );
+        app.request_live_media_refresh();
+        assert!(app.deferred_live_refresh_pending);
+        assert!(!app.media_refresh_inflight);
+        release.send(()).unwrap();
+        finish_reads(&mut app);
+        assert_eq!(app.state.directory, folder);
+        assert_eq!(app.state.queue_count(), 0);
+        assert!(!app.media_actions_blocked());
+        app.flush_deferred_live_refresh();
+        assert!(app.media_refresh_inflight);
+    }
+
+    #[test]
+    fn latest_directory_intent_wins_and_focus_suspends_then_reissues_it() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        touch(&second.join("new.jpg"));
+        let mut app = app_for_browser_tests(temp.path());
+        let (started, release) = blocked_directory_read(&mut app, &first);
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let stale = app.read_generation;
+        app.queue_directory(second.clone(), None);
+        let before_focus_loss = app.read_generation;
+        app.handle_focus_change(false);
+        app.handle_read_result(stale, Ok(ReadOutput::Media(Vec::new())));
+        app.handle_read_result(before_focus_loss, Ok(ReadOutput::Media(Vec::new())));
+        assert_eq!(app.state.directory, temp.path());
+        assert!(!app.read_inflight);
+        assert!(app.pending_read.is_some());
+        release.send(()).unwrap();
+        app.handle_focus_change(true);
+        finish_reads(&mut app);
+        assert_eq!(app.state.directory, second);
+        assert_eq!(app.state.entries.len(), 1);
+        app.handle_read_result(stale, Err("old failure".to_owned()));
+        assert!(app.right_pane_error.is_none());
+    }
+
+    #[test]
+    fn filter_change_during_navigation_keeps_pending_destination() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        touch(&target.join(".hidden.jpg"));
+        let mut app = app_for_browser_tests(temp.path());
+        let (started, release) = blocked_directory_read(&mut app, &target);
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.toggle_hidden_files();
+        app.rescan();
+        app.pending_rescan = false;
+        release.send(()).unwrap();
+        finish_reads(&mut app);
+        assert_eq!(app.state.directory, target);
+        assert_eq!(app.state.entries.len(), 1);
+        assert_eq!(app.state.entries[0].display_name, ".hidden.jpg");
+    }
+
+    #[test]
+    fn delayed_browser_selection_waits_for_focus_and_cached_file_selection_stays_fast() {
+        let temp = tempdir().unwrap();
+        touch(&temp.path().join("a.jpg"));
+        touch(&temp.path().join("b.jpg"));
+        let mut app = app_for_browser_tests(temp.path());
+        app.rescan();
+        finish_reads(&mut app);
+        app.state.browser = Some(
+            BrowserState::for_directory(
+                temp.path().to_path_buf(),
+                Some(temp.path().join("a.jpg")),
+                HashMap::new(),
+                false,
+                &["jpg".to_owned()],
+            )
+            .unwrap(),
+        );
+        app.state.mode = ViewMode::Preview;
+        app.state.current_index = app
+            .state
+            .entries
+            .iter()
+            .position(|e| e.display_name == "a.jpg")
+            .unwrap();
+        app.select_browser_index(1);
+        let ctx = egui::Context::default();
+        frame_output(&mut app, &ctx, false, 1.0);
+        frame_output(&mut app, &ctx, false, 2.0);
+        assert_eq!(app.state.current_path(), Some(temp.path().join("a.jpg")));
+        assert!(app.pending_read.is_none());
+        assert!(app.browser_apply_deadline.is_some());
+        frame_output(&mut app, &ctx, true, 3.0);
+        assert_eq!(app.state.current_path(), Some(temp.path().join("b.jpg")));
+        assert!(
+            app.pending_read.is_none(),
+            "already loaded files need no read job"
+        );
+        assert!(!app.media_actions_blocked());
+    }
+
+    #[test]
+    fn decode_from_before_focus_loss_cannot_remove_a_new_inflight_request() {
+        let temp = tempdir().unwrap();
+        let entry = media_entry(
+            temp.path().join("a.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            0,
+        );
+        let mut app = GuiApp::new(
+            app_state(vec![entry], 0),
+            None,
+            true,
+            false,
+            temp.path().to_path_buf(),
+        );
+        let (jobs, results) = controlled_decode_queue(&mut app);
+        let ctx = egui::Context::default();
+        frame_output(&mut app, &ctx, true, 0.0);
+        let old = jobs.try_recv().unwrap();
+        frame_output(&mut app, &ctx, false, 1.0);
+        frame_output(&mut app, &ctx, true, 2.0);
+        let current = jobs.try_recv().unwrap();
+        results
+            .send(DecodeResult {
+                key: old.key,
+                work_epoch: old.work_epoch,
+                image: Ok(egui::ColorImage::new([1, 1], egui::Color32::WHITE)),
+                _memory_permit: None,
+            })
+            .unwrap();
+        frame_output(&mut app, &ctx, true, 3.0);
+        assert!(app.inflight.contains(&current.key));
+        assert!(app.previews.entries.is_empty());
+        // A result whose file identity is no longer in the view is stale as well.
+        app.state.entries[0].file_len += 1;
+        results
+            .send(DecodeResult {
+                key: current.key,
+                work_epoch: current.work_epoch,
+                image: Ok(egui::ColorImage::new([1, 1], egui::Color32::WHITE)),
+                _memory_permit: None,
+            })
+            .unwrap();
+        frame_output(&mut app, &ctx, true, 4.0);
+        assert!(app.previews.entries.is_empty());
+    }
+
+    #[test]
+    fn failed_manual_read_preserves_queue_cache_and_old_view() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("image.jpg");
+        touch(&path);
+        let mut app = app_for_browser_tests(temp.path());
+        app.rescan();
+        finish_reads(&mut app);
+        app.state.delete_queue.insert(path.clone());
+        let generation = app.decode_generation;
+        app.queue_directory(temp.path().join("missing"), None);
+        finish_reads(&mut app);
+        assert_eq!(app.state.directory, temp.path());
+        assert_eq!(app.state.current_path(), Some(path));
+        assert_eq!(app.state.queue_count(), 1);
+        assert_eq!(app.decode_generation, generation);
+        assert!(app.right_pane_error.is_some());
+        assert!(!app.media_actions_blocked());
+    }
+
+    #[test]
+    fn async_sort_preserves_latest_selection_and_queue_even_when_membership_is_unchanged() {
+        let temp = tempdir().unwrap();
+        touch(&temp.path().join("a.jpg"));
+        touch(&temp.path().join("b.jpg"));
+        let mut app = app_for_browser_tests(temp.path());
+        app.rescan();
+        finish_reads(&mut app);
+        app.state.delete_queue.insert(temp.path().join("a.jpg"));
+        app.resort(SortMode::NameDesc);
+        let current = app.state.entries[1].path.clone();
+        app.set_current_index(1);
+        finish_reads(&mut app);
+        assert_eq!(app.state.entries[0].display_name, "b.jpg");
+        assert_eq!(app.state.current_path(), Some(current));
+        assert_eq!(app.state.queue_count(), 1);
+    }
+
+    #[test]
+    fn metadata_result_cannot_restore_an_old_file_identity_or_selection() {
+        let temp = tempdir().unwrap();
+        let mut app = app_for_browser_tests(temp.path());
+        let original = media_entry(
+            temp.path().join("a.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            0,
+        );
+        app.state.entries = vec![original.clone()];
+        app.pending_read = Some(PendingRead {
+            job: ReadJob::Metadata(original.clone()),
+            effect: ReadEffect::Metadata,
+        });
+        app.state.entries[0].file_len += 1;
+        let mut enriched = original.clone();
+        enriched.dimensions = Some((100, 100));
+        app.handle_read_result(
+            app.read_generation,
+            Ok(ReadOutput::Metadata(enriched.clone())),
+        );
+        assert_eq!(app.state.entries[0].dimensions, None);
+        app.pending_read = Some(PendingRead {
+            job: ReadJob::Metadata(original),
+            effect: ReadEffect::Metadata,
+        });
+        app.state.entries[0].path = temp.path().join("b.jpg");
+        app.handle_read_result(app.read_generation, Ok(ReadOutput::Metadata(enriched)));
+        assert_eq!(app.state.entries[0].path, temp.path().join("b.jpg"));
+        assert_eq!(app.state.entries[0].dimensions, None);
+    }
+
+    #[test]
+    fn terminal_events_around_focus_loss_do_not_repeat_advance_or_resume() {
+        for repeat in [true, false] {
+            for publish_before_loss in [true, false] {
+                let temp = tempdir().unwrap();
+                let path = temp.path().join("synthetic.mp4");
+                let mut state = app_state(
+                    vec![
+                        media_entry(path.clone(), MediaKind::Video(VideoKind::Mp4), 0),
+                        media_entry(
+                            temp.path().join("next.mp4"),
+                            MediaKind::Video(VideoKind::Mp4),
+                            1,
+                        ),
+                    ],
+                    0,
+                );
+                state.mode = ViewMode::Preview;
+                let mut app = GuiApp::new(state, None, true, !repeat, temp.path().to_path_buf());
+                app.repeat_video = repeat;
+                let handle = video::PlaybackHandle::test_handle(path.clone(), false);
+                let id = handle.id();
+                app.video_events.activate(id);
+                app.active_video = Some(ActiveVideo {
+                    handle,
+                    texture: None,
+                    position: Duration::ZERO,
+                    duration: None,
+                    ended: false,
+                });
+                let event = video::PlaybackEvent {
+                    playback_id: id,
+                    path: path.clone(),
+                    frame: None,
+                    position: Some(Duration::from_secs(1)),
+                    duration: None,
+                    ended: true,
+                    error: None,
+                };
+                if !publish_before_loss {
+                    app.handle_focus_change(false);
+                }
+                app.video_events.publish(event);
+                let ctx = egui::Context::default();
+                frame_output(&mut app, &ctx, false, 0.0);
+                assert!(app.active_video.as_ref().unwrap().ended);
+                assert!(app.active_video.as_ref().unwrap().handle.is_paused());
+                frame_output(&mut app, &ctx, true, 1.0);
+                assert_eq!(app.active_video.as_ref().unwrap().handle.id(), id);
+                assert!(!app.active_video_is_playing());
+                assert_eq!(app.state.current_path(), Some(path));
+                assert_eq!(app.repeat_video, repeat);
+                // Even an already-unfocused UI update enforces the invariant.
+                app.window_focused = false;
+                app.active_video.as_mut().unwrap().ended = false;
+                app.active_video.as_ref().unwrap().handle.set_paused(false);
+                frame_output(&mut app, &ctx, false, 2.0);
+                assert!(app.active_video.as_ref().unwrap().handle.is_paused());
+            }
+        }
+    }
+
+    fn finish_reads(app: &mut GuiApp) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.pending_read.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "read did not finish: {}",
+                app.status
+            );
+            app.resume_read();
+            app.drain_refresh_results();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn run_frame(app: &mut GuiApp, ctx: &egui::Context, events: Vec<egui::Event>) {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -3866,6 +4788,7 @@ mod tests {
         let ctx = egui::Context::default();
         run_frame(&mut app, &ctx, Vec::new());
         run_frame(&mut app, &ctx, vec![key_press(egui::Key::E)]);
+        finish_reads(&mut app);
 
         assert!(
             app.state.browser.is_some(),
@@ -3894,6 +4817,7 @@ mod tests {
         );
 
         app.apply_browser_selection();
+        finish_reads(&mut app);
 
         assert_eq!(app.state.directory, folder.canonicalize().unwrap());
         assert_eq!(app.state.mode, ViewMode::Grid);
@@ -3908,6 +4832,7 @@ mod tests {
         fs::create_dir(&folder).unwrap();
         let mut app = app_for_browser_tests(temp.path());
         app.open_browser_directory(folder.canonicalize().unwrap(), None);
+        finish_reads(&mut app);
 
         assert_eq!(app.state.directory, folder.canonicalize().unwrap());
         assert_eq!(app.state.mode, ViewMode::Grid);
@@ -3934,6 +4859,7 @@ mod tests {
         fs::remove_dir(&folder).unwrap();
 
         app.apply_browser_selection();
+        finish_reads(&mut app);
 
         assert_eq!(app.state.directory, original_directory);
         assert!(
@@ -3960,6 +4886,7 @@ mod tests {
         let selected_image = selected_image.canonicalize().unwrap();
         let mut app = app_for_browser_tests(&old_folder);
         app.load_right_pane_directory(old_folder.clone());
+        finish_reads(&mut app);
         app.state.browser = Some(
             BrowserState::for_directory(
                 new_folder,
@@ -3973,6 +4900,7 @@ mod tests {
         fs::remove_file(&selected_image).unwrap();
 
         app.apply_browser_selection_with_force(true);
+        finish_reads(&mut app);
 
         assert_eq!(app.state.directory, old_folder);
         assert_eq!(
@@ -4004,6 +4932,7 @@ mod tests {
         );
 
         app.apply_browser_selection();
+        finish_reads(&mut app);
 
         assert_eq!(app.state.mode, ViewMode::Preview);
         assert_eq!(
@@ -4081,6 +5010,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         run_frame(&mut app, &ctx, vec![key_press(egui::Key::N)]);
+        finish_reads(&mut app);
 
         let browser = app.state.browser.as_ref().unwrap();
         assert_eq!(browser.sort_mode, SortMode::NameDesc);
@@ -4115,6 +5045,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         run_frame(&mut app, &ctx, vec![key_press(egui::Key::N)]);
+        finish_reads(&mut app);
 
         let browser = app.state.browser.as_ref().unwrap();
         assert_eq!(browser.sort_mode, SortMode::NameAsc);
@@ -4266,6 +5197,7 @@ mod tests {
         fs::write(&image, b"replacement content").unwrap();
 
         app.rescan();
+        finish_reads(&mut app);
 
         assert_eq!(app.decode_generation, generation.wrapping_add(1));
         assert!(app.state.delete_queue.is_empty());
@@ -5019,6 +5951,8 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 
     let options = eframe::NativeOptions {
+        // Avoid the NVIDIA/Wayland swap_buffers wait observed during workspace switches.
+        vsync: false,
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_IDENTITY)
             .with_inner_size([1280.0, 800.0]),
@@ -5158,6 +6092,7 @@ fn scan_launch_entries(
     Ok(entries)
 }
 
+#[cfg(test)]
 fn scan_state_entries(state: &AppState) -> Result<Vec<MediaEntry>> {
     if let Some(selected_files) = &state.selected_files {
         let files = selected_files.iter().cloned().collect::<Vec<_>>();

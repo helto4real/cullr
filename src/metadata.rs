@@ -17,6 +17,13 @@ use crate::state::MediaEntry;
 const MAX_SORT_EXIF_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn enrich_entry(entry: &mut MediaEntry) {
+    enrich_entry_cancellable(entry, &|| false);
+}
+
+pub(crate) fn enrich_entry_cancellable(entry: &mut MediaEntry, cancelled: &impl Fn() -> bool) {
+    if cancelled() {
+        return;
+    }
     if !entry.media_kind.is_image() {
         entry.dimensions_attempted = true;
         entry.exif_attempted = true;
@@ -30,6 +37,9 @@ pub fn enrich_entry(entry: &mut MediaEntry) {
         }
     }
 
+    if cancelled() {
+        return;
+    }
     if (entry.exif_date.is_none() || entry.exif_orientation.is_none()) && !entry.exif_attempted {
         entry.exif_attempted = true;
         if let Ok(exif) = read_exif_metadata(&entry.path) {
