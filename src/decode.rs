@@ -4,44 +4,99 @@
 //! work for large photos; everything else falls back to the `image` crate. The
 //! result is oriented RGBA, ready to upload as a GPU texture.
 
-use std::path::Path;
+use std::{path::Path, sync::OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
 
 use crate::metadata::{apply_orientation, read_exif_metadata};
 
-const MAX_RGBA_DECODE_BYTES: usize = 512 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
+/// Lower bound for the decode memory limit, so small machines can still open
+/// typical camera files.
+const MIN_DECODE_MEMORY_LIMIT_BYTES: usize = 512 * MIB;
+/// Limit used when the platform cannot report its physical memory size.
+const FALLBACK_DECODE_MEMORY_LIMIT_BYTES: usize = 2048 * MIB;
 
 #[derive(Debug, thiserror::Error)]
-#[error("image decode would exceed the 512 MiB safety limit")]
-struct DecodeSafetyLimit;
-
-/// Conservatively estimate the peak bytes a decode may retain. The GUI uses
-/// this to reserve capacity before starting work so parallel workers cannot
-/// each materialize a maximum-sized image at the same time.
-pub(crate) fn estimated_image_decode_bytes(path: &Path, cap: u32) -> Result<usize> {
-    estimate_image_decode(path, cap).map(|(decode_bytes, _)| decode_bytes)
+#[error(
+    "image decode would exceed the {} MiB memory limit (half of system memory)",
+    .limit / MIB
+)]
+struct DecodeSafetyLimit {
+    limit: usize,
 }
 
-/// Include the second RGBA-sized allocation needed to convert a decoded image
-/// into egui's texture input on a worker thread.
+/// Peak bytes that in-flight image decodes may hold at once, and therefore
+/// the largest single decode. Half of physical memory leaves room for the
+/// rest of the system while still bounding malformed or hostile files.
+pub(crate) fn decode_memory_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| decode_memory_limit_for(physical_memory_bytes()))
+}
+
+fn decode_memory_limit_for(physical_memory_bytes: Option<u64>) -> usize {
+    physical_memory_bytes
+        .map(|bytes| usize::try_from(bytes / 2).unwrap_or(usize::MAX))
+        .unwrap_or(FALLBACK_DECODE_MEMORY_LIMIT_BYTES)
+        .max(MIN_DECODE_MEMORY_LIMIT_BYTES)
+}
+
+#[cfg(unix)]
+fn physical_memory_bytes() -> Option<u64> {
+    // SAFETY: sysconf has no preconditions; it only reads system configuration.
+    let (pages, page_size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let pages = u64::try_from(pages).ok().filter(|pages| *pages > 0)?;
+    let page_size = u64::try_from(page_size).ok().filter(|size| *size > 0)?;
+    pages.checked_mul(page_size)
+}
+
+#[cfg(windows)]
+fn physical_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    // SAFETY: MEMORYSTATUSEX is plain old data, so all-zero bytes are valid.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is writable and its dwLength is set as the API requires.
+    let succeeded = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    (succeeded && status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn physical_memory_bytes() -> Option<u64> {
+    None
+}
+
+/// Conservatively estimate the peak bytes a decode may retain, including the
+/// second RGBA-sized allocation needed to convert the image into egui's
+/// texture input on a worker thread. The GUI reserves this before starting
+/// work, so parallel workers cannot each materialize a maximum-sized image at
+/// the same time.
 pub(crate) fn estimated_color_image_decode_bytes(path: &Path, cap: u32) -> Result<usize> {
-    let (decode_bytes, output_bytes) = estimate_image_decode(path, cap)?;
+    let limit = decode_memory_limit();
+    let (decode_bytes, output_bytes) = estimate_image_decode(path, cap, limit)?;
     let conversion_bytes = output_bytes
         .checked_mul(2)
-        .filter(|bytes| *bytes <= MAX_RGBA_DECODE_BYTES)
-        .ok_or(DecodeSafetyLimit)?;
+        .filter(|bytes| *bytes <= limit)
+        .ok_or(DecodeSafetyLimit { limit })?;
     Ok(decode_bytes.max(conversion_bytes))
 }
 
-fn estimate_image_decode(path: &Path, cap: u32) -> Result<(usize, usize)> {
+/// Conservatively estimate the peak bytes a decode may retain, returned with
+/// the size of the RGBA output alone.
+fn estimate_image_decode(path: &Path, cap: u32, limit: usize) -> Result<(usize, usize)> {
     let encoded_bytes = std::fs::metadata(path)
         .ok()
         .and_then(|metadata| usize::try_from(metadata.len()).ok())
         .unwrap_or(0);
-    if encoded_bytes > MAX_RGBA_DECODE_BYTES {
-        return Err(DecodeSafetyLimit.into());
+    if encoded_bytes > limit {
+        return Err(DecodeSafetyLimit { limit }.into());
     }
 
     let reader = image::ImageReader::open(path)
@@ -49,7 +104,7 @@ fn estimate_image_decode(path: &Path, cap: u32) -> Result<(usize, usize)> {
         .and_then(|reader| reader.with_guessed_format().ok());
     let format = reader.as_ref().and_then(image::ImageReader::format);
     let Some((width, height)) = reader.and_then(|reader| reader.into_dimensions().ok()) else {
-        return Ok((MAX_RGBA_DECODE_BYTES, 0));
+        return Ok((limit, 0));
     };
 
     let (target_width, target_height) = if cap == u32::MAX {
@@ -65,12 +120,12 @@ fn estimate_image_decode(path: &Path, cap: u32) -> Result<(usize, usize)> {
             .scale(width as usize)
             .checked_mul(factor.scale(height as usize))
             .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or(DecodeSafetyLimit)?
+            .ok_or(DecodeSafetyLimit { limit })?
     } else {
         (target_width as usize)
             .checked_mul(target_height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or(DecodeSafetyLimit)?
+            .ok_or(DecodeSafetyLimit { limit })?
     };
     let retained_bytes = if matches!(format, Some(ImageFormat::Jpeg)) {
         0
@@ -80,21 +135,21 @@ fn estimate_image_decode(path: &Path, cap: u32) -> Result<(usize, usize)> {
             // The image crate may retain 16-bit RGBA source pixels while it
             // creates the capped 8-bit RGBA output.
             .and_then(|pixels| pixels.checked_mul(8))
-            .ok_or(DecodeSafetyLimit)?
+            .ok_or(DecodeSafetyLimit { limit })?
     };
 
     Ok((
-        checked_decode_reservation([encoded_bytes, retained_bytes, output_bytes])?,
+        checked_decode_reservation([encoded_bytes, retained_bytes, output_bytes], limit)?,
         output_bytes,
     ))
 }
 
-fn checked_decode_reservation(parts: [usize; 3]) -> Result<usize> {
+fn checked_decode_reservation(parts: [usize; 3], limit: usize) -> Result<usize> {
     parts
         .into_iter()
         .try_fold(0usize, usize::checked_add)
-        .filter(|bytes| *bytes <= MAX_RGBA_DECODE_BYTES)
-        .ok_or_else(|| DecodeSafetyLimit.into())
+        .filter(|bytes| *bytes <= limit)
+        .ok_or_else(|| DecodeSafetyLimit { limit }.into())
 }
 
 /// Decode an image to oriented RGBA for display, capped so neither axis exceeds
@@ -111,10 +166,19 @@ pub(crate) fn decode_rgba_capped_cancellable(
     cap: u32,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Option<image::RgbaImage>> {
+    decode_rgba_capped_with_limit(path, cap, decode_memory_limit(), cancelled)
+}
+
+fn decode_rgba_capped_with_limit(
+    path: &Path,
+    cap: u32,
+    limit: usize,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<image::RgbaImage>> {
     if cancelled() {
         return Ok(None);
     }
-    estimated_image_decode_bytes(path, cap)?;
+    estimate_image_decode(path, cap, limit)?;
     if cancelled() {
         return Ok(None);
     }
@@ -124,7 +188,7 @@ pub(crate) fn decode_rgba_capped_cancellable(
     if cancelled() {
         return Ok(None);
     }
-    let Some(mut image) = decode_at_most(path, cap, cap, orientation, cancelled)? else {
+    let Some(mut image) = decode_at_most(path, cap, cap, orientation, limit, cancelled)? else {
         return Ok(None);
     };
     if cap != u32::MAX && (image.width() > cap || image.height() > cap) {
@@ -147,18 +211,24 @@ fn decode_at_most(
     max_width: u32,
     max_height: u32,
     orientation: Option<u16>,
+    limit: usize,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Option<DynamicImage>> {
     if cancelled() {
         return Ok(None);
     }
-    let reader = image::ImageReader::open(path)
+    let mut reader = image::ImageReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?
         .with_guessed_format()
         .with_context(|| format!("failed to detect image format for {}", path.display()))?;
+    // The image crate applies its own 512 MiB allocation cap by default; keep
+    // it in step with the limit the decode was reserved against.
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(u64::try_from(limit).unwrap_or(u64::MAX));
+    reader.limits(limits);
 
     if matches!(reader.format(), Some(ImageFormat::Jpeg)) {
-        match decode_jpeg_scaled(path, max_width, max_height, orientation, cancelled) {
+        match decode_jpeg_scaled(path, max_width, max_height, orientation, limit, cancelled) {
             Ok(Some(image)) => return Ok(Some(image)),
             Ok(None) => return Ok(None),
             Err(error) => {
@@ -196,6 +266,7 @@ fn decode_jpeg_scaled(
     max_width: u32,
     max_height: u32,
     orientation: Option<u16>,
+    limit: usize,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Option<DynamicImage>> {
     if cancelled() {
@@ -233,9 +304,9 @@ fn decode_jpeg_scaled(
     let buffer_len = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4))
-        .filter(|bytes| *bytes <= MAX_RGBA_DECODE_BYTES)
-        .ok_or(DecodeSafetyLimit)?;
-    checked_decode_reservation([data.len(), 0, buffer_len])?;
+        .filter(|bytes| *bytes <= limit)
+        .ok_or(DecodeSafetyLimit { limit })?;
+    checked_decode_reservation([data.len(), 0, buffer_len], limit)?;
     let mut image = turbojpeg::Image {
         pixels: vec![0u8; buffer_len],
         width,
@@ -357,15 +428,31 @@ mod tests {
 
     #[test]
     fn jpeg_safety_limit_is_a_terminal_decode_error() {
-        let error = 20_000usize
-            .checked_mul(20_000)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .filter(|bytes| *bytes <= MAX_RGBA_DECODE_BYTES)
-            .ok_or(DecodeSafetyLimit)
-            .map_err(anyhow::Error::from)
-            .unwrap_err();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.jpg");
+        write_jpeg(&path, 256, 256);
+
+        // The scaled JPEG buffer exceeds the limit; the decode must not fall
+        // back to the image crate, which would allocate the same buffer.
+        let error =
+            decode_at_most(&path, u32::MAX, u32::MAX, None, 64 * 1024, &|| false).unwrap_err();
 
         assert!(error.downcast_ref::<DecodeSafetyLimit>().is_some());
+    }
+
+    #[test]
+    fn image_crate_allocations_follow_the_decode_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.png");
+        image::RgbImage::new(256, 256).save(&path).unwrap();
+
+        let error =
+            decode_at_most(&path, u32::MAX, u32::MAX, None, 64 * 1024, &|| false).unwrap_err();
+
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<image::ImageError>(),
+            Some(image::ImageError::Limits(_))
+        )));
     }
 
     #[test]
@@ -373,11 +460,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oversized.jpg");
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len(MAX_RGBA_DECODE_BYTES as u64 + 1).unwrap();
+        file.set_len(MIB as u64 + 1).unwrap();
 
-        let error = estimated_image_decode_bytes(&path, 512).unwrap_err();
+        let error = estimate_image_decode(&path, 512, MIB).unwrap_err();
 
         assert!(error.downcast_ref::<DecodeSafetyLimit>().is_some());
+    }
+
+    #[test]
+    fn accepts_a_large_16_bit_image_within_the_limit() {
+        // An 8000 px 16-bit RGBA TIFF (file + retained source + RGBA output)
+        // stays well below the limit of a machine with 8 GiB of memory.
+        let limit = decode_memory_limit_for(Some(8 * 1024 * MIB as u64));
+        let file = 8000 * 8000 * 8;
+        let retained = 8000 * 8000 * 8;
+        let output = 8000 * 8000 * 4;
+
+        assert!(checked_decode_reservation([file, retained, output], limit).is_ok());
+        assert!(checked_decode_reservation([file, retained, output], 512 * MIB).is_err());
+    }
+
+    #[test]
+    fn decode_memory_limit_is_half_of_physical_memory() {
+        assert_eq!(
+            decode_memory_limit_for(Some(16 * 1024 * MIB as u64)),
+            8 * 1024 * MIB
+        );
+        assert_eq!(
+            decode_memory_limit_for(Some(256 * MIB as u64)),
+            MIN_DECODE_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(
+            decode_memory_limit_for(None),
+            FALLBACK_DECODE_MEMORY_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn reports_physical_memory() {
+        assert!(physical_memory_bytes().is_some_and(|bytes| bytes > 0));
+        assert!(decode_memory_limit() >= MIN_DECODE_MEMORY_LIMIT_BYTES);
     }
 
     fn write_jpeg(path: &Path, width: u32, height: u32) {

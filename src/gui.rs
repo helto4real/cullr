@@ -32,7 +32,9 @@ use crate::{
         preferred_browser_index,
     },
     cli::{Cli, CliViewMode},
-    decode::{decode_rgba_capped_cancellable, estimated_color_image_decode_bytes},
+    decode::{
+        decode_memory_limit, decode_rgba_capped_cancellable, estimated_color_image_decode_bytes,
+    },
     delete,
     refresh::{
         BrowserRefreshScope, MediaRefreshOutput, MediaRefreshScope, ReadJob, ReadOutput,
@@ -70,7 +72,6 @@ const DECODE_RESULT_CAPACITY: usize = 8;
 /// Keep image conversion and GPU texture creation from monopolizing a frame.
 /// Decoding remains parallel, but uploads are deliberately paced on the UI thread.
 const DECODE_UPLOADS_PER_FRAME: usize = 1;
-const DECODE_MEMORY_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Grid cell edge in points.
 const CELL: f32 = 168.0;
 /// Extra grid rows to decode above/below the viewport for smooth scrolling.
@@ -153,6 +154,9 @@ impl TexKey {
 
 struct DecodeRequest {
     key: TexKey,
+    /// Longest edge to decode at: the variant cap, bounded by the GPU's
+    /// largest texture so actual-size images can always be uploaded.
+    cap: u32,
     work_epoch: u64,
 }
 
@@ -264,7 +268,7 @@ impl DecodeService {
         let (job_tx, job_rx) = flume::bounded::<DecodeRequest>(DECODE_QUEUE_CAPACITY);
         let (result_tx, result_rx) = flume::bounded::<DecodeResult>(DECODE_RESULT_CAPACITY);
         let work_epoch = Arc::new(AtomicU64::new(0));
-        let memory_budget = DecodeMemoryBudget::new(DECODE_MEMORY_BUDGET_BYTES);
+        let memory_budget = DecodeMemoryBudget::new(decode_memory_limit());
         let repaint: Arc<Mutex<video::RepaintSignal>> = Arc::new(Mutex::new(Arc::new(|| {})));
         let workers = thread::available_parallelism()
             .map(|count| count.get().clamp(2, 6))
@@ -294,7 +298,11 @@ impl DecodeService {
                     if cancelled() {
                         continue;
                     }
-                    let reservation = match decode_memory_reservation(&job.key) {
+                    let reservation = match decode_memory_reservation(
+                        &job.key,
+                        job.cap,
+                        memory_budget.capacity,
+                    ) {
                         Ok(reservation) => reservation,
                         Err(error) => {
                             publish(DecodeResult {
@@ -327,14 +335,12 @@ impl DecodeService {
                         continue;
                     }
                     let decoded = match &job.key.media_kind {
-                        MediaKind::Image(_) => decode_rgba_capped_cancellable(
-                            &job.key.path,
-                            job.key.variant.cap(),
-                            &cancelled,
-                        ),
+                        MediaKind::Image(_) => {
+                            decode_rgba_capped_cancellable(&job.key.path, job.cap, &cancelled)
+                        }
                         MediaKind::Video(_) => video::decode_first_frame_rgba_cancellable(
                             &job.key.path,
-                            job.key.variant.cap(),
+                            job.cap,
                             &cancelled,
                         ),
                     };
@@ -366,9 +372,18 @@ impl DecodeService {
         }
     }
 
-    fn request(&self, key: TexKey) -> Result<(), flume::TrySendError<DecodeRequest>> {
+    fn request(
+        &self,
+        key: TexKey,
+        max_texture_side: u32,
+    ) -> Result<(), flume::TrySendError<DecodeRequest>> {
         let work_epoch = self.work_epoch.load(Ordering::Relaxed);
-        self.job_tx.try_send(DecodeRequest { key, work_epoch })
+        let cap = key.variant.cap().min(max_texture_side.max(1));
+        self.job_tx.try_send(DecodeRequest {
+            key,
+            cap,
+            work_epoch,
+        })
     }
 
     fn cancel_pending(&self) {
@@ -381,13 +396,18 @@ impl DecodeService {
     }
 }
 
-fn decode_memory_reservation(key: &TexKey) -> std::result::Result<usize, String> {
+fn decode_memory_reservation(
+    key: &TexKey,
+    cap: u32,
+    budget_capacity: usize,
+) -> std::result::Result<usize, String> {
     match &key.media_kind {
-        MediaKind::Image(_) => estimated_color_image_decode_bytes(&key.path, key.variant.cap())
-            .map_err(|error| format!("{error:#}")),
+        MediaKind::Image(_) => {
+            estimated_color_image_decode_bytes(&key.path, cap).map_err(|error| format!("{error:#}"))
+        }
         // FFmpeg may retain a native-resolution source frame while producing
         // the scaled RGBA frame, so video decode is serialized at full budget.
-        MediaKind::Video(_) => Ok(DECODE_MEMORY_BUDGET_BYTES),
+        MediaKind::Video(_) => Ok(budget_capacity),
     }
 }
 
@@ -474,6 +494,8 @@ struct GuiApp {
     status: String,
     right_pane_error: Option<String>,
     preview_pan: PreviewPan,
+    /// Largest texture edge the renderer accepts, read from egui every frame.
+    max_texture_side: u32,
     grid_cols: usize,
     grid_rows: usize,
     browser_rows: usize,
@@ -584,6 +606,7 @@ impl GuiApp {
             status,
             right_pane_error: None,
             preview_pan: PreviewPan::default(),
+            max_texture_side: u32::MAX,
             grid_cols: 1,
             grid_rows: 1,
             browser_rows: 1,
@@ -939,7 +962,7 @@ impl GuiApp {
         if cached || self.inflight.contains(&key) || self.failed.contains_key(&key) {
             return;
         }
-        match self.decoder.request(key.clone()) {
+        match self.decoder.request(key.clone(), self.max_texture_side) {
             Ok(()) => {
                 self.inflight.insert(key);
             }
@@ -3138,7 +3161,9 @@ impl GuiApp {
     /// The whole per-frame flow, separated from `eframe::App` so tests can
     /// drive full frames through `egui::Context::run`.
     fn update_impl(&mut self, ctx: &egui::Context) {
-        let focused = ctx.input(|input| input.focused);
+        let (focused, max_texture_side) =
+            ctx.input(|input| (input.focused, input.max_texture_side));
+        self.max_texture_side = u32::try_from(max_texture_side).unwrap_or(u32::MAX);
         self.handle_focus_change(focused);
         self.start_pending_initial_video_autoplay(focused);
         self.resume_read();
@@ -4272,6 +4297,30 @@ mod tests {
     }
 
     #[test]
+    fn actual_size_decode_fits_the_largest_gpu_texture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.png");
+        image::RgbImage::new(300, 200).save(&path).unwrap();
+        let decoder = DecodeService::new(Arc::new(AtomicBool::new(false)));
+        let key = TexKey {
+            path,
+            variant: Variant::Original,
+            media_kind: MediaKind::Image(ImageKind::Png),
+            file_len: 0,
+            modified: None,
+            generation: 0,
+        };
+
+        decoder.request(key, 100).unwrap();
+        let result = decoder
+            .result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        assert_eq!(result.image.unwrap().size, [100, 67]);
+    }
+
+    #[test]
     fn decode_memory_wait_stops_when_work_is_cancelled() {
         let budget = DecodeMemoryBudget::new(100);
         let _all_memory = budget.acquire(100).unwrap();
@@ -4588,7 +4637,7 @@ mod tests {
             let permit = valid.then(|| {
                 app.decoder
                     .memory_budget
-                    .acquire(DECODE_MEMORY_BUDGET_BYTES)
+                    .acquire(app.decoder.memory_budget.capacity)
                     .unwrap()
             });
             for time in 0..4 {

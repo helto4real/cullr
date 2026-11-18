@@ -1174,6 +1174,7 @@ dependencies = [
  "indexmap",
  "jwalk",
  "kamadak-exif",
+ "libc",
  "lru",
  "notify",
  "rodio",
@@ -1183,6 +1184,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turbojpeg",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
