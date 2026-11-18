@@ -81,6 +81,7 @@ const EMPTY_MEDIA_PROMPT: &str = "press `r` for recursive search or `q` to quit"
 const BROWSER_APPLY_DEBOUNCE_SECONDS: f64 = 0.12;
 const VIDEO_PROGRESS_OVERLAY_SECONDS: f64 = 2.0;
 const VIDEO_PROGRESS_OVERLAY_FADE_SECONDS: f32 = 0.18;
+const PREVIEW_PAN_STEP: f32 = 80.0;
 
 fn request_background_repaint(enabled: &AtomicBool, request_repaint: impl FnOnce()) {
     if enabled.load(Ordering::Relaxed) {
@@ -94,6 +95,19 @@ fn preview_scale(zoom_mode: ZoomMode, container_size: egui::Vec2, texture_size: 
         ZoomMode::Fit => fit_scale,
         ZoomMode::OriginalPixels => 1.0,
         ZoomMode::OriginalPixelsMaxWindow => fit_scale.min(1.0),
+    }
+}
+
+#[derive(Default)]
+struct PreviewPan {
+    key: Option<TexKey>,
+    offset: egui::Vec2,
+    limit: egui::Vec2,
+}
+
+impl PreviewPan {
+    fn move_by(&mut self, delta: egui::Vec2) {
+        self.offset = (self.offset + delta).clamp(-self.limit, self.limit);
     }
 }
 
@@ -459,6 +473,7 @@ struct GuiApp {
     dry_run: bool,
     status: String,
     right_pane_error: Option<String>,
+    preview_pan: PreviewPan,
     grid_cols: usize,
     grid_rows: usize,
     browser_rows: usize,
@@ -568,6 +583,7 @@ impl GuiApp {
             dry_run,
             status,
             right_pane_error: None,
+            preview_pan: PreviewPan::default(),
             grid_cols: 1,
             grid_rows: 1,
             browser_rows: 1,
@@ -2264,8 +2280,28 @@ impl GuiApp {
         self.scroll_to_current = true;
     }
 
+    fn sync_preview_pan(&mut self) {
+        let key = (self.state.mode == ViewMode::Preview
+            && self.state.zoom_mode == ZoomMode::OriginalPixels
+            && self.right_pane_error.is_none()
+            && !self.browser_selected_is_unsupported())
+        .then(|| {
+            self.state
+                .current_entry()
+                .map(|entry| TexKey::for_entry(entry, Variant::Original, self.decode_generation))
+        })
+        .flatten();
+        if self.preview_pan.key != key {
+            self.preview_pan = PreviewPan {
+                key,
+                ..Default::default()
+            };
+        }
+    }
+
     fn handle_input(&mut self, ctx: &egui::Context) {
         use egui::Key;
+        self.sync_preview_pan();
         // Confirmation modal swallows everything except y/n/esc.
         if self.state.confirm_delete && !self.media_actions_blocked() {
             ctx.input(|i| {
@@ -2292,6 +2328,24 @@ impl GuiApp {
         let mut toggle_fullscreen = false;
 
         ctx.input(|i| {
+            if i.modifiers.ctrl && i.modifiers.alt {
+                let left = i.key_pressed(Key::H) || i.key_pressed(Key::ArrowLeft);
+                let right = i.key_pressed(Key::L) || i.key_pressed(Key::ArrowRight);
+                let up = i.key_pressed(Key::K) || i.key_pressed(Key::ArrowUp);
+                let down = i.key_pressed(Key::J) || i.key_pressed(Key::ArrowDown);
+                if left || right || up || down {
+                    if !self.browser_is_focused() && !self.media_actions_blocked() {
+                        // Moving the viewport left/up moves the image right/down.
+                        self.preview_pan.move_by(
+                            egui::vec2(
+                                i32::from(left) as f32 - i32::from(right) as f32,
+                                i32::from(up) as f32 - i32::from(down) as f32,
+                            ) * PREVIEW_PAN_STEP,
+                        );
+                    }
+                    return;
+                }
+            }
             if i.key_pressed(Key::Q) {
                 close = true;
             }
@@ -2704,6 +2758,7 @@ impl GuiApp {
     }
 
     fn draw_preview(&mut self, ui: &mut egui::Ui) {
+        self.sync_preview_pan();
         let variant = self.preview_variant();
         let Some(entry) = self.state.current_entry() else {
             draw_empty_media_message(ui, &self.empty_media_target);
@@ -2724,8 +2779,41 @@ impl GuiApp {
             let tex = handle.size_vec2();
             let scale = preview_scale(self.state.zoom_mode, container_rect.size(), tex);
             let draw = tex * scale;
-            let image_rect = egui::Rect::from_center_size(container_rect.center(), draw);
-            egui::Image::new(&handle).paint_at(ui, image_rect);
+            self.preview_pan.limit = if self.state.zoom_mode == ZoomMode::OriginalPixels {
+                ((draw - container_rect.size()) * 0.5).max(egui::Vec2::ZERO)
+            } else {
+                egui::Vec2::ZERO
+            };
+            self.preview_pan.move_by(egui::Vec2::ZERO);
+            let image_rect = egui::Rect::from_center_size(
+                container_rect.center() + self.preview_pan.offset,
+                draw,
+            );
+            if self.preview_pan.limit != egui::Vec2::ZERO && !self.state.confirm_delete {
+                let response = ui.interact(
+                    image_rect.intersect(container_rect),
+                    ui.id().with("preview-pan"),
+                    egui::Sense::drag(),
+                );
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    self.preview_pan.move_by(response.drag_delta());
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                } else if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+            }
+            let image_rect = egui::Rect::from_center_size(
+                container_rect.center() + self.preview_pan.offset,
+                draw,
+            );
+            ui.painter()
+                .with_clip_rect(container_rect.intersect(ui.clip_rect()))
+                .image(
+                    handle.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
             self.draw_video_progress_overlay(ui, image_rect.intersect(container_rect), progress);
         } else if let Some(error) = self.failed.get(&key) {
             ui.centered_and_justified(|ui| {
@@ -3007,6 +3095,8 @@ grid (library) mode:
 preview mode:
   h / k / ← / ↑   previous
   l / j / → / ↓   next
+  ctrl+alt+h/j/k/l or arrows pan actual-size image
+  mouse drag      pan actual-size image
 browser mode:
   e               toggle browser
   ctrl+h / ctrl+l focus browser / preview pane
@@ -3756,6 +3846,237 @@ mod tests {
             preview_scale(ZoomMode::OriginalPixels, container, texture),
             1.0
         );
+    }
+
+    fn pan_test_app(ctx: &egui::Context, size: [usize; 2]) -> GuiApp {
+        let entries = ["first.jpg", "second.jpg"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                media_entry(
+                    PathBuf::from(name),
+                    MediaKind::Image(ImageKind::Jpeg),
+                    index,
+                )
+            })
+            .collect();
+        let mut state = app_state(entries, 0);
+        state.mode = ViewMode::Preview;
+        state.zoom_mode = ZoomMode::OriginalPixels;
+        let mut app = GuiApp::new(state, None, true, false, PathBuf::new());
+        let texture = ctx.load_texture(
+            "pan-test",
+            egui::ColorImage::new(size, egui::Color32::WHITE),
+            egui::TextureOptions::default(),
+        );
+        for entry in &app.state.entries {
+            for variant in [Variant::Original, Variant::Fit] {
+                app.previews
+                    .put(TexKey::for_entry(entry, variant, 0), texture.clone());
+            }
+        }
+        app
+    }
+
+    fn pan_frame(
+        app: &mut GuiApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+        size: egui::Vec2,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                modifiers,
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                app.handle_input(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if app.state.mode == ViewMode::Preview {
+                        app.draw_preview(ui);
+                    }
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn preview_pan_chords_preserve_selection_and_panel_focus() {
+        let ctx = egui::Context::default();
+        let mut app = pan_test_app(&ctx, [1000, 800]);
+        app.state.browser = Some(BrowserState {
+            listed_directory: PathBuf::new(),
+            entries: Vec::new(),
+            selected_index: 0,
+            focus: BrowserPaneFocus::Preview,
+            sort_mode: SortMode::Discovered,
+            remembered_selection: HashMap::new(),
+            scroll_to_selection: false,
+        });
+        let size = egui::vec2(600.0, 400.0);
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::ALT;
+        pan_frame(&mut app, &ctx, vec![], modifiers, size);
+        for (key, expected) in [
+            (egui::Key::K, egui::vec2(0.0, 80.0)),
+            (egui::Key::H, egui::vec2(80.0, 80.0)),
+            (egui::Key::J, egui::vec2(80.0, 0.0)),
+            (egui::Key::L, egui::Vec2::ZERO),
+            (egui::Key::ArrowUp, egui::vec2(0.0, 80.0)),
+            (egui::Key::ArrowLeft, egui::vec2(80.0, 80.0)),
+            (egui::Key::ArrowDown, egui::vec2(80.0, 0.0)),
+            (egui::Key::ArrowRight, egui::Vec2::ZERO),
+        ] {
+            pan_frame(&mut app, &ctx, vec![key_press(key)], modifiers, size);
+            assert_eq!(app.preview_pan.offset, expected);
+            assert_eq!(app.state.current_index, 0);
+            assert!(!app.browser_is_focused());
+        }
+        pan_frame(
+            &mut app,
+            &ctx,
+            vec![key_press(egui::Key::H)],
+            egui::Modifiers::CTRL,
+            size,
+        );
+        assert!(app.browser_is_focused());
+        pan_frame(
+            &mut app,
+            &ctx,
+            vec![key_press(egui::Key::K)],
+            modifiers,
+            size,
+        );
+        assert_eq!(app.preview_pan.offset, egui::Vec2::ZERO);
+        pan_frame(
+            &mut app,
+            &ctx,
+            vec![key_press(egui::Key::L)],
+            egui::Modifiers::CTRL,
+            size,
+        );
+        assert!(!app.browser_is_focused());
+    }
+
+    #[test]
+    fn preview_pan_drag_tracks_motion_stops_on_release_and_clamps_to_edges() {
+        let ctx = egui::Context::default();
+        let mut app = pan_test_app(&ctx, [1000, 800]);
+        let size = egui::vec2(600.0, 400.0);
+        let modifiers = egui::Modifiers::NONE;
+        let origin = egui::pos2(300.0, 200.0);
+        pan_frame(&mut app, &ctx, vec![], modifiers, size);
+        pan_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(origin),
+                egui::Event::PointerButton {
+                    pos: origin,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+            ],
+            modifiers,
+            size,
+        );
+        for delta in [egui::vec2(30.0, 20.0), egui::vec2(50.0, 40.0)] {
+            pan_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(origin + delta)],
+                modifiers,
+                size,
+            );
+            assert_eq!(app.preview_pan.offset, delta);
+        }
+        let edge = egui::pos2(900.0, 900.0);
+        pan_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(edge)],
+            modifiers,
+            size,
+        );
+        assert_eq!(app.preview_pan.offset, app.preview_pan.limit);
+        pan_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: edge,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers,
+            }],
+            modifiers,
+            size,
+        );
+        pan_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(origin)],
+            modifiers,
+            size,
+        );
+        assert_eq!(app.preview_pan.offset, app.preview_pan.limit);
+        // A taller viewport locks the vertical axis, leaving horizontal pan available.
+        pan_frame(&mut app, &ctx, vec![], modifiers, egui::vec2(600.0, 1000.0));
+        assert_eq!(app.preview_pan.offset.y, 0.0);
+        assert!(app.preview_pan.offset.x > 0.0);
+        pan_frame(
+            &mut app,
+            &ctx,
+            vec![],
+            modifiers,
+            egui::vec2(1200.0, 1000.0),
+        );
+        assert_eq!(app.preview_pan.offset, egui::Vec2::ZERO);
+        assert_eq!(app.preview_pan.limit, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn preview_pan_resets_for_zoom_selection_and_grid_changes() {
+        let ctx = egui::Context::default();
+        let mut app = pan_test_app(&ctx, [1000, 800]);
+        let size = egui::vec2(600.0, 400.0);
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::ALT;
+        pan_frame(&mut app, &ctx, vec![], modifiers, size);
+        for key in [egui::Key::Z, egui::Key::L, egui::Key::G] {
+            pan_frame(
+                &mut app,
+                &ctx,
+                vec![key_press(egui::Key::K)],
+                modifiers,
+                size,
+            );
+            assert!(app.preview_pan.offset.y > 0.0);
+            pan_frame(
+                &mut app,
+                &ctx,
+                vec![key_press(key)],
+                egui::Modifiers::NONE,
+                size,
+            );
+            pan_frame(&mut app, &ctx, vec![], egui::Modifiers::NONE, size);
+            assert_eq!(app.preview_pan.offset, egui::Vec2::ZERO);
+            app.state.mode = ViewMode::Preview;
+            app.state.zoom_mode = ZoomMode::OriginalPixels;
+            pan_frame(&mut app, &ctx, vec![], modifiers, size);
+        }
+        for zoom in [ZoomMode::Fit, ZoomMode::OriginalPixelsMaxWindow] {
+            app.state.zoom_mode = zoom;
+            pan_frame(
+                &mut app,
+                &ctx,
+                vec![key_press(egui::Key::K)],
+                modifiers,
+                size,
+            );
+            assert_eq!(app.preview_pan.offset, egui::Vec2::ZERO);
+        }
     }
 
     #[test]

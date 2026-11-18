@@ -86,6 +86,8 @@ Multiple explicit files still open as the focused grid review set.
 | --- | --- |
 | `h` / `k` / left / up | Previous file in preview mode. |
 | `l` / `j` / right / down | Next file in preview mode. |
+| `ctrl+alt+h/j/k/l` / `ctrl+alt+arrows` | Pan left/down/up/right in actual-size preview. |
+| Left mouse drag | Pan an actual-size image that exceeds the preview area. |
 | `g` | Toggle between preview and grid. |
 | `e` | Toggle the file browser view. |
 | `enter` | Open the highlighted grid file in preview mode. |
