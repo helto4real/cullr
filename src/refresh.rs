@@ -58,14 +58,12 @@ pub(crate) enum ReadJob {
         entries: Vec<BrowserEntry>,
         sort_mode: SortMode,
     },
-    Metadata(MediaEntry),
 }
 
 #[derive(Debug)]
 pub enum ReadOutput {
     Media(Vec<MediaEntry>),
     Browser(Vec<BrowserEntry>),
-    Metadata(MediaEntry),
 }
 
 #[derive(Debug)]
@@ -143,25 +141,110 @@ fn execute_read(job: ReadJob, cancelled: &impl Fn() -> bool) -> anyhow::Result<O
             crate::browser::sort_browser_entries(&mut entries, sort_mode);
             ReadOutput::Browser(entries)
         }
-        ReadJob::Metadata(mut entry) => {
-            let matches_identity = || -> anyhow::Result<bool> {
-                let current = std::fs::metadata(&entry.path)?;
-                Ok(current.len() == entry.file_len && current.modified().ok() == entry.modified)
-            };
-            anyhow::ensure!(matches_identity()?, "file changed before metadata read");
-            metadata::enrich_entry_cancellable(&mut entry, cancelled);
-            if cancelled() {
-                return Ok(None);
-            }
-            let current = std::fs::metadata(&entry.path)?;
-            anyhow::ensure!(
-                current.len() == entry.file_len && current.modified().ok() == entry.modified,
-                "file changed during metadata read"
-            );
-            ReadOutput::Metadata(entry)
-        }
     };
     Ok((!cancelled()).then_some(output))
+}
+
+/// Read dimensions and EXIF for one entry, refusing results for a file that
+/// changed on disk since it was scanned.
+fn read_entry_metadata(
+    mut entry: MediaEntry,
+    cancelled: &impl Fn() -> bool,
+) -> anyhow::Result<Option<MediaEntry>> {
+    let matches_identity = |entry: &MediaEntry| -> anyhow::Result<bool> {
+        let current = std::fs::metadata(&entry.path)?;
+        Ok(current.len() == entry.file_len && current.modified().ok() == entry.modified)
+    };
+    anyhow::ensure!(
+        matches_identity(&entry)?,
+        "file changed before metadata read"
+    );
+    metadata::enrich_entry_cancellable(&mut entry, cancelled);
+    if cancelled() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        matches_identity(&entry)?,
+        "file changed during metadata read"
+    );
+    Ok(Some(entry))
+}
+
+#[derive(Debug)]
+pub(crate) struct MetadataResult {
+    /// The entry as it was requested, identifying which file the result is for.
+    pub(crate) requested: MediaEntry,
+    pub(crate) result: Result<MediaEntry, String>,
+}
+
+struct MetadataJob {
+    epoch: u64,
+    entry: MediaEntry,
+}
+
+/// Loads info-overlay metadata on its own thread, so it neither waits behind
+/// nor cancels directory reads, sorts, and live refreshes. Only the newest
+/// request matters; older ones are skipped or cancelled.
+pub(crate) struct MetadataService {
+    job_tx: Sender<MetadataJob>,
+    result_rx: Receiver<MetadataResult>,
+    epoch: Arc<AtomicU64>,
+}
+
+impl MetadataService {
+    pub(crate) fn new(
+        suspended: Arc<AtomicBool>,
+        repaint: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let (job_tx, job_rx) = flume::unbounded::<MetadataJob>();
+        let (result_tx, result_rx) = flume::unbounded();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let worker_epoch = Arc::clone(&epoch);
+        thread::Builder::new()
+            .name("cullr-metadata".to_owned())
+            .spawn(move || {
+                while let Ok(mut job) = job_rx.recv() {
+                    while let Ok(newer) = job_rx.try_recv() {
+                        job = newer;
+                    }
+                    let cancelled = || {
+                        suspended.load(Ordering::Acquire)
+                            || worker_epoch.load(Ordering::Acquire) != job.epoch
+                    };
+                    let result = match read_entry_metadata(job.entry.clone(), &cancelled) {
+                        Ok(Some(entry)) => Ok(entry),
+                        Ok(None) => continue,
+                        Err(error) => Err(format!("{error:#}")),
+                    };
+                    if cancelled() {
+                        continue;
+                    }
+                    let result = MetadataResult {
+                        requested: job.entry,
+                        result,
+                    };
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                    repaint();
+                }
+            })
+            .expect("failed to start metadata worker");
+        Self {
+            job_tx,
+            result_rx,
+            epoch,
+        }
+    }
+
+    pub(crate) fn request(&self, entry: MediaEntry) {
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.job_tx.send(MetadataJob { epoch, entry });
+    }
+
+    pub(crate) fn drain(&self) -> Vec<MetadataResult> {
+        self.result_rx.try_iter().collect()
+    }
 }
 
 #[derive(Debug)]
@@ -624,7 +707,7 @@ fn prepare_media_refresh_cancellable(
     (!cancelled()).then_some(output)
 }
 
-fn same_scanned_file(left: &MediaEntry, right: &MediaEntry) -> bool {
+pub(crate) fn same_scanned_file(left: &MediaEntry, right: &MediaEntry) -> bool {
     left.file_len == right.file_len
         && left.modified == right.modified
         && left.media_kind == right.media_kind
@@ -640,14 +723,12 @@ mod tests {
         let mut entries =
             crate::scanner::scan_files(std::slice::from_ref(&path), &["jpg".to_owned()]).unwrap();
         let entry = entries.remove(0);
-        let Some(ReadOutput::Metadata(enriched)) =
-            execute_read(ReadJob::Metadata(entry.clone()), &|| false).unwrap()
-        else {
-            panic!("expected enriched metadata");
-        };
+        let enriched = read_entry_metadata(entry.clone(), &|| false)
+            .unwrap()
+            .expect("expected enriched metadata");
         assert_eq!(enriched.dimensions, Some((8, 8)));
         std::fs::write(path, b"changed").unwrap();
-        assert!(execute_read(ReadJob::Metadata(entry), &|| false).is_err());
+        assert!(read_entry_metadata(entry, &|| false).is_err());
     }
 
     use super::*;

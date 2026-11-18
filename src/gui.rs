@@ -37,8 +37,8 @@ use crate::{
     },
     delete,
     refresh::{
-        BrowserRefreshScope, MediaRefreshOutput, MediaRefreshScope, ReadJob, ReadOutput,
-        RefreshResult, RefreshService,
+        BrowserRefreshScope, MediaRefreshOutput, MediaRefreshScope, MetadataResult,
+        MetadataService, ReadJob, ReadOutput, RefreshResult, RefreshService, same_scanned_file,
     },
     scanner::{ScanOptions, scan_directory, scan_files},
     sorter,
@@ -396,6 +396,11 @@ impl DecodeService {
     }
 }
 
+/// Whether two entries describe the same scanned file on disk.
+fn same_file(left: &MediaEntry, right: &MediaEntry) -> bool {
+    left.path == right.path && same_scanned_file(left, right)
+}
+
 fn decode_memory_reservation(
     key: &TexKey,
     cap: u32,
@@ -517,7 +522,6 @@ struct GuiApp {
     empty_media_target: PathBuf,
     // Deferred from inside the input closure (which borrows ctx immutably).
     pending_sort: Option<crate::state::SortMode>,
-    pending_enrich: bool,
     pending_rescan: bool,
     deferred_preview_prefetch: HashSet<PathBuf>,
     deferred_live_refresh_pending: bool,
@@ -530,6 +534,11 @@ struct GuiApp {
     watcher: Option<MediaWatcher>,
     watcher_error: Option<String>,
     refresh: Option<RefreshService>,
+    metadata: Option<MetadataService>,
+    /// Entry whose info-overlay metadata is being read, or whose read failed;
+    /// either way it is not requested again until the selection changes.
+    metadata_inflight: Option<MediaEntry>,
+    metadata_failed: Option<MediaEntry>,
     pending_read: Option<PendingRead>,
     read_generation: u64,
     read_inflight: bool,
@@ -553,7 +562,6 @@ enum ReadEffect {
     Load(ViewLoad),
     SortMedia(SortMode),
     SortBrowser(SortMode),
-    Metadata,
 }
 
 #[derive(Clone)]
@@ -627,7 +635,6 @@ impl GuiApp {
             video_progress_overlay_visible_until: 0.0,
             empty_media_target,
             pending_sort: None,
-            pending_enrich: false,
             pending_rescan: false,
             deferred_preview_prefetch: HashSet::new(),
             deferred_live_refresh_pending: false,
@@ -638,6 +645,9 @@ impl GuiApp {
             watcher: None,
             watcher_error: None,
             refresh: None,
+            metadata: None,
+            metadata_inflight: None,
+            metadata_failed: None,
             pending_read: None,
             read_generation: 0,
             read_inflight: false,
@@ -794,16 +804,6 @@ impl GuiApp {
                     browser.sort_mode = mode;
                 }
                 self.status = format!("browser sort: {mode:?}");
-            }
-            (ReadEffect::Metadata, ReadOutput::Metadata(enriched)) => {
-                if let Some(entry) = self.state.current_entry_mut()
-                    && entry.path == enriched.path
-                    && entry.file_len == enriched.file_len
-                    && entry.modified == enriched.modified
-                {
-                    *entry = enriched;
-                }
-                self.status = "metadata loaded".to_owned();
             }
             _ => unreachable!("read result must match its request"),
         }
@@ -1561,9 +1561,98 @@ impl GuiApp {
             }
             self.media_refresh_inflight = false;
             self.browser_refresh_inflight = false;
+            // The metadata worker drops reads while suspended; request again later.
+            self.metadata_inflight = None;
             if let Some(refresh) = &self.refresh {
                 refresh.cancel_all();
             }
+        }
+    }
+
+    /// The entry the info overlay describes, if the overlay is shown.
+    fn info_overlay_entry(&self) -> Option<&MediaEntry> {
+        if !self.state.show_info_overlay
+            || self.browser_selected_is_unsupported()
+            || self.right_pane_error.is_some()
+        {
+            return None;
+        }
+        self.state.current_entry()
+    }
+
+    /// Load dimensions and EXIF for whichever file the info overlay shows, so
+    /// they follow the selection instead of only the file shown when it opened.
+    fn ensure_info_metadata(&mut self) {
+        if self.live_refresh_is_suspended() {
+            return;
+        }
+        let Some(entry) = self.info_overlay_entry() else {
+            return;
+        };
+        let is_entry = |other: &Option<MediaEntry>| {
+            other.as_ref().is_some_and(|other| same_file(other, entry))
+        };
+        if (entry.dimensions_attempted && entry.exif_attempted)
+            || is_entry(&self.metadata_inflight)
+            || is_entry(&self.metadata_failed)
+        {
+            return;
+        }
+        let entry = entry.clone();
+        let signal = Arc::clone(&self.decoder.repaint);
+        let metadata = self.metadata.get_or_insert_with(|| {
+            MetadataService::new(Arc::clone(&self.live_refresh_suspended), move || {
+                let callback = signal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                callback();
+            })
+        });
+        metadata.request(entry.clone());
+        self.metadata_inflight = Some(entry);
+    }
+
+    fn drain_metadata_results(&mut self) {
+        let results = self
+            .metadata
+            .as_ref()
+            .map(MetadataService::drain)
+            .unwrap_or_default();
+        for result in results {
+            self.handle_metadata_result(result);
+        }
+    }
+
+    /// Store metadata on the entry it was read for, wherever it now sits in
+    /// the list. A file that changed identity since the request is left alone.
+    fn handle_metadata_result(&mut self, MetadataResult { requested, result }: MetadataResult) {
+        if self
+            .metadata_inflight
+            .as_ref()
+            .is_some_and(|inflight| same_file(inflight, &requested))
+        {
+            self.metadata_inflight = None;
+        }
+        let enriched = match result {
+            Ok(enriched) => enriched,
+            Err(error) => {
+                self.status = format!("metadata failed: {error}");
+                self.metadata_failed = Some(requested);
+                return;
+            }
+        };
+        if let Some(entry) = self
+            .state
+            .entries
+            .iter_mut()
+            .find(|entry| same_file(entry, &requested))
+        {
+            entry.dimensions = enriched.dimensions;
+            entry.dimensions_attempted = enriched.dimensions_attempted;
+            entry.exif_date = enriched.exif_date;
+            entry.exif_orientation = enriched.exif_orientation;
+            entry.exif_attempted = enriched.exif_attempted;
         }
     }
 
@@ -2611,19 +2700,12 @@ impl GuiApp {
                 }
                 if i.key_pressed(Key::I) {
                     self.state.show_info_overlay = !self.state.show_info_overlay;
-                    self.pending_enrich = self.state.show_info_overlay;
                 }
             }
         });
 
         if let Some(mode) = self.pending_sort.take() {
             self.resort(mode);
-        }
-        if std::mem::take(&mut self.pending_enrich)
-            && let Some(entry) = self.state.current_entry_mut()
-        {
-            let entry = entry.clone();
-            self.begin_read(ReadJob::Metadata(entry), ReadEffect::Metadata);
         }
         if std::mem::take(&mut self.pending_rescan) {
             self.rescan();
@@ -3070,11 +3152,7 @@ impl GuiApp {
                     ui.label(HELP_TEXT);
                 });
         }
-        if self.state.show_info_overlay
-            && !self.browser_selected_is_unsupported()
-            && self.right_pane_error.is_none()
-            && let Some(entry) = self.state.current_entry()
-        {
+        if let Some(entry) = self.info_overlay_entry() {
             let dims = entry
                 .dimensions
                 .map(|(w, h)| format!("{w}×{h}"))
@@ -3193,6 +3271,8 @@ impl GuiApp {
             }
         }
 
+        self.drain_metadata_results();
+        self.ensure_info_metadata();
         self.drain_results(ctx);
         self.drain_video_events(ctx);
         self.ensure_requested();
@@ -5006,7 +5086,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_result_cannot_restore_an_old_file_identity_or_selection() {
+    fn metadata_result_only_updates_the_file_it_was_read_for() {
         let temp = tempdir().unwrap();
         let mut app = app_for_browser_tests(temp.path());
         let original = media_entry(
@@ -5014,27 +5094,104 @@ mod tests {
             MediaKind::Image(ImageKind::Jpeg),
             0,
         );
-        app.state.entries = vec![original.clone()];
-        app.pending_read = Some(PendingRead {
-            job: ReadJob::Metadata(original.clone()),
-            effect: ReadEffect::Metadata,
-        });
-        app.state.entries[0].file_len += 1;
         let mut enriched = original.clone();
         enriched.dimensions = Some((100, 100));
-        app.handle_read_result(
-            app.read_generation,
-            Ok(ReadOutput::Metadata(enriched.clone())),
-        );
+        enriched.dimensions_attempted = true;
+        let result = || MetadataResult {
+            requested: original.clone(),
+            result: Ok(enriched.clone()),
+        };
+
+        app.state.entries = vec![original.clone()];
+        app.state.entries[0].file_len += 1;
+        app.handle_metadata_result(result());
         assert_eq!(app.state.entries[0].dimensions, None);
-        app.pending_read = Some(PendingRead {
-            job: ReadJob::Metadata(original),
-            effect: ReadEffect::Metadata,
-        });
+
+        app.state.entries = vec![original.clone()];
         app.state.entries[0].path = temp.path().join("b.jpg");
-        app.handle_read_result(app.read_generation, Ok(ReadOutput::Metadata(enriched)));
+        app.handle_metadata_result(result());
         assert_eq!(app.state.entries[0].path, temp.path().join("b.jpg"));
         assert_eq!(app.state.entries[0].dimensions, None);
+
+        // The selection may have moved on; the result still lands on its file.
+        let other = media_entry(
+            temp.path().join("c.jpg"),
+            MediaKind::Image(ImageKind::Jpeg),
+            1,
+        );
+        app.state.entries = vec![original.clone(), other];
+        app.state.current_index = 1;
+        app.handle_metadata_result(result());
+        assert_eq!(app.state.entries[0].dimensions, Some((100, 100)));
+        assert_eq!(app.state.entries[1].dimensions, None);
+    }
+
+    fn metadata_test_app(temp: &Path) -> GuiApp {
+        let paths: Vec<PathBuf> = [("a.png", 24, 12), ("b.png", 30, 20)]
+            .into_iter()
+            .map(|(name, width, height)| {
+                let path = temp.join(name);
+                image::RgbImage::new(width, height).save(&path).unwrap();
+                path
+            })
+            .collect();
+        let entries = scan_files(&paths, &["png".to_owned()]).unwrap();
+        let mut state = app_state(entries, 0);
+        state.show_info_overlay = true;
+        GuiApp::new(state, None, true, false, temp.to_path_buf())
+    }
+
+    fn run_until(app: &mut GuiApp, ctx: &egui::Context, done: impl Fn(&GuiApp) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut time = 0.0;
+        while std::time::Instant::now() < deadline {
+            frame_output(app, ctx, true, time);
+            if done(app) {
+                return true;
+            }
+            time += 0.01;
+            thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    fn dimensions_of(app: &GuiApp, name: &str) -> Option<(u32, u32)> {
+        app.state
+            .entries
+            .iter()
+            .find(|entry| entry.display_name == name)
+            .and_then(|entry| entry.dimensions)
+    }
+
+    #[test]
+    fn info_overlay_loads_dimensions_for_each_selected_file() {
+        let temp = tempdir().unwrap();
+        let mut app = metadata_test_app(temp.path());
+        let ctx = egui::Context::default();
+        let first = app.state.current_entry().unwrap().display_name.clone();
+        let second = if first == "a.png" { "b.png" } else { "a.png" };
+
+        assert!(run_until(&mut app, &ctx, |app| dimensions_of(app, &first).is_some()));
+        assert_eq!(dimensions_of(&app, second), None);
+
+        app.state.current_index = 1;
+        assert!(run_until(&mut app, &ctx, |app| dimensions_of(app, second).is_some()));
+        assert_eq!(dimensions_of(&app, "a.png"), Some((24, 12)));
+        assert_eq!(dimensions_of(&app, "b.png"), Some((30, 20)));
+    }
+
+    #[test]
+    fn info_overlay_metadata_does_not_cancel_a_pending_read() {
+        let temp = tempdir().unwrap();
+        let mut app = metadata_test_app(temp.path());
+        let ctx = egui::Context::default();
+        let first = app.state.current_entry().unwrap().display_name.clone();
+        let (started, release) = blocked_directory_read(&mut app, temp.path());
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert!(run_until(&mut app, &ctx, |app| dimensions_of(app, &first).is_some()));
+        assert!(app.pending_read.is_some());
+        release.send(()).unwrap();
     }
 
     #[test]
